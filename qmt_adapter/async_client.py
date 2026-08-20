@@ -2,7 +2,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from types import TracebackType
-from typing import Any, Callable, Dict, Optional, Type, TypeVar
+from typing import Any, Callable, Dict, Iterable, List, Optional, Type, TypeVar
 
 from .client import QmtClient
 from .config import ConfigPath
@@ -113,6 +113,27 @@ class AsyncQmtClient:
         return await self._call(
             self._client.place_order,
             order,
+            wait_for=wait_for,
+            timeout=timeout,
+        )
+
+    async def place_orders(
+        self,
+        orders: Iterable[OrderRequest],
+        interval_ms: int,
+        wait_for: str = "LOCAL_ACK",
+        timeout: float = 10.0,
+    ) -> List[OrderReceipt]:
+        """异步按指定最小时间间隔串行提交多笔股票委托。
+
+        参数、返回值和异常语义与 :meth:`QmtClient.place_orders` 相同。
+        整批操作占用同一条持久命名管道并严格串行执行，不会与本客户端的
+        其他请求交错；等待和通信发生在工作线程中，不阻塞调用方事件循环。
+        """
+        return await self._call(
+            self._client.place_orders,
+            orders,
+            interval_ms,
             wait_for=wait_for,
             timeout=timeout,
         )

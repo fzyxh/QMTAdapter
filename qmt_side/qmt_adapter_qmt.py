@@ -700,7 +700,7 @@ def _order_filled_quantity(raw):
     return max(0, value or 0)
 
 
-def _derive_order_status(raw, current_status):
+def _reported_order_status(raw, current_status):
     if not raw:
         return current_status
     order_status = _raw_integer(raw, "m_nOrderStatus")
@@ -718,13 +718,7 @@ def _derive_order_status(raw, current_status):
         255: "UNKNOWN",
     }
     if order_status in status_map:
-        reported_status = status_map[order_status]
-        if current_status == "CANCEL_PENDING" and reported_status in (
-            "SUBMITTED",
-            "PARTIALLY_FILLED",
-        ):
-            return "CANCEL_PENDING"
-        return reported_status
+        return status_map[order_status]
     original = _raw_integer(raw, "m_nVolumeTotalOriginal")
     traded = _raw_integer(raw, "m_nVolumeTraded")
     remaining = _raw_integer(raw, "m_nVolumeTotal")
@@ -743,6 +737,27 @@ def _derive_order_status(raw, current_status):
     if current_status in ("PENDING_QMT", "PENDING_BROKER_ID", "UNKNOWN"):
         return "SUBMITTED"
     return current_status
+
+
+def _derive_order_status(raw, current_status):
+    if not raw:
+        return current_status
+    if current_status in ORDER_TERMINAL_STATUSES:
+        return current_status
+    reported_status = _reported_order_status(raw, current_status)
+    if current_status == "CANCEL_PENDING" and reported_status in (
+        "SUBMITTED",
+        "PARTIALLY_FILLED",
+    ):
+        return "CANCEL_PENDING"
+    return reported_status
+
+
+def _is_stale_terminal_order_event(raw, current_status):
+    return (
+        current_status in ORDER_TERMINAL_STATUSES
+        and _reported_order_status(raw, current_status) != current_status
+    )
 
 
 class PipeServer(object):
@@ -1146,13 +1161,23 @@ class OrderStore(object):
             row = self.get_order(client_order_id)
             if not row:
                 return
+            next_status = status or row["status"]
+            next_raw_json = (
+                _canonical_json(raw) if raw is not None else row["raw_json"]
+            )
+            if row["status"] in ORDER_TERMINAL_STATUSES:
+                next_status = row["status"]
+                if raw is not None and _is_stale_terminal_order_event(
+                    raw, row["status"]
+                ):
+                    next_raw_json = row["raw_json"]
             self.conn.execute(
                 "UPDATE orders SET status=?,qmt_order_id=?,raw_json=?,updated_at=? "
                 "WHERE client_order_id=?",
                 (
-                    status or row["status"],
+                    next_status,
                     qmt_order_id if qmt_order_id is not None else row["qmt_order_id"],
-                    _canonical_json(raw) if raw is not None else row["raw_json"],
+                    next_raw_json,
                     _utc_now_text(),
                     client_order_id,
                 ),
@@ -2795,6 +2820,11 @@ class BridgeRuntime(object):
                             qmt_order_id=qmt_order_id,
                             raw=raw,
                         )
+                        updated = self.store.get_order(row["client_order_id"])
+                        if updated is not None:
+                            self._complete_broker_response(
+                                row["client_order_id"], updated
+                            )
                         break
 
     def _order_row(self, row):
@@ -2868,27 +2898,44 @@ def init(ContextInfo):
     global _RUNTIME
     if _RUNTIME is not None:
         return
+    runtime = None
     try:
         previous_runtime = getattr(builtins, _RUNTIME_SLOT, None)
         if previous_runtime is not None:
             previous_runtime.stop()
             delattr(builtins, _RUNTIME_SLOT)
         config = _load_config()
-        _RUNTIME = BridgeRuntime(config)
-        for account in _RUNTIME.accounts.values():
+        runtime = BridgeRuntime(config)
+        for account in runtime.accounts.values():
             ContextInfo.set_account(account["account_id"])
-        _RUNTIME.start()
+        runtime.start()
+        _RUNTIME = runtime
         ContextInfo.run_time(
             "_qmt_adapter_tick",
             config.get("timer_period", "10nMilliSecond"),
             "2000-01-01 00:00:00",
             "SH",
         )
-        setattr(builtins, _RUNTIME_SLOT, _RUNTIME)
+        setattr(builtins, _RUNTIME_SLOT, runtime)
         print("QMT Adapter bridge is ready: %s" % config.get("pipe_name"))
     except Exception as exc:
+        if _RUNTIME is runtime:
+            _RUNTIME = None
+        if getattr(builtins, _RUNTIME_SLOT, None) is runtime:
+            delattr(builtins, _RUNTIME_SLOT)
+        cleanup_error = None
+        if runtime is not None:
+            try:
+                runtime.stop()
+            except Exception as stop_exc:
+                cleanup_error = stop_exc
         print("QMT Adapter startup failed: %s: %s" % (type(exc).__name__, exc))
         print(traceback.format_exc())
+        if cleanup_error is not None:
+            print(
+                "QMT Adapter startup cleanup failed: %s: %s"
+                % (type(cleanup_error).__name__, cleanup_error)
+            )
 
 
 def _qmt_adapter_tick(ContextInfo):

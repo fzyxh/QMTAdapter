@@ -16,6 +16,7 @@
 - 股票账户查询；
 - 股票持仓查询；
 - 普通现金账户股票买入和卖出；
+- 按指定时间间隔串行批量下单；
 - 沪深交易所原生股票市价申报；
 - 委托查询和撤单；
 - 按盘口流动性拆分并按固定间隔提交大额股票委托，支持预览、提交、查询和撤单。
@@ -118,6 +119,34 @@ with QmtClient() as client:
 不连接外部 `xtdata`，不写数据库且不调用 `passorder`。
 `place_algo_order()` 会重新读取即时盘口并执行，所以预览与实单的价格和数量可能
 随行情变化。
+
+普通批量下单直接复用单笔委托接口。`interval_ms` 表示相邻两笔调用开始时间的
+最小间隔，整批始终串行提交：
+
+```python
+from qmt_adapter import OrderRequest, QmtClient
+
+
+orders = [
+    OrderRequest(
+        account_id="YOUR_ACCOUNT_ID",
+        instrument="601919.SH",
+        side="BUY",
+        quantity=100,
+        price_type="COUNTERPARTY",
+        remark="batch-%02d" % index,
+    )
+    for index in range(10)
+]
+
+with QmtClient() as client:
+    receipts = client.place_orders(
+        orders,
+        interval_ms=50,
+        wait_for="LOCAL_ACK",
+        timeout=10.0,
+    )
+```
 
 ## Asyncio 客户端
 

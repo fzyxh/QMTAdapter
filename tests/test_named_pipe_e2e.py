@@ -7,7 +7,14 @@ import time
 import unittest
 import uuid
 
-from qmt_adapter import AlgoOrderRequest, OrderRequest, QmtClient, RemoteError
+from qmt_adapter import (
+    AlgoOrderRequest,
+    OrderRequest,
+    QmtClient,
+    RemoteError,
+    RequestTimeout,
+    ValidationError,
+)
 from qmt_side import qmt_adapter_qmt as bridge
 
 
@@ -71,6 +78,8 @@ class FakeQmtApi(object):
         self.cancel_callback_times = []
         self.order_counter = 0
         self.raise_passorder = False
+        self.emit_order_callback = True
+        self.return_orders_for_reconcile = False
         self.full_ticks = {
             "600000.SH": {
                 "lastPrice": 10.0,
@@ -96,7 +105,7 @@ class FakeQmtApi(object):
         if detail_type == "POSITION":
             return [FakePosition()]
         if detail_type == "ORDER":
-            return []
+            return list(self.orders) if self.return_orders_for_reconcile else []
         return []
 
     def passorder(self, *args):
@@ -108,11 +117,12 @@ class FakeQmtApi(object):
         order_id = "QMT-ORDER-%04d" % self.order_counter
         self.orders.append(FakeOrder(args[9], order_id, args[6]))
         callback_order = self.orders[-1]
-        timer = threading.Timer(
-            0.03, lambda: bridge.order_callback(None, callback_order)
-        )
-        timer.daemon = True
-        timer.start()
+        if self.emit_order_callback:
+            timer = threading.Timer(
+                0.03, lambda: bridge.order_callback(None, callback_order)
+            )
+            timer.daemon = True
+            timer.start()
 
     def can_cancel_order(self, qmt_order_id, account_id, account_type):
         return (
@@ -289,6 +299,172 @@ class NamedPipeEndToEndTests(unittest.TestCase):
         self.assertNotEqual(first.request_id, replay.request_id)
         self.assertEqual(replay.raw["original_request_id"], first.request_id)
         self.assertEqual(len(self.fake_api.passorder_calls), 1)
+
+    def test_broker_id_waiter_is_completed_by_reconciliation(self):
+        self.fake_api.emit_order_callback = False
+        self.fake_api.return_orders_for_reconcile = True
+        bridge._RUNTIME.config["reconcile_interval_seconds"] = 0.01
+        bridge._RUNTIME.last_reconcile = 0.0
+        order = OrderRequest(
+            account_id=ACCOUNT_ID,
+            instrument="600000.SH",
+            side="BUY",
+            quantity=100,
+            price_type="LIMIT",
+            limit_price="10.25",
+            client_order_id="CLIENT-RECONCILE-BROKER-ID",
+        )
+
+        with QmtClient(config_path=self.config_path) as client:
+            receipt = client.place_order(
+                order,
+                wait_for="BROKER_ID",
+                timeout=2,
+            )
+
+        self.assertEqual(receipt.qmt_order_id, "QMT-ORDER-0001")
+        self.assertEqual(len(self.fake_api.passorder_calls), 1)
+        self.assertNotIn(
+            order.client_order_id,
+            bridge._RUNTIME.pending_broker_responses,
+        )
+
+    def test_sync_batch_orders_are_serialized_at_requested_interval(self):
+        orders = [
+            OrderRequest(
+                account_id=ACCOUNT_ID,
+                instrument="600000.SH",
+                side="BUY",
+                quantity=100,
+                price_type="LIMIT",
+                limit_price="10.25",
+                remark="sync-batch-%02d" % index,
+                client_order_id="CLIENT-SYNC-BATCH-%02d" % index,
+            )
+            for index in range(3)
+        ]
+
+        with QmtClient(config_path=self.config_path) as client:
+            receipts = client.place_orders(
+                orders,
+                interval_ms=50,
+                wait_for="LOCAL_ACK",
+                timeout=5,
+            )
+
+        self.assertEqual(
+            [item.client_order_id for item in receipts],
+            [item.client_order_id for item in orders],
+        )
+        self.assertEqual(len(self.fake_api.passorder_calls), 3)
+        gaps = [
+            later - earlier
+            for earlier, later in zip(
+                self.fake_api.passorder_call_times,
+                self.fake_api.passorder_call_times[1:],
+            )
+        ]
+        self.assertTrue(all(gap >= 0.04 for gap in gaps), gaps)
+
+    def test_batch_prevalidation_prevents_partial_submission(self):
+        valid_order = OrderRequest(
+            account_id=ACCOUNT_ID,
+            instrument="600000.SH",
+            side="BUY",
+            quantity=100,
+            price_type="LIMIT",
+            limit_price="10.25",
+        )
+
+        with QmtClient(config_path=self.config_path) as client:
+            with self.assertRaises(ValidationError):
+                client.place_orders(
+                    [valid_order, object()],
+                    interval_ms=50,
+                    timeout=5,
+                )
+
+        self.assertEqual(self.fake_api.passorder_calls, [])
+
+    def test_batch_rejects_duplicate_client_order_ids_before_submission(self):
+        same_payload = [
+            OrderRequest(
+                account_id=ACCOUNT_ID,
+                instrument="600000.SH",
+                side="BUY",
+                quantity=100,
+                price_type="LIMIT",
+                limit_price="10.25",
+                client_order_id="CLIENT-BATCH-DUPLICATE-SAME",
+            )
+            for unused in range(2)
+        ]
+        different_payload = [
+            OrderRequest(
+                account_id=ACCOUNT_ID,
+                instrument="600000.SH",
+                side="BUY",
+                quantity=quantity,
+                price_type="LIMIT",
+                limit_price="10.25",
+                client_order_id="CLIENT-BATCH-DUPLICATE-DIFFERENT",
+            )
+            for quantity in (100, 200)
+        ]
+
+        with QmtClient(config_path=self.config_path) as client:
+            for orders in (same_payload, different_payload):
+                with self.subTest(orders=orders):
+                    with self.assertRaises(ValidationError) as caught:
+                        client.place_orders(orders, interval_ms=0, timeout=5)
+                    self.assertIn("duplicate client_order_id", str(caught.exception))
+
+        self.assertEqual(self.fake_api.passorder_calls, [])
+
+    def test_terminal_order_ignores_stale_nonterminal_callback(self):
+        order = OrderRequest(
+            account_id=ACCOUNT_ID,
+            instrument="600000.SH",
+            side="BUY",
+            quantity=100,
+            price_type="LIMIT",
+            limit_price="10.25",
+            client_order_id="CLIENT-TERMINAL-STALE-CALLBACK",
+        )
+        with QmtClient(config_path=self.config_path) as client:
+            client.place_order(order, wait_for="BROKER_ID", timeout=5)
+            callback_order = self.fake_api.orders[0]
+            callback_order.m_nOrderStatus = 56
+            callback_order.m_nVolumeTraded = 100
+            callback_order.m_nVolumeTotal = 0
+            bridge.order_callback(None, callback_order)
+            filled = client.get_order(order.client_order_id)
+
+            stale = FakeOrder(
+                callback_order.m_strRemark,
+                callback_order.m_strOrderSysID,
+                100,
+            )
+            stale.m_nOrderStatus = 50
+            bridge.order_callback(None, stale)
+            after_stale = client.get_order(order.client_order_id)
+
+        self.assertEqual(filled["order_status"], "FILLED")
+        self.assertEqual(after_stale["order_status"], "FILLED")
+        self.assertEqual(after_stale["raw"]["m_nOrderStatus"], 56)
+        self.assertEqual(after_stale["raw"]["m_nVolumeTraded"], 100)
+
+    def test_second_client_honors_timeout_while_pipe_is_busy(self):
+        first = QmtClient(config_path=self.config_path).connect()
+        second = QmtClient(config_path=self.config_path)
+        started = time.monotonic()
+        try:
+            with self.assertRaises(RequestTimeout):
+                second.connect(timeout=0.15)
+        finally:
+            second.close()
+            first.close()
+        self.assertGreaterEqual(time.monotonic() - started, 0.1)
 
     def test_native_market_price_types_are_forwarded_to_passorder(self):
         cases = (

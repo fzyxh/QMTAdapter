@@ -9,6 +9,7 @@
 - 查询股票资金账户；
 - 查询股票持仓；
 - 普通股票买入、卖出；
+- 按指定时间间隔串行提交多笔普通股票委托；
 - 查询本适配器发出的委托；
 - 撤销本适配器发出的委托；
 - 盘口流动性加权算法父单的预览、提交、查询和整体撤单；
@@ -400,7 +401,7 @@ order = OrderRequest(
 |---|---|---|
 | `LOCAL_ACK` | SQLite记录已创建，且 `passorder` 已调用并且未抛异常 | 通常暂时为 `None` |
 | `QMT_CALLED` | 当前版本与 `LOCAL_ACK` 的实际返回时点相同 | 通常暂时为 `None` |
-| `BROKER_ID` | `order_callback` 已关联QMT委托ID，并通过原命名管道请求直接返回 | 正常情况下非空 |
+| `BROKER_ID` | `order_callback` 或Bridge内部对账已关联QMT委托ID，并通过原命名管道请求直接返回 | 正常情况下非空 |
 
 `BROKER_ID` 不依赖外部轮询 SQLite。等待期间同一个客户端连接不能发送下一条请求。
 
@@ -409,7 +410,58 @@ order = OrderRequest(
 `get_order` 查询；需要重试 `place_order` 时必须提交原对象或相同 ID、相同参数，
 Bridge 会重放已有结果而不会重复调用 `passorder`。
 
-### 5.7 get_order
+### 5.7 place_orders
+
+函数签名：
+
+```python
+receipts = client.place_orders(
+    orders,
+    interval_ms=50,
+    wait_for="LOCAL_ACK",
+    timeout=10.0,
+)
+```
+
+该方法接收按提交顺序排列的 `OrderRequest` 可迭代对象，先校验全部委托，再依次
+调用现有 `place_order()`。返回值是与输入顺序一致的 `OrderReceipt` 列表。
+批内每笔委托必须使用不同的 `client_order_id`；发现重复ID时，整批会在第一笔
+提交前被拒绝，不会把重复ID解释成幂等重放。
+
+`interval_ms` 是相邻两次 `place_order()` 调用开始时间的最小间隔，必须为非负
+整数。上一笔调用耗时小于该间隔时，客户端等待剩余时间；上一笔耗时已经超过该
+间隔时，下一笔在上一笔返回后立即开始。任何情况下都不会并行提交，也不会把落后
+的委托连续突发出去。`timeout` 是每笔委托各自的超时时间，不是整批总超时。
+
+```python
+from qmt_adapter import OrderRequest, QmtClient
+
+
+orders = [
+    OrderRequest(
+        account_id="YOUR_ACCOUNT_ID",
+        instrument="601919.SH",
+        side="BUY",
+        quantity=100,
+        price_type="COUNTERPARTY",
+        remark="batch-%02d" % index,
+    )
+    for index in range(10)
+]
+
+with QmtClient(config_path=CONFIG_PATH) as client:
+    receipts = client.place_orders(
+        orders,
+        interval_ms=50,
+        wait_for="LOCAL_ACK",
+        timeout=10.0,
+    )
+```
+
+任一运行期异常都会停止后续提交；异常前已经提交成功的委托不会自动撤销。调用方
+可以使用原始 `OrderRequest.client_order_id` 查询这些委托。空输入返回空列表。
+
+### 5.8 get_order
 
 ```python
 order = client.get_order(client_order_id, timeout=5.0)
@@ -433,7 +485,7 @@ order = client.get_order(client_order_id, timeout=5.0)
 | `created_at` | QMT端创建记录的UTC时间 |
 | `updated_at` | 最近回调持久化的UTC时间 |
 
-### 5.8 list_orders
+### 5.9 list_orders
 
 查询指定账号的适配器委托：
 
@@ -471,10 +523,13 @@ Bridge 已将 QMT 普通股票委托状态 48 至 57 标准化为
 - `m_nOrderStatus`：QMT原始委托状态码；
 - `m_strErrorMsg`：QMT错误信息。
 
+`FILLED`、`CANCELED` 和 `REJECTED` 是不可逆状态。迟到的旧回报不会把终态
+降回 `SUBMITTED` 或 `PARTIALLY_FILLED`，也不会覆盖已经保存的终态原始数据。
+
 算法父单的成交汇总以每个子单的 `m_nVolumeTraded` 求和。某一笔子单已经成交、
 撤销或被拒绝，并不表示整个父单也已经结束。
 
-### 5.9 cancel_order
+### 5.10 cancel_order
 
 ```python
 result = client.cancel_order(
@@ -612,6 +667,7 @@ async with AsyncQmtClient(config_path=CONFIG_PATH) as client:
 | `await get_account(account_id, timeout)` | `get_account(...)` |
 | `await list_positions(account_id, timeout)` | `list_positions(...)` |
 | `await place_order(order, wait_for, timeout)` | `place_order(...)` |
+| `await place_orders(orders, interval_ms, wait_for, timeout)` | `place_orders(...)` |
 | `await get_order(client_order_id, timeout)` | `get_order(...)` |
 | `await list_orders(account_id, timeout)` | `list_orders(...)` |
 | `await cancel_order(client_order_id, timeout)` | `cancel_order(...)` |
@@ -648,38 +704,20 @@ async def main():
 asyncio.run(main())
 ```
 
-按固定节奏创建多笔任务、最后统一等待：
+按固定间隔串行提交多笔委托：
 
 ```python
-import asyncio
-
-
-async def submit_batch(client, orders, interval_seconds=0.05):
-    loop = asyncio.get_running_loop()
-    start = loop.time()
-    tasks = []
-
-    for index, order in enumerate(orders):
-        target = start + index * interval_seconds
-        remaining = target - loop.time()
-        if remaining > 0:
-            await asyncio.sleep(remaining)
-
-        tasks.append(
-            asyncio.create_task(
-                client.place_order(
-                    order,
-                    wait_for="LOCAL_ACK",
-                    timeout=10.0,
-                )
-            )
-        )
-
-    receipts = await asyncio.gather(*tasks)
-    return receipts
+receipts = await client.place_orders(
+    orders,
+    interval_ms=50,
+    wait_for="LOCAL_ACK",
+    timeout=10.0,
+)
 ```
 
-此方式只是让调用方可以继续运行其他协程，实际 QMT 请求仍按顺序执行。如果单笔调用耗时超过目标间隔，后续任务会排队，不能维持原定送单间隔。
+异步批量接口在内部工作线程中复用同步批量接口，因此不阻塞调用方事件循环。整批
+操作独占该客户端的一条持久命名管道，批量中的委托不会与同一客户端的其他请求
+交错，实际 QMT 请求仍按顺序执行。
 
 批量下单阶段使用 `LOCAL_ACK` 可以避免每笔都等待委托ID。全部发送完成后，再根据每个 `receipt.client_order_id` 调用 `get_order`，或者统一调用 `list_orders` 查询QMT委托ID和回调字段。
 

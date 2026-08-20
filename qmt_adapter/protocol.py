@@ -14,6 +14,7 @@ GENERIC_WRITE = 0x40000000
 OPEN_EXISTING = 3
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 ERROR_BROKEN_PIPE = 109
+ERROR_SEM_TIMEOUT = 121
 ERROR_PIPE_BUSY = 231
 ERROR_NO_DATA = 232
 ERROR_FILE_NOT_FOUND = 2
@@ -83,7 +84,11 @@ class NamedPipeConnection:
             wait_ms = max(1, min(50, int(remaining * 1000)))
             if not self._kernel32.WaitNamedPipeW(self.pipe_name, wait_ms):
                 error_code = ctypes.get_last_error()
-                if error_code in (ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY):
+                if error_code in (
+                    ERROR_FILE_NOT_FOUND,
+                    ERROR_SEM_TIMEOUT,
+                    ERROR_PIPE_BUSY,
+                ):
                     time.sleep(min(0.005, remaining))
                     continue
                 raise ctypes.WinError(error_code)
@@ -98,7 +103,11 @@ class NamedPipeConnection:
             )
             if handle == INVALID_HANDLE_VALUE:
                 error_code = ctypes.get_last_error()
-                if error_code in (ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY):
+                if error_code in (
+                    ERROR_FILE_NOT_FOUND,
+                    ERROR_SEM_TIMEOUT,
+                    ERROR_PIPE_BUSY,
+                ):
                     time.sleep(min(0.005, remaining))
                     continue
                 raise ctypes.WinError(error_code)

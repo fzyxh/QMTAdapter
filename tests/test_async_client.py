@@ -104,6 +104,48 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(set(qmt_order_ids)), 50)
             self.assertEqual(len(self.fake_api.passorder_calls), 50)
 
+    async def test_async_batch_orders_use_single_serial_schedule(self):
+        orders = [
+            OrderRequest(
+                account_id=ACCOUNT_ID,
+                instrument="600000.SH",
+                side="BUY",
+                quantity=100,
+                price_type="LIMIT",
+                limit_price="10.25",
+                remark="async-batch-%02d" % index,
+                client_order_id="CLIENT-ASYNC-BATCH-%02d" % index,
+            )
+            for index in range(3)
+        ]
+
+        async with AsyncQmtClient(config_path=self.config_path) as client:
+            batch_task = asyncio.create_task(
+                client.place_orders(
+                    orders,
+                    interval_ms=50,
+                    wait_for="BROKER_ID",
+                    timeout=5,
+                )
+            )
+            await asyncio.sleep(0.01)
+            self.assertFalse(batch_task.done())
+            receipts = await batch_task
+
+        self.assertEqual(
+            [item.client_order_id for item in receipts],
+            [item.client_order_id for item in orders],
+        )
+        self.assertEqual(len(self.fake_api.passorder_calls), 3)
+        gaps = [
+            later - earlier
+            for earlier, later in zip(
+                self.fake_api.passorder_call_times,
+                self.fake_api.passorder_call_times[1:],
+            )
+        ]
+        self.assertTrue(all(gap >= 0.04 for gap in gaps), gaps)
+
     async def test_async_algo_preview_place_and_query(self):
         order = AlgoOrderRequest(
             account_id=ACCOUNT_ID,

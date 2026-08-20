@@ -175,6 +175,33 @@ class BookLiquidityPlannerTests(unittest.TestCase):
             "CANCELED",
         )
 
+    def test_stale_qmt_status_does_not_downgrade_terminal_states(self):
+        submitted = {
+            "m_nOrderStatus": 50,
+            "m_nVolumeTotalOriginal": 500,
+            "m_nVolumeTraded": 0,
+            "m_nVolumeTotal": 500,
+        }
+        partial = {
+            "m_nOrderStatus": 55,
+            "m_nVolumeTotalOriginal": 500,
+            "m_nVolumeTraded": 100,
+            "m_nVolumeTotal": 400,
+        }
+
+        self.assertEqual(
+            bridge._derive_order_status(submitted, "FILLED"),
+            "FILLED",
+        )
+        self.assertEqual(
+            bridge._derive_order_status(partial, "CANCELED"),
+            "CANCELED",
+        )
+        self.assertEqual(
+            bridge._derive_order_status(submitted, "REJECTED"),
+            "REJECTED",
+        )
+
     def test_chase_price_is_clamped_to_daily_limit(self):
         market_depth = depth(((16.64, 1),))
         market_depth["price_limits"] = {

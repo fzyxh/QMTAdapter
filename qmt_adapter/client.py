@@ -1,6 +1,7 @@
+import time
 import uuid
 from types import TracebackType
-from typing import Any, Dict, Optional, Type
+from typing import Any, Dict, Iterable, List, Optional, Type
 
 from .config import ConfigPath, load_config
 from .exceptions import RemoteError, RequestTimeout, ValidationError
@@ -196,6 +197,86 @@ class QmtClient:
                 data={"client_order_id": receipt.client_order_id},
             )
         return receipt
+
+    def place_orders(
+        self,
+        orders: Iterable[OrderRequest],
+        interval_ms: int,
+        wait_for: str = "LOCAL_ACK",
+        timeout: float = 10.0,
+    ) -> List[OrderReceipt]:
+        """按指定最小时间间隔串行提交多笔普通股票委托。
+
+        本方法会先校验全部委托，再依次复用 :meth:`place_order` 提交。
+        ``interval_ms`` 约束相邻两次单笔调用的开始时间；如果上一笔调用耗时
+        已经超过该间隔，下一笔会在上一笔返回后立即开始。批量内不会并行下单。
+
+        Args:
+            orders: 按提交顺序排列的 :class:`OrderRequest` 可迭代对象。
+            interval_ms: 相邻两笔单笔调用开始时间的最小间隔，单位毫秒；
+                必须为非负整数。
+            wait_for: 每笔委托的返回时点，含义同 :meth:`place_order`。
+            timeout: 每笔委托各自的响应超时时间，单位秒，不是整批总超时。
+
+        Returns:
+            与输入顺序一致的 :class:`OrderReceipt` 列表。空输入返回空列表。
+
+        Raises:
+            ValidationError: 批量参数或任一委托不合法。此类校验会在第一笔
+                提交前完成。
+            RequestTimeout: 当前委托等待响应或 QMT 委托 ID 超时。
+            RemoteError: QMT Bridge 明确拒绝当前委托。
+
+        Note:
+            运行期异常会立即停止后续提交；异常前已经成功返回的委托不会撤销。
+            调用方仍可使用原始 ``OrderRequest.client_order_id`` 查询这些委托。
+        """
+        if not isinstance(interval_ms, int) or isinstance(interval_ms, bool):
+            raise ValidationError("interval_ms must be a non-negative integer")
+        if interval_ms < 0:
+            raise ValidationError("interval_ms must be a non-negative integer")
+
+        try:
+            batch = list(orders)
+        except TypeError:
+            raise ValidationError("orders must be an iterable of OrderRequest")
+
+        normalized_wait_for = str(wait_for).upper()
+        if normalized_wait_for not in ("LOCAL_ACK", "QMT_CALLED", "BROKER_ID"):
+            raise ValidationError(
+                "wait_for must be LOCAL_ACK, QMT_CALLED or BROKER_ID"
+            )
+        client_order_ids = set()
+        for order in batch:
+            if not isinstance(order, OrderRequest):
+                raise ValidationError("orders must contain only OrderRequest")
+            payload = order.to_payload()
+            client_order_id = payload["client_order_id"]
+            if client_order_id in client_order_ids:
+                raise ValidationError(
+                    "duplicate client_order_id in orders: %s" % client_order_id
+                )
+            client_order_ids.add(client_order_id)
+
+        receipts: List[OrderReceipt] = []
+        interval_seconds = interval_ms / 1000.0
+        previous_started_at: Optional[float] = None
+        for order in batch:
+            if previous_started_at is not None:
+                remaining = interval_seconds - (
+                    time.monotonic() - previous_started_at
+                )
+                if remaining > 0:
+                    time.sleep(remaining)
+            previous_started_at = time.monotonic()
+            receipts.append(
+                self.place_order(
+                    order,
+                    wait_for=normalized_wait_for,
+                    timeout=timeout,
+                )
+            )
+        return receipts
 
     def get_order(
         self, client_order_id: str, timeout: float = 5.0

@@ -637,7 +637,7 @@ client.orders.cancel(qmt_order_id="...", account_id="...", account_type="STOCK")
 2. 根据本地映射查找 `qmt_order_id`。
 3. 若仍为 `PENDING_BROKER_ID`，可按请求参数等待一段时间；不得改用“最新委托号”。
 4. 调用 `can_cancel_order`。
-5. 不可撤时刷新委托状态；若已终态，返回当前终态而非错误。
+5. 不可撤时刷新委托状态；若订单已经成交、撤销或被拒绝，直接返回当前状态。
 6. 可撤时调用 `cancel`，返回 `CANCEL_PENDING`。
 7. 通过回报/轮询确认 `CANCELED`、`FILLED` 或 `PARTIALLY_FILLED`。
 
@@ -794,7 +794,7 @@ CREATE TABLE audit_log (
 1. 平安 QMT 模拟版已验证 `order_callback(ContextInfo, orderInfo)` 会在委托状态变化时调用。
 2. `order.place(wait_for=BROKER_ID)` 不返回中间轮询结果，而是在服务端保留原管道请求；`order_callback` 根据 `m_strRemark` 中的 `wire_order_tag` 关联 `m_strOrderSysID`，持久化后直接通过同一命名管道写回最终响应。
 3. 正常委托号关联不依赖外部读取 SQLite，也不等待 `get_trade_detail_data` 轮询。每 5 秒对仍处于 `PENDING_BROKER_ID` 的记录执行恢复对账，用于处理重启遗留或回调漏报。
-4. 资产和持仓默认每 1 秒轮询，成交或委托终态变化后立即触发一次刷新。
+4. 资产和持仓默认每 1 秒轮询，委托成交、撤销或被拒绝后立即触发一次刷新。
 5. 对同一 `qmt_order_id`/`trade_id` 使用 UPSERT，状态版本只增不减。
 6. 手工委托也可进入只读查询结果，但若没有 `wire_order_tag`，标记 `origin=EXTERNAL_QMT`，不冒充 Adapter 委托。
 
@@ -878,7 +878,7 @@ Python 包仍安装在外部策略自己的虚拟环境中。上面的固定目�
 5. 注册 QMT 定时器回调。
 6. 外部库连接并完成握手后发送查询或交易命令。
 
-`stop(ContextInfo)` 必须停止接收新命令、等待当前 SQLite 事务完成、将正在跨越 QMT 调用边界的命令标记为 `UNCERTAIN`，然后关闭管道和线程。不能长时间等待柜台终态。
+`stop(ContextInfo)` 必须停止接收新命令、等待当前 SQLite 事务完成、将正在跨越 QMT 调用边界的命令标记为 `UNCERTAIN`，然后关闭管道和线程。不能长时间等待柜台返回成交、撤销或拒绝结果。
 
 ## 20. 性能与容量目标
 

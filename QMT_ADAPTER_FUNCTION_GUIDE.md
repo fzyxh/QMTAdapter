@@ -1,0 +1,726 @@
+# QMT Adapter 部署与函数调用说明
+
+本文档对应当前代码版本，说明大 QMT 端脚本的部署方式，以及外部封装库的同步、异步函数调用方法。
+
+## 1. 当前支持范围
+
+当前版本只支持普通股票现货业务：
+
+- 查询股票资金账户；
+- 查询股票持仓；
+- 普通股票买入、卖出；
+- 查询本适配器发出的委托；
+- 撤销本适配器发出的委托；
+- 同步调用和 `asyncio` 异步调用；
+- 以 `client_order_id` 为唯一身份的下单幂等重放与冲突检测。
+
+当前不支持信用、期货、期权、组合、算法任务、行情订阅和成交明细独立查询。
+
+当前没有单独的公开 `idempotency_key`。`client_order_id` 同时承担逻辑委托 ID
+和下单幂等键的作用：相同 ID 与相同委托参数只执行一次；相同 ID 与不同参数
+会被拒绝。每一笔新的逻辑委托必须使用新的 `client_order_id`。
+
+## 2. 组成与运行关系
+
+### 2.1 大 QMT 端
+
+文件：
+
+```text
+qmt_side/qmt_adapter_qmt.py
+```
+
+该脚本在大 QMT 的 Python 策略中运行，是唯一调用 QMT 内置交易函数的部分。它负责：
+
+- 调用 `get_trade_detail_data` 查询账户、持仓和委托；
+- 调用 `passorder` 下单；
+- 调用 `can_cancel_order` 和 `cancel` 撤单；
+- 接收 QMT 的 `order_callback` 委托回报；
+- 通过 Windows 命名管道接收外部命令并返回结果；
+- 使用 SQLite 在调用 `passorder` 前保存委托、参数指纹，并持久化 QMT
+  委托 ID 和委托回调原始数据。
+
+### 2.2 外部封装库
+
+目录：
+
+```text
+qmt_adapter/
+```
+
+外部封装库不导入、不依赖任何 QMT 模块，只通过本机命名管道与大 QMT 端通信。
+
+公开对象：
+
+```python
+from qmt_adapter import (
+    AsyncQmtClient,
+    ConnectionClosed,
+    OrderReceipt,
+    OrderRequest,
+    QmtAdapterError,
+    QmtClient,
+    RemoteError,
+    RequestTimeout,
+    ValidationError,
+)
+```
+
+## 3. 大 QMT 端部署
+
+### 3.1 创建配置文件
+
+复制：
+
+```text
+config/bridge_config.example.json
+```
+
+到大 QMT 安装目录下：
+
+```text
+userdata/qmt_adapter/bridge_config.json
+```
+
+默认路径为：
+
+```text
+C:\pazq_qmt_simulate\userdata\qmt_adapter\bridge_config.json
+```
+
+配置示例：
+
+```json
+{
+  "version": 1,
+  "pipe_name": "\\\\.\\pipe\\pazq_qmt_adapter_v1",
+  "auth_token": "请替换为随机的64位十六进制字符串",
+  "environment": "SIMULATION",
+  "trading_enabled": true,
+  "db_path": "C:\\pazq_qmt_simulate\\userdata\\qmt_adapter\\bridge.db",
+  "accounts": [
+    {
+      "account_id": "股票资金账号",
+      "account_type": "STOCK"
+    }
+  ],
+  "timer_period": "10nMilliSecond",
+  "reconcile_interval_seconds": 5.0,
+  "max_commands_per_tick": 20,
+  "max_pending_commands": 1000,
+  "max_message_size": 1048576,
+  "qmt_remark_max_bytes": 64
+}
+```
+
+配置字段：
+
+| 字段 | 说明 |
+|---|---|
+| `version` | 当前固定为 `1` |
+| `pipe_name` | 本机 Windows 命名管道名称，外部库必须使用相同配置 |
+| `auth_token` | 连接鉴权令牌，外部库和 QMT 端必须一致 |
+| `environment` | 当前模拟账户使用 `SIMULATION` |
+| `trading_enabled` | `false` 时拒绝下单和撤单，查询仍可使用 |
+| `db_path` | QMT 端委托持久化 SQLite 文件路径 |
+| `accounts` | 允许查询和交易的股票资金账号白名单 |
+| `timer_period` | QMT 处理命令的定时器周期，当前实测可用值为 `10nMilliSecond` |
+| `reconcile_interval_seconds` | 委托回调遗漏或重启恢复时的对账周期 |
+| `max_commands_per_tick` | 每个 QMT 定时器周期最多处理的命令数 |
+| `max_pending_commands` | QMT 主线程待处理命令队列上限 |
+| `max_message_size` | 单个管道消息最大字节数 |
+| `qmt_remark_max_bytes` | 传入 QMT 的委托备注最大字节数 |
+
+### 3.2 创建并运行 QMT 策略
+
+1. 在大 QMT 的“模型交易”中创建 Python 策略。
+2. 将 `qmt_side/qmt_adapter_qmt.py` 的完整内容放入策略代码。
+   源文件使用 UTF-8；首行编码声明必须与实际文件编码保持一致。
+3. 账户类型选择“股票账号”。
+4. 资金账号选择配置文件中同一个账号。
+5. 主图代码可以使用 `000300`，运行周期使用“日线”。主图只用于启动策略运行环境，不参与适配器交易标的选择。
+6. 需要实际调用下单、撤单函数时，在模型交易中使用交易运行模式。
+7. 启动后确认日志出现：
+
+```text
+QMT Adapter bridge is ready: \\.\pipe\pazq_qmt_adapter_v1
+QMT Adapter trading_enabled=True
+```
+
+QMT 自动调用以下入口，不需要外部程序直接调用：
+
+| QMT入口 | 作用 |
+|---|---|
+| `init(ContextInfo)` | 加载配置、设置账号、启动管道和10 ms命令定时器 |
+| `_qmt_adapter_tick(ContextInfo)` | 在QMT主线程中处理账户、持仓、下单和撤单命令 |
+| `handlebar(ContextInfo)` | 当前为空；适配器不依赖K线触发 |
+| `order_callback(ContextInfo, orderInfo)` | 接收委托回报、保存QMT委托ID及原始字段 |
+| `stop(ContextInfo)` | 停止管道线程并关闭SQLite |
+
+如果大 QMT 的实际安装目录不同，需要同步修改 QMT 脚本顶部的 `CONFIG_PATH`，或者在启动 QMT 前设置 `QMT_ADAPTER_CONFIG` 环境变量。
+
+## 4. 外部库使用准备
+
+将整个 `qmt_adapter` 目录复制到外部项目根目录，保证项目结构类似：
+
+```text
+your_project/
+  qmt_adapter/
+    __init__.py
+    async_client.py
+    client.py
+    config.py
+    exceptions.py
+    models.py
+    protocol.py
+  your_strategy.py
+```
+
+外部库只使用 Python 标准库，不需要安装 QMT Python 包。
+
+外部库的公开类和方法包含内联 Type Hints，并提供 `qmt_adapter/py.typed`
+标记。支持 PEP 561 的 IDE 和静态检查工具可以识别参数类型、返回类型、
+`OrderRequest` 和 `OrderReceipt` 字段类型。Type Hints 只用于开发期检查，
+不会改变 Python 的运行时参数校验规则。
+
+推荐显式传入配置路径：
+
+```python
+CONFIG_PATH = r"C:\pazq_qmt_simulate\userdata\qmt_adapter\bridge_config.json"
+```
+
+外部库读取同一个配置文件中的 `pipe_name`、`auth_token` 和 `environment`，不会读取 SQLite 作为通信通道。
+
+## 5. 同步客户端 QmtClient
+
+### 5.1 推荐连接方式
+
+```python
+from qmt_adapter import QmtClient
+
+
+with QmtClient(config_path=CONFIG_PATH, client_id="my-strategy") as client:
+    health = client.health()
+    print(health)
+```
+
+离开 `with` 代码块时自动关闭命名管道连接。
+
+也可以手动管理：
+
+```python
+client = QmtClient(config_path=CONFIG_PATH, client_id="my-strategy")
+client.connect(timeout=5.0)
+try:
+    print(client.health())
+finally:
+    client.close()
+```
+
+### 5.2 连接信息
+
+连接成功后可读取：
+
+```python
+client.hello
+```
+
+主要字段：
+
+```python
+{
+    "protocol_version": 2,
+    "environment": "SIMULATION",
+    "trading_enabled": True,
+    "idempotency_mode": "CLIENT_ORDER_ID_ENFORCED",
+    "accounts": [...],
+    "commands": [...],
+}
+```
+
+### 5.3 health
+
+```python
+result = client.health(timeout=5.0)
+```
+
+用途：检查 QMT Bridge 是否运行、是否允许交易、命令队列和 QMT 定时器状态。
+
+主要返回字段：
+
+| 字段 | 说明 |
+|---|---|
+| `status` | `OK` 或 `DEGRADED` |
+| `environment` | 当前环境 |
+| `trading_enabled` | 是否允许下单和撤单 |
+| `configured_accounts` | 配置的账号白名单 |
+| `pending_commands` | 等待QMT主线程处理的命令数 |
+| `last_error` | Bridge最近一次错误 |
+| `timer_interval_median_ms` | QMT命令定时器间隔中位数 |
+
+### 5.4 get_account
+
+```python
+result = client.get_account("YOUR_ACCOUNT_ID", timeout=5.0)
+```
+
+返回结构：
+
+```python
+{
+    "account_id": "YOUR_ACCOUNT_ID",
+    "account_type": "STOCK",
+    "items": [
+        {
+            "account_id": "YOUR_ACCOUNT_ID",
+            "account_type": "STOCK",
+            "available_cash": 1000000.0,
+            "raw": {...},
+        }
+    ],
+    "count": 1,
+    "as_of": "UTC时间",
+}
+```
+
+`available_cash` 来自 QMT 字段 `m_dAvailable`；其他未标准化账户字段保留在 `raw` 中。
+
+### 5.5 list_positions
+
+```python
+result = client.list_positions("YOUR_ACCOUNT_ID", timeout=5.0)
+```
+
+每个持仓项目主要字段：
+
+```python
+{
+    "account_id": "YOUR_ACCOUNT_ID",
+    "account_type": "STOCK",
+    "instrument": "601919",
+    "total_quantity": 1000,
+    "raw": {...},
+}
+```
+
+`total_quantity` 来自 QMT 字段 `m_nVolume`。可用数量、冻结数量、成本等未标准化字段保留在 `raw` 中。
+
+### 5.6 place_order
+
+函数签名：
+
+```python
+receipt = client.place_order(
+    order,
+    wait_for="LOCAL_ACK",
+    timeout=10.0,
+)
+```
+
+`order` 必须是 `OrderRequest`。
+
+`OrderRequest` 创建时会生成一次 `client_order_id`（也可由调用方显式传入）。
+同一个对象重复提交时，该 ID 不会变化。Bridge 对委托字段做规范化后计算参数
+指纹，并按以下规则处理：
+
+| 情况 | 处理 |
+|---|---|
+| 新 `client_order_id` | 先持久化，再调用一次 `passorder` |
+| 相同 ID、相同规范化参数 | 返回已有委托，`idempotent_replay=True`，不再调用 `passorder` |
+| 相同 ID、不同参数 | 返回 `CLIENT_ORDER_ID_CONFLICT` |
+| 已越过可能调用 `passorder` 的边界，但没有可靠 QMT 委托 ID | 返回 `COMMAND_UNCERTAIN`，不自动重下 |
+
+价格指纹会规范化十进制表示，例如限价 `10.2500` 与 `10.25` 视为相同值。
+
+对手方最优买入示例：
+
+```python
+from qmt_adapter import OrderRequest, QmtClient
+
+
+order = OrderRequest(
+    account_id="YOUR_ACCOUNT_ID",
+    instrument="601919.SH",
+    side="BUY",
+    quantity=500,
+    price_type="COUNTERPARTY",
+    remark="strategy-a-buy",
+)
+
+with QmtClient(config_path=CONFIG_PATH) as client:
+    receipt = client.place_order(
+        order,
+        wait_for="BROKER_ID",
+        timeout=10.0,
+    )
+    print(receipt.client_order_id)
+    print(receipt.qmt_order_id)
+```
+
+限价卖出示例：
+
+```python
+order = OrderRequest(
+    account_id="YOUR_ACCOUNT_ID",
+    instrument="600105.SH",
+    side="SELL",
+    quantity=200,
+    price_type="LIMIT",
+    limit_price="40.50",
+    remark="strategy-a-sell",
+)
+```
+
+#### wait_for
+
+| 值 | 当前实现的返回时点 | `qmt_order_id` |
+|---|---|---|
+| `LOCAL_ACK` | SQLite记录已创建，且 `passorder` 已调用并且未抛异常 | 通常暂时为 `None` |
+| `QMT_CALLED` | 当前版本与 `LOCAL_ACK` 的实际返回时点相同 | 通常暂时为 `None` |
+| `BROKER_ID` | `order_callback` 已关联QMT委托ID，并通过原命名管道请求直接返回 | 正常情况下非空 |
+
+`BROKER_ID` 不依赖外部轮询 SQLite。等待期间同一个客户端连接不能发送下一条请求。
+
+如果等待超时，不能据此认定 QMT 没有接收委托。应保留原始
+`OrderRequest`（或至少完整参数和 `client_order_id`），重新连接后先调用
+`get_order` 查询；需要重试 `place_order` 时必须提交原对象或相同 ID、相同参数，
+Bridge 会重放已有结果而不会重复调用 `passorder`。
+
+### 5.7 get_order
+
+```python
+order = client.get_order(client_order_id, timeout=5.0)
+```
+
+该函数查询本适配器持久化的委托记录，不是直接向柜台重新发起一次委托查询。
+
+主要字段：
+
+| 字段 | 说明 |
+|---|---|
+| `client_order_id` | 外部统一委托ID |
+| `request_id` | 原始 `order.place` 协议请求 ID |
+| `qmt_order_id` | QMT委托ID，尚未收到回报时可能为空 |
+| `instrument` | `代码.市场` |
+| `side` | `BUY` 或 `SELL` |
+| `quantity` | 委托股数 |
+| `price_type` | 统一价格类型 |
+| `order_status` | 适配器内部状态 |
+| `raw` | 最新QMT委托回调原始字段 |
+| `created_at` | QMT端创建记录的UTC时间 |
+| `updated_at` | 最近回调持久化的UTC时间 |
+
+### 5.8 list_orders
+
+查询指定账号的适配器委托：
+
+```python
+result = client.list_orders(
+    account_id="YOUR_ACCOUNT_ID",
+    timeout=5.0,
+)
+```
+
+查询全部已配置账号的适配器委托：
+
+```python
+result = client.list_orders(timeout=5.0)
+```
+
+返回：
+
+```python
+{
+    "items": [...],
+    "count": 50,
+}
+```
+
+当前版本没有把所有 QMT 状态码标准化成统一成交状态。判断成交情况时应结合 `raw` 中的字段，例如：
+
+- `m_nVolumeTotalOriginal`：原始委托数量；
+- `m_nVolumeTraded`：已成交数量；
+- `m_nVolumeTotal`：剩余数量；
+- `m_dTradedPrice`：成交均价；
+- `m_dTradeAmount`：成交金额；
+- `m_nOrderStatus`：QMT原始委托状态码；
+- `m_strErrorMsg`：QMT错误信息。
+
+不同 QMT 版本的数字状态枚举可能不同，不应只根据单个数字状态码编写跨版本逻辑。
+
+### 5.9 cancel_order
+
+```python
+result = client.cancel_order(
+    client_order_id,
+    timeout=10.0,
+)
+```
+
+撤单使用 `client_order_id`，Bridge 从持久化记录中找到对应的 `qmt_order_id`，然后调用 QMT 撤单函数。
+
+返回示例：
+
+```python
+{
+    "client_order_id": "...",
+    "qmt_order_id": "...",
+    "cancel_requested": True,
+    "order_status": "CANCEL_PENDING",
+}
+```
+
+`cancel_requested=True` 只表示撤单请求已经发出，不代表柜台最终撤单成功。
+当前幂等规则仅用于 `order.place`；撤单没有独立幂等键。重复调用撤单时，Bridge
+会重新根据 QMT 的 `can_cancel_order` 结果决定是否再次调用 `cancel`，不会因为
+`client_order_id` 相同而直接禁止撤单。
+
+## 6. OrderRequest 参数
+
+构造函数：
+
+```python
+OrderRequest(
+    account_id,
+    instrument,
+    side,
+    quantity,
+    price_type="LATEST",
+    limit_price=None,
+    remark="",
+    account_type="STOCK",
+    business_type="CASH",
+    quantity_type="SHARES",
+    client_order_id=None,
+)
+```
+
+| 参数 | 要求 |
+|---|---|
+| `account_id` | 必须存在于配置文件账号白名单 |
+| `instrument` | 必须使用 `601919.SH`、`000001.SZ`、`430047.BJ` 格式 |
+| `side` | `BUY` 或 `SELL` |
+| `quantity` | 正整数；股票买入必须为100股整数倍 |
+| `price_type` | 见价格类型表 |
+| `limit_price` | `LIMIT` 时为必填限价；交易所原生市价申报时为可选保护限价，默认 `0` |
+| `remark` | 用户备注；Bridge会在前面添加用于回报关联的标签 |
+| `account_type` | 当前只能为 `STOCK` |
+| `business_type` | 当前只能为 `CASH` |
+| `quantity_type` | 当前只能为 `SHARES` |
+| `client_order_id` | 可选；不传时在 `OrderRequest` 创建时生成一次 UUID4。它是逻辑委托唯一 ID，也是下单幂等身份 |
+
+不要为同一笔逻辑委托重新构造一个没有显式 `client_order_id` 的
+`OrderRequest`，否则会生成新 ID，并被视为另一笔有效委托。反过来，多笔参数完全
+相同但业务上独立的委托，应当分别使用不同 ID。
+
+选价后限价申报类型：
+
+| 值 | QMT `prType` | 实际申报含义 |
+|---|---:|---|
+| `ASK5`～`ASK1` | 0～4 | 读取卖五至卖一价格后，按具体价格限价申报 |
+| `LATEST` | 5 | 读取最新价后限价申报，不是原生市价单 |
+| `BID1`～`BID5` | 6～10 | 读取买一至买五价格后，按具体价格限价申报 |
+| `LIMIT` | 11 | 使用 `limit_price` 限价申报 |
+| `LIMIT_UP_DOWN` | 12 | 买入取涨停价、卖出取跌停价后限价申报 |
+| `QUEUE` | 13 | 读取本方一档价格后限价申报 |
+| `COUNTERPARTY` | 14 | 读取对方一档价格后限价申报；买入等于 `ASK1`，卖出等于 `BID1` |
+
+交易所原生市价申报类型：
+
+| 值 | QMT `prType` | 适用市场 | 申报含义 |
+|---|---:|---|---|
+| `MARKET_SH_CONVERT_5_CANCEL` | 42 | `.SH`、`.BJ` | 最优五档即时成交，剩余撤销 |
+| `MARKET_SH_CONVERT_5_LIMIT` | 43 | `.SH`、`.BJ` | 最优五档即时成交，剩余转限价 |
+| `MARKET_PEER_PRICE_FIRST` | 44 | `.SH`、`.SZ`、`.BJ` | 对手方最优价格市价申报 |
+| `MARKET_MINE_PRICE_FIRST` | 45 | `.SH`、`.SZ`、`.BJ` | 本方最优价格市价申报 |
+| `MARKET_SZ_INSTBUSI_RESTCANCEL` | 46 | `.SZ` | 即时成交，剩余撤销 |
+| `MARKET_SZ_CONVERT_5_CANCEL` | 47 | `.SZ` | 最优五档即时成交，剩余撤销 |
+| `MARKET_SZ_FULL_OR_CANCEL` | 48 | `.SZ` | 全额成交，否则全部撤销 |
+
+Bridge 和外部 `OrderRequest` 都会校验价格模式与证券市场是否匹配。原生市价
+申报的 `limit_price` 会传入 QMT 的 `price` 参数作为保护限价；不传时传 `0`。
+QMT 当前官方枚举说明标注 `42～48` 不支持模拟交易，因此模拟环境可能返回
+废单或明确错误；是否能由实盘柜台接受必须在对应市场、交易时段和账户权限下验证。
+
+## 7. OrderReceipt 字段
+
+`place_order` 返回 `OrderReceipt`：
+
+```python
+receipt.request_id
+receipt.client_order_id
+receipt.command_status
+receipt.order_status
+receipt.qmt_order_id
+receipt.idempotent_replay
+receipt.raw
+```
+
+注意：
+
+- `command_status="SUCCEEDED"` 只说明QMT下单函数调用未抛异常，不等于成交；
+- 使用 `LOCAL_ACK` 或 `QMT_CALLED` 时，`qmt_order_id` 可以为空；
+- 使用 `BROKER_ID` 时，正常返回会包含 `qmt_order_id`；
+- `idempotent_replay=True` 表示本次请求命中了同一 `client_order_id` 的已存委托，
+  本次没有再次调用 `passorder`；
+- `request_id` 是本次通信尝试的 ID；幂等重放时它会变化，不是逻辑委托身份。
+
+## 8. 异步客户端 AsyncQmtClient
+
+`AsyncQmtClient` 提供与 `QmtClient` 对应的异步函数：
+
+```python
+async with AsyncQmtClient(config_path=CONFIG_PATH) as client:
+    health = await client.health()
+    account = await client.get_account("YOUR_ACCOUNT_ID")
+    positions = await client.list_positions("YOUR_ACCOUNT_ID")
+```
+
+完整方法：
+
+| 异步函数 | 对应同步函数 |
+|---|---|
+| `await connect(timeout)` | `connect(timeout)` |
+| `await close()` | `close()` |
+| `await health(timeout)` | `health(timeout)` |
+| `await get_account(account_id, timeout)` | `get_account(...)` |
+| `await list_positions(account_id, timeout)` | `list_positions(...)` |
+| `await place_order(order, wait_for, timeout)` | `place_order(...)` |
+| `await get_order(client_order_id, timeout)` | `get_order(...)` |
+| `await list_orders(account_id, timeout)` | `list_orders(...)` |
+| `await cancel_order(client_order_id, timeout)` | `cancel_order(...)` |
+
+内部实现只有一个工作线程、一个命名管道连接和一把异步锁，因此同一个 `AsyncQmtClient` 的所有请求严格串行，不会并行调用 QMT 的 `passorder`。
+
+单笔异步下单：
+
+```python
+import asyncio
+
+from qmt_adapter import AsyncQmtClient, OrderRequest
+
+
+async def main():
+    order = OrderRequest(
+        account_id="YOUR_ACCOUNT_ID",
+        instrument="601919.SH",
+        side="BUY",
+        quantity=100,
+        price_type="COUNTERPARTY",
+        remark="async-buy",
+    )
+
+    async with AsyncQmtClient(config_path=CONFIG_PATH) as client:
+        receipt = await client.place_order(
+            order,
+            wait_for="BROKER_ID",
+            timeout=10.0,
+        )
+        print(receipt.client_order_id, receipt.qmt_order_id)
+
+
+asyncio.run(main())
+```
+
+按固定节奏创建多笔任务、最后统一等待：
+
+```python
+import asyncio
+
+
+async def submit_batch(client, orders, interval_seconds=0.05):
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    tasks = []
+
+    for index, order in enumerate(orders):
+        target = start + index * interval_seconds
+        remaining = target - loop.time()
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+
+        tasks.append(
+            asyncio.create_task(
+                client.place_order(
+                    order,
+                    wait_for="LOCAL_ACK",
+                    timeout=10.0,
+                )
+            )
+        )
+
+    receipts = await asyncio.gather(*tasks)
+    return receipts
+```
+
+此方式只是让调用方可以继续运行其他协程，实际 QMT 请求仍按顺序执行。如果单笔调用耗时超过目标间隔，后续任务会排队，不能维持原定送单间隔。
+
+批量下单阶段使用 `LOCAL_ACK` 可以避免每笔都等待委托ID。全部发送完成后，再根据每个 `receipt.client_order_id` 调用 `get_order`，或者统一调用 `list_orders` 查询QMT委托ID和回调字段。
+
+## 9. 异常处理
+
+```python
+from qmt_adapter import QmtAdapterError
+
+
+try:
+    receipt = client.place_order(order, wait_for="BROKER_ID", timeout=10.0)
+except QmtAdapterError as exc:
+    print(exc.code)
+    print(exc.request_id)
+    print(exc.data)
+    print(str(exc))
+```
+
+异常类型：
+
+| 类型 | 说明 |
+|---|---|
+| `ValidationError` | 外部请求参数不合法 |
+| `RemoteError` | QMT Bridge明确返回错误 |
+| `RequestTimeout` | 连接或请求等待超时 |
+| `ConnectionClosed` | 命名管道连接已经关闭 |
+| `QmtAdapterError` | 上述适配器异常的基类 |
+
+重要规则：下单请求一旦跨过 `passorder` 调用边界，连接断开、超时或
+`COMMAND_UNCERTAIN` 都不能证明委托没有提交。Bridge 不会自动重下不确定命令。
+先查询原 `client_order_id`；若重试下单，只能使用原 ID 和完全相同的委托参数。
+使用新 ID 会被当成新委托执行。
+
+## 10. 通信、持久化和并发限制
+
+- 命名管道负责实时请求和响应；
+- SQLite只由QMT端用于委托映射、回调持久化和重启恢复；
+- 外部库不通过SQLite向QMT发送命令，也不通过SQLite等待实时结果；
+- SQLite 的写入只发生在 QMT Bridge 进程内；它用于持久化和幂等判断，不承担
+  双向通信；
+- 旧版 `orders` 表会在 QMT Bridge 启动时自动增加并回填 `payload_hash`；
+- 当前管道服务只允许一个活动客户端连接；
+- 单个同步或异步客户端也只允许一条请求在途；
+- 正常断开后，服务端会重新创建管道并接受下一次连接；
+- QMT账户、持仓、下单和撤单命令在QMT主线程的定时器中执行；
+- `system.health`、`order.get` 和 `order.list` 是本地持久化读取，不需要调用QMT交易函数。
+
+## 11. 推荐的基本调用顺序
+
+```text
+启动大QMT并登录账号
+  -> 启动QMT Adapter策略
+  -> 外部客户端connect
+  -> health确认环境和trading_enabled
+  -> get_account/list_positions确认账号
+  -> place_order
+  -> 保存client_order_id
+  -> get_order/list_orders查看QMT委托ID及回调
+  -> 如需撤单则cancel_order(client_order_id)
+  -> close
+```
+
+外部业务程序至少应持久化 `client_order_id`、请求参数和最终获得的 `qmt_order_id`，避免程序重启后失去委托关联。
+
+## 12. 升级说明
+
+本版本的命名管道协议为 v2。外部库和 QMT 端脚本必须同时升级；v2 客户端
+连接旧 v1 Bridge，或旧客户端连接 v2 Bridge，都会收到
+`PROTOCOL_MISMATCH`，不会继续发送交易命令。升级时先停止外部客户端，替换并
+重启 QMT 策略，再启动外部客户端。

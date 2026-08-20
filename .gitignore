@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+*.db
+*.db-shm
+*.db-wal
+stress_results/
+
+*.zip
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

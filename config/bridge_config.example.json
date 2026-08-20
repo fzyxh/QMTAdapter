@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "pipe_name": "\\\\.\\pipe\\pazq_qmt_adapter_v1",
+  "auth_token": "replace-with-a-random-64-character-hex-token",
+  "environment": "SIMULATION",
+  "trading_enabled": false,
+  "db_path": "C:\\pazq_qmt_simulate\\userdata\\qmt_adapter\\bridge.db",
+  "accounts": [
+    {
+      "account_id": "replace-with-stock-account-id",
+      "account_type": "STOCK"
+    }
+  ],
+  "timer_period": "10nMilliSecond",
+  "reconcile_interval_seconds": 5.0,
+  "max_commands_per_tick": 20,
+  "max_pending_commands": 1000,
+  "max_message_size": 1048576,
+  "qmt_remark_max_bytes": 64
+}

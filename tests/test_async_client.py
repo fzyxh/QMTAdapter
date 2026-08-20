@@ -20,7 +20,6 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             "version": 1,
             "pipe_name": r"\\.\pipe\qmt_adapter_async_test_%s" % uuid.uuid4().hex,
             "auth_token": uuid.uuid4().hex + uuid.uuid4().hex,
-            "environment": "SIMULATION",
             "db_path": str(base / "bridge.db"),
             "accounts": [{"account_id": ACCOUNT_ID, "account_type": "STOCK"}],
             "timer_period": "10nMilliSecond",
@@ -46,7 +45,7 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             config_path=self.config_path, client_id="async-e2e"
         ) as client:
             health = await client.health()
-            self.assertEqual(health["environment"], "SIMULATION")
+            self.assertNotIn("environment", health)
 
             account = await client.get_account(ACCOUNT_ID)
             self.assertEqual(account["items"][0]["available_cash"], 20000000.0)

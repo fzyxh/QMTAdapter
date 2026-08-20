@@ -31,7 +31,7 @@ CONFIG_PATH = globals().get("QMT_ADAPTER_CONFIG_PATH") or os.environ.get(
     r"C:\QMTAdapter\config\bridge_config.json",
 )
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 MAX_MESSAGE_SIZE = 1024 * 1024
 STRATEGY_NAME = "QMT_ADAPTER_V1"
 _RUNTIME = None
@@ -903,19 +903,6 @@ class PipeServer(object):
                         },
                     )
                     return
-                if message.get("environment") != self.runtime.environment:
-                    self._send_direct(
-                        handle,
-                        {
-                            "v": PROTOCOL_VERSION,
-                            "type": "hello_ack",
-                            "request_id": message.get("message_id"),
-                            "ok": False,
-                            "code": "ENVIRONMENT_MISMATCH",
-                            "error": {"message": "client and bridge environment differ"},
-                        },
-                    )
-                    return
                 authenticated = True
                 with self.handle_lock:
                     self.authenticated_connection_id = connection_id
@@ -1387,7 +1374,6 @@ class BridgeRuntime(object):
 
     def __init__(self, config):
         self.config = config
-        self.environment = config.get("environment", "SIMULATION")
         self.accounts = self._load_accounts(config.get("accounts", []))
         self.inbound = queue.Queue(maxsize=int(config.get("max_pending_commands", 1000)))
         self.order_events = queue.Queue()
@@ -1450,7 +1436,6 @@ class BridgeRuntime(object):
             "code": "OK",
             "result": {
                 "protocol_version": PROTOCOL_VERSION,
-                "environment": self.environment,
                 "idempotency_mode": "CLIENT_ORDER_ID_ENFORCED",
                 "accounts": list(self.accounts.values()),
                 "commands": [
@@ -1711,7 +1696,6 @@ class BridgeRuntime(object):
             tick_max_ms = None
         return {
             "status": "OK" if not self.last_error else "DEGRADED",
-            "environment": self.environment,
             "connected": self.connected,
             "configured_accounts": list(self.accounts.values()),
             "pending_commands": self.inbound.qsize(),

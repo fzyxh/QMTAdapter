@@ -16,7 +16,6 @@ class ProtocolVersionTests(unittest.TestCase):
                     {
                         "pipe_name": r"\\.\pipe\unused_protocol_test",
                         "auth_token": "test-token",
-                        "environment": "SIMULATION",
                     }
                 ),
                 encoding="utf-8",
@@ -29,7 +28,7 @@ class ProtocolVersionTests(unittest.TestCase):
                     "type": "hello_ack",
                     "ok": True,
                     "code": "OK",
-                    "result": {"protocol_version": 1},
+                    "result": {"protocol_version": 2},
                 }
             )
             client.connection.close = mock.Mock()

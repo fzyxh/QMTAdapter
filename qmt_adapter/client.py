@@ -9,7 +9,7 @@ from .protocol import NamedPipeConnection
 from .version import __version__
 
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 
 
 class QmtClient:
@@ -51,7 +51,7 @@ class QmtClient:
 
         Raises:
             RequestTimeout: 在指定时间内无法完成连接。
-            RemoteError: Bridge 拒绝鉴权或运行环境不匹配。
+            RemoteError: Bridge 拒绝鉴权或协议版本不匹配。
             OSError: Windows 命名管道连接失败。
         """
         self.connection.connect(timeout=timeout)
@@ -64,7 +64,6 @@ class QmtClient:
                 "client_id": self.client_id,
                 "client_version": __version__,
                 "auth_token": self.config["auth_token"],
-                "environment": self.config.get("environment", "SIMULATION"),
             },
             timeout=timeout,
             correlation_field="message_id",

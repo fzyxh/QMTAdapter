@@ -203,7 +203,6 @@ class NamedPipeEndToEndTests(unittest.TestCase):
             "version": 1,
             "pipe_name": r"\\.\pipe\qmt_adapter_test_%s" % uuid.uuid4().hex,
             "auth_token": uuid.uuid4().hex + uuid.uuid4().hex,
-            "environment": "SIMULATION",
             "db_path": str(base / "bridge.db"),
             "accounts": [
                 {"account_id": ACCOUNT_ID, "account_type": "STOCK"}
@@ -231,7 +230,7 @@ class NamedPipeEndToEndTests(unittest.TestCase):
             config_path=self.config_path, client_id="named-pipe-e2e"
         ) as client:
             health = client.health()
-            self.assertEqual(health["environment"], "SIMULATION")
+            self.assertNotIn("environment", health)
             account = client.get_account(ACCOUNT_ID)
             self.assertEqual(account["count"], 1)
             self.assertEqual(account["items"][0]["available_cash"], 20000000.0)

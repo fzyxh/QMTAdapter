@@ -93,7 +93,6 @@ def _initial_config(account_ids: Iterable[str], db_path: Path) -> Dict[str, Any]
         "version": 1,
         "pipe_name": r"\\.\pipe\qmt_adapter_v1",
         "auth_token": secrets.token_hex(32),
-        "environment": "SIMULATION",
         "db_path": str(db_path),
         "accounts": normalized_accounts,
         "timer_period": "10nMilliSecond",
@@ -105,14 +104,26 @@ def _initial_config(account_ids: Iterable[str], db_path: Path) -> Dict[str, Any]
     }
 
 
+def _remove_obsolete_environment(config_path: Path) -> None:
+    config = json.loads(config_path.read_text(encoding="ascii"))
+    if "environment" not in config:
+        return
+    del config["environment"]
+    encoded_config = (json.dumps(config, ensure_ascii=True, indent=2) + "\n").encode(
+        "ascii"
+    )
+    _atomic_write(config_path, encoded_config)
+
+
 def deploy(
     root: Optional[PathValue] = None,
     account_ids: Iterable[str] = (),
 ) -> Dict[str, Any]:
     """Deploy or upgrade the QMT-side runtime.
 
-    The bridge and loader are replaced atomically on every call. An existing
-    configuration and SQLite database are never overwritten.
+    The bridge and loader are replaced atomically on every call. Existing
+    account, authentication, database settings and SQLite data are preserved.
+    The obsolete ``environment`` setting is removed from an existing config.
 
     Args:
         root: Absolute deployment directory. Defaults to ``C:\\QMTAdapter``.
@@ -150,6 +161,8 @@ def deploy(
         ).encode("ascii")
         _atomic_write(config_path, encoded_config)
         config_created = True
+    else:
+        _remove_obsolete_environment(config_path)
 
     return {
         "root": install_root,

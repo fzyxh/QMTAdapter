@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from qmt_adapter import AsyncQmtClient, OrderRequest, QmtClient
 
 
-CONFIRM_TEXT = "PLACE_50_SIMULATION_ORDERS"
+CONFIRM_TEXT = "PLACE_50_STOCK_ORDERS"
 INSTRUMENT = "601919.SH"
 ORDER_COUNT = 50
 INTERVAL_SECONDS = 0.05
@@ -71,13 +71,11 @@ def _build_orders(seed, mode, account_id):
 
 
 def _validate_client(client, account_id):
-    if client.hello.get("environment") != "SIMULATION":
-        raise RuntimeError("bridge environment is not SIMULATION")
     configured_ids = {
         str(item.get("account_id")) for item in client.hello.get("accounts", [])
     }
     if account_id not in configured_ids:
-        raise RuntimeError("configured simulation account does not match")
+        raise RuntimeError("configured account does not match")
 
 
 async def _submit_one(client, order, scheduled_at, loop):
@@ -366,7 +364,7 @@ def run_sync(seed, account_id):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Place exactly 50 simulation BUY orders for 601919.SH."
+        description="Place exactly 50 BUY orders for 601919.SH."
     )
     parser.add_argument("--confirm", required=True)
     parser.add_argument("--account-id", required=True)

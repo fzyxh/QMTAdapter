@@ -2,7 +2,6 @@
   "version": 1,
   "pipe_name": "\\\\.\\pipe\\qmt_adapter_v1",
   "auth_token": "replace-with-a-random-64-character-hex-token",
-  "environment": "SIMULATION",
   "db_path": "C:\\QMTAdapter\\data\\bridge.db",
   "accounts": [
     {

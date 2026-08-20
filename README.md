@@ -63,9 +63,9 @@ C:\QMTAdapter\
 不会在行情回调、查询或下单时重复读取文件。
 
 升级时再次执行 `qmt-adapter deploy`。命令只更新
-`C:\QMTAdapter\runtime\qmt_adapter_qmt.py` 和加载器，不覆盖 `config` 与
-`data` 目录中的配置、数据库和 WAL 文件。更新后停止并重新启动 QMT 策略，
-使其加载新代码。
+`C:\QMTAdapter\runtime\qmt_adapter_qmt.py` 和加载器，并从旧配置中删除已经废弃的
+`environment` 字段；账号、鉴权令牌、数据库路径以及 `data` 目录中的文件均保持
+不变。更新后停止并重新启动 QMT 策略，使其加载新代码。
 
 ## 第一步：验证账户和持仓
 

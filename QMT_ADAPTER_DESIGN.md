@@ -1,6 +1,6 @@
 # QMT Adapter 交易桥接系统设计
 
-> 当前实现阶段说明（2026-08-20）：当前协议 v2 已实现普通股票账户、持仓、
+> 当前实现阶段说明（2026-08-20）：当前协议 v3 已实现普通股票账户、持仓、
 > 买卖、委托查询、撤单、下单幂等，以及盘口流动性加权算法父单。算法执行、
 > 持久化和重试的当前权威设计见 `QMT_ALGO_ORDER_DESIGN.md`。实现中不再设置独立
 > `idempotency_key`；`client_order_id` 是逻辑委托 ID，也是唯一的下单幂等
@@ -174,8 +174,7 @@ QMT Bridge 采用以下线程规则：
   "client_version": "0.1.0",
   "supported_versions": [1],
   "auth_token": "<从受限配置文件读取>",
-  "last_event_seq": 1024,
-  "environment": "SIMULATION"
+  "last_event_seq": 1024
 }
 ```
 
@@ -242,7 +241,6 @@ QMT Bridge 采用以下线程规则：
 |---|---|
 | `system.health` | QMT、管道、数据库、调度器、账号订阅和对账状态 |
 | `system.capabilities` | 支持的命令、账号类型、价格模式和字段版本 |
-| `system.mode` | 返回 `READ_ONLY`、`SIMULATION` 或 `LIVE`；不可通过远程命令开启实盘 |
 | `reconcile.run` | 手动触发一次委托/成交/持仓对账 |
 
 ### 7.2 查询命令

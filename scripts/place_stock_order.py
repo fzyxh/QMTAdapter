@@ -8,11 +8,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from qmt_adapter import OrderRequest, QmtAdapterError, QmtClient
 
 
-CONFIRM_TEXT = "PLACE_SIMULATION_ORDER"
+CONFIRM_TEXT = "PLACE_STOCK_ORDER"
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Place one QMT simulation stock order.")
+    parser = argparse.ArgumentParser(description="Place one QMT stock order.")
     parser.add_argument("--account-id", required=True)
     parser.add_argument("--instrument", required=True, help="Example: 600000.SH")
     parser.add_argument("--side", required=True, choices=("BUY", "SELL"))
@@ -57,9 +57,6 @@ def main():
 
     try:
         with QmtClient(config_path=args.config, client_id="stock-order-cli") as client:
-            if client.hello.get("environment") != "SIMULATION":
-                print("Refusing order: bridge environment is not SIMULATION", file=sys.stderr)
-                return 2
             receipt = client.place_order(
                 OrderRequest(
                     account_id=args.account_id,

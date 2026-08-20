@@ -33,7 +33,7 @@ class DeployTests(unittest.TestCase):
             )
 
             config = json.loads(result["config_path"].read_text(encoding="ascii"))
-            self.assertEqual(config["environment"], "SIMULATION")
+            self.assertNotIn("environment", config)
             self.assertEqual(config["accounts"][0]["account_id"], "SIM001")
             self.assertEqual(len(config["auth_token"]), 64)
             int(config["auth_token"], 16)
@@ -54,6 +54,25 @@ class DeployTests(unittest.TestCase):
                 second["database_path"].read_bytes(), b"database-sentinel"
             )
             self.assertNotEqual(second["bridge_path"].read_bytes(), b"old-bridge")
+
+    def test_redeploy_removes_obsolete_environment_only(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "QMTAdapter"
+            first = deploy(root=root, account_ids=["SIM001"])
+            config = json.loads(first["config_path"].read_text(encoding="ascii"))
+            config["environment"] = "SIMULATION"
+            first["config_path"].write_text(
+                json.dumps(config, ensure_ascii=True, indent=2) + "\n",
+                encoding="ascii",
+            )
+
+            second = deploy(root=root)
+
+            updated = json.loads(second["config_path"].read_text(encoding="ascii"))
+            self.assertFalse(second["config_created"])
+            self.assertNotIn("environment", updated)
+            self.assertEqual(updated["accounts"], config["accounts"])
+            self.assertEqual(updated["auth_token"], config["auth_token"])
 
     def test_first_deploy_requires_account_id(self):
         with tempfile.TemporaryDirectory() as temp_dir:

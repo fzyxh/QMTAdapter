@@ -115,7 +115,7 @@ SQLite 启用 WAL 后，运行期间可能在同一目录生成 `bridge.db-wal` 
 |---|---|---|
 | QMT 短加载器 | `C:\QMTAdapter\qmt_adapter_loader.py` | 部署命令更新 |
 | QMT Bridge | `C:\QMTAdapter\runtime\qmt_adapter_qmt.py` | 部署命令更新 |
-| JSON 配置 | `C:\QMTAdapter\config\bridge_config.json` | 部署命令仅首次创建 |
+| JSON 配置 | `C:\QMTAdapter\config\bridge_config.json` | 首次部署时创建；升级时只删除已废弃的 `environment` 字段 |
 | SQLite 数据库 | `C:\QMTAdapter\data\bridge.db` | QMT Bridge 首次启动时创建 |
 | SQLite WAL/SHM | `C:\QMTAdapter\data\bridge.db-wal`、`bridge.db-shm` | SQLite 按运行状态创建或删除 |
 
@@ -126,7 +126,6 @@ SQLite 启用 WAL 后，运行期间可能在同一目录生成 `bridge.db-wal` 
   "version": 1,
   "pipe_name": "\\\\.\\pipe\\qmt_adapter_v1",
   "auth_token": "由部署命令生成的64位十六进制字符串",
-  "environment": "SIMULATION",
   "db_path": "C:\\QMTAdapter\\data\\bridge.db",
   "accounts": [
     {
@@ -150,7 +149,6 @@ SQLite 启用 WAL 后，运行期间可能在同一目录生成 `bridge.db-wal` 
 | `version` | 当前固定为 `1` |
 | `pipe_name` | 本机 Windows 命名管道名称，外部库必须使用相同配置 |
 | `auth_token` | 部署时随机生成的连接鉴权令牌，外部库和 QMT 端读取同一配置 |
-| `environment` | 当前模拟账户使用 `SIMULATION` |
 | `db_path` | QMT 端委托持久化 SQLite 文件路径 |
 | `accounts` | 允许查询和交易的股票资金账号白名单 |
 | `timer_period` | QMT 处理命令的定时器周期，当前实测可用值为 `10nMilliSecond` |
@@ -217,7 +215,7 @@ QMT 自动调用以下入口，不需要外部程序直接调用：
 CONFIG_PATH = r"C:\QMTAdapter\config\bridge_config.json"
 ```
 
-外部库读取同一个 JSON 配置中的 `pipe_name`、`auth_token` 和 `environment`。
+外部库读取同一个 JSON 配置中的 `pipe_name` 和 `auth_token`。
 外部库不会直接读取或写入 SQLite；实时请求和响应只通过命名管道传输。
 
 ## 5. 同步客户端 QmtClient
@@ -258,8 +256,7 @@ client.hello
 
 ```python
 {
-    "protocol_version": 2,
-    "environment": "SIMULATION",
+    "protocol_version": 3,
     "idempotency_mode": "CLIENT_ORDER_ID_ENFORCED",
     "accounts": [...],
     "commands": [...],
@@ -279,7 +276,6 @@ result = client.health(timeout=5.0)
 | 字段 | 说明 |
 |---|---|
 | `status` | `OK` 或 `DEGRADED` |
-| `environment` | 当前环境 |
 | `configured_accounts` | 配置的账号白名单 |
 | `pending_commands` | 等待QMT主线程处理的命令数 |
 | `last_error` | Bridge最近一次错误 |

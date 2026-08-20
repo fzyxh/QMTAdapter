@@ -21,7 +21,6 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             "pipe_name": r"\\.\pipe\qmt_adapter_async_test_%s" % uuid.uuid4().hex,
             "auth_token": uuid.uuid4().hex + uuid.uuid4().hex,
             "environment": "SIMULATION",
-            "trading_enabled": True,
             "db_path": str(base / "bridge.db"),
             "accounts": [{"account_id": ACCOUNT_ID, "account_type": "STOCK"}],
             "timer_period": "10nMilliSecond",

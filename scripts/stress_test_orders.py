@@ -73,8 +73,6 @@ def _build_orders(seed, mode, account_id):
 def _validate_client(client, account_id):
     if client.hello.get("environment") != "SIMULATION":
         raise RuntimeError("bridge environment is not SIMULATION")
-    if not client.hello.get("trading_enabled"):
-        raise RuntimeError("bridge trading_enabled is false")
     configured_ids = {
         str(item.get("account_id")) for item in client.hello.get("accounts", [])
     }

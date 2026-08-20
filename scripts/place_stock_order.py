@@ -60,9 +60,6 @@ def main():
             if client.hello.get("environment") != "SIMULATION":
                 print("Refusing order: bridge environment is not SIMULATION", file=sys.stderr)
                 return 2
-            if not client.hello.get("trading_enabled"):
-                print("Refusing order: bridge trading_enabled is false", file=sys.stderr)
-                return 2
             receipt = client.place_order(
                 OrderRequest(
                     account_id=args.account_id,

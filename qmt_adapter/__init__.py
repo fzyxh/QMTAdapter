@@ -8,6 +8,7 @@ from .exceptions import (
     ValidationError,
 )
 from .models import OrderReceipt, OrderRequest
+from .version import __version__
 
 __all__ = [
     "QmtClient",
@@ -19,4 +20,5 @@ __all__ = [
     "RemoteError",
     "RequestTimeout",
     "ValidationError",
+    "__version__",
 ]

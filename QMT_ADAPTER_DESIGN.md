@@ -99,13 +99,13 @@ flowchart LR
 | 模块 | 职责 |
 |---|---|
 | `BridgeLifecycle` | `init/stop` 生命周期、健康状态、关闭线程 |
-| `PipeServer` | 创建 `\\.\pipe\pazq_qmt_adapter_v1`、鉴权、重连、帧收发 |
+| `PipeServer` | 创建 `\\.\pipe\qmt_adapter_v1`、鉴权、重连、帧收发 |
 | `ProtocolCodec` | 长度帧、JSON 校验、协议版本、消息大小限制 |
 | `CommandStore` | SQLite 事务、幂等检查、命令状态、委托映射、Outbox |
 | `CommandDispatcher` | 在 QMT 定时器线程中限量执行已持久化命令 |
 | `QmtApiAdapter` | 统一模型到 QMT 参数/对象的唯一映射层 |
 | `Reconciler` | 委托/成交/持仓轮询、回调合并、重启恢复 |
-| `RiskGuard` | 账号白名单、交易开关、数量/金额/频率等本地保护 |
+| `RiskGuard` | 账号白名单、数量/金额/频率等本地保护 |
 
 ### 4.2 外部交易库模块
 
@@ -139,16 +139,15 @@ QMT Bridge 采用以下线程规则：
 - 命名管道服务启动成功；
 - 配置的账号完成 `ContextInfo.set_account()` 订阅；
 - QMT 已进入最新 Bar，`ContextInfo.is_last_bar()` 为真；
-- `trading_enabled=true`；
 - 请求中的环境与桥接环境相符。
 
-否则查询可以按能力返回，交易命令返回 `QMT_NOT_READY` 或 `TRADING_DISABLED`。
+否则查询可以按能力返回，交易命令返回 `QMT_NOT_READY`。
 
 ## 6. 命名管道协议
 
 ### 6.1 管道与连接模型
 
-- 默认名称：`\\.\pipe\pazq_qmt_adapter_v1`
+- 默认名称：`\\.\pipe\qmt_adapter_v1`
 - QMT Bridge 是管道服务端，外部交易库是客户端。
 - 首期只允许一个活动客户端；第二个客户端得到 `CLIENT_BUSY`。
 - 断开后 QMT 端重新创建管道实例，客户端指数退避重连。
@@ -177,7 +176,7 @@ QMT Bridge 采用以下线程规则：
 }
 ```
 
-服务端返回协议版本、`bridge_instance_id`、QMT 版本、Python 版本、交易开关、账号能力、最大消息大小和支持命令。客户端必须依据能力协商结果工作，不能假设所有券商版本支持相同字段。
+服务端返回协议版本、`bridge_instance_id`、QMT 版本、Python 版本、账号能力、最大消息大小和支持命令。客户端必须依据能力协商结果工作，不能假设所有券商版本支持相同字段。
 
 ### 6.3 请求信封
 
@@ -645,11 +644,17 @@ client.orders.cancel(qmt_order_id="...", account_id="...", account_type="STOCK")
 
 ### 14.1 QMT Bridge 数据库
 
-默认位置：
+运行配置和数据库均位于固定绝对路径：
 
 ```text
-<QMT安装目录>\userdata\qmt_adapter\bridge.db
+C:\QMTAdapter\config\bridge_config.json
+C:\QMTAdapter\data\bridge.db
 ```
+
+部署命令只在首次部署时创建 JSON 配置，不预先创建 SQLite。QMT Bridge 首次
+启动时创建数据库；WAL 模式运行期间可能同时存在 `bridge.db-wal` 和
+`bridge.db-shm`。这些文件全部位于 `C:\QMTAdapter\data`，不写入 QMT 或券商
+软件安装目录。外部客户端不直接访问数据库，数据库只由 QMT Bridge 打开和写入。
 
 配置：
 
@@ -804,7 +809,6 @@ Bridge 在调用 QMT 前执行本地保护，但不替代券商风控：
 - 限价相对最新行情偏离上限；
 - 单笔最大数量/金额、单日累计金额、每秒命令数限制；
 - 同账号同证券短时间相同自然指纹告警；该告警不能替代幂等键；
-- 全局 `kill_switch` 和账号级 `trading_enabled`；
 - `LIVE` 模式必须配置明确的实盘账号白名单，不能通过 IPC 动态开启；
 - 客户端请求环境必须与 Bridge 环境一致。
 
@@ -815,7 +819,6 @@ Bridge 在调用 QMT 前执行本地保护，但不替代券商风控：
 - 不通过协议传输账号密码；账号登录由 QMT 自身完成。
 - 日志对账号、认证令牌和敏感参数脱敏。
 - 每个写命令记录调用方、幂等键、完整负载哈希、执行结果和状态变化。
-- Bridge 启动默认 `READ_ONLY`，必须由本地配置文件显式启用交易。
 
 ## 18. 错误模型
 
@@ -828,7 +831,6 @@ Bridge 在调用 QMT 前执行本地保护，但不替代券商风控：
 | `AUTH_FAILED` | 管道鉴权失败 | 否 |
 | `CLIENT_BUSY` | 已有活动客户端 | 可退避重连 |
 | `QMT_NOT_READY` | 尚未进入可执行状态 | 可用同一幂等键重试 |
-| `TRADING_DISABLED` | 本地交易开关关闭 | 否 |
 | `ACCOUNT_NOT_ALLOWED` | 不在账号白名单 | 否 |
 | `ACCOUNT_NOT_LOGGED_IN` | 账号不可用 | 状态恢复后可用同一幂等键重试 |
 | `IDEMPOTENCY_CONFLICT` | 同键不同负载 | 否 |
@@ -847,36 +849,31 @@ Bridge 在调用 QMT 前执行本地保护，但不替代券商风控：
 ### 19.1 推荐文件结构
 
 ```text
-QMTAdapter/
-  qmt_side/
-    qmt_bridge.py              # GBK/ASCII 兼容，Python 3.6
-    qmt_api_adapter.py
-    winpipe.py
-  qmt_adapter/
-    client.py
-    async_client.py
-    models.py
-    protocol.py
-    exceptions.py
-    durable.py
-  config/
-    bridge_config.example.json
-  tests/
-  QMT_ADAPTER_DESIGN.md
+C:\QMTAdapter\
+├── qmt_adapter_loader.py
+├── runtime\
+│   └── qmt_adapter_qmt.py
+├── config\
+│   └── bridge_config.json
+└── data\
+    ├── bridge.db
+    ├── bridge.db-wal
+    └── bridge.db-shm
 ```
 
-为避免 QMT 的 GBK 源码要求，QMT 端源文件尽量只使用 ASCII，中文通过 `\uXXXX` 或运行时资源处理。外部库使用当前 `.venv`，QMT 端保持 Python 3.6 语法兼容，不共享第三方依赖。
+Python 包仍安装在外部策略自己的虚拟环境中。上面的固定目录只存放 QMT
+加载器、Bridge、运行配置和持久化数据，不依赖 Python 虚拟环境或券商软件目录。
+短加载器使用 ASCII/GBK 兼容源码；完整 Bridge 保持 Python 3.6 兼容且不使用
+第三方依赖。
 
 ### 19.2 QMT 启动顺序
 
-1. QMT Bridge `init` 读取本地配置并迁移数据库。
-2. 对配置账号调用 `ContextInfo.set_account()`。
-3. 启动管道、持久化和对账后台线程。
-4. 注册 QMT 定时器回调。
-5. 完成历史 Bar 后进入 `READY_READ_ONLY`。
-6. 本地配置允许交易且运行环境匹配时进入 `READY_TRADING`。
-7. 外部库连接、握手、恢复事件游标。
-8. Bridge 先完成未决命令对账，再接收新的写命令。
+1. QMT Bridge `init` 读取 `C:\QMTAdapter\config\bridge_config.json`。
+2. 打开或创建 `C:\QMTAdapter\data\bridge.db` 并迁移数据库。
+3. 对配置账号调用 `ContextInfo.set_account()`。
+4. 启动命名管道服务。
+5. 注册 QMT 定时器回调。
+6. 外部库连接并完成握手后发送查询或交易命令。
 
 `stop(ContextInfo)` 必须停止接收新命令、等待当前 SQLite 事务完成、将正在跨越 QMT 调用边界的命令标记为 `UNCERTAIN`，然后关闭管道和线程。不能长时间等待柜台终态。
 

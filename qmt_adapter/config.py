@@ -10,7 +10,7 @@ ConfigPath = Optional[Union[str, os.PathLike]]
 DEFAULT_CONFIG_PATH = Path(
     os.environ.get(
         "QMT_ADAPTER_CONFIG",
-        r"C:\pazq_qmt_simulate\userdata\qmt_adapter\bridge_config.json",
+        r"C:\QMTAdapter\config\bridge_config.json",
     )
 )
 

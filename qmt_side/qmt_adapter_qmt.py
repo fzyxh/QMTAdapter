@@ -26,9 +26,9 @@ import time
 import traceback
 
 
-CONFIG_PATH = os.environ.get(
+CONFIG_PATH = globals().get("QMT_ADAPTER_CONFIG_PATH") or os.environ.get(
     "QMT_ADAPTER_CONFIG",
-    r"C:\pazq_qmt_simulate\userdata\qmt_adapter\bridge_config.json",
+    r"C:\QMTAdapter\config\bridge_config.json",
 )
 
 PROTOCOL_VERSION = 2
@@ -621,7 +621,6 @@ class BridgeRuntime(object):
     def __init__(self, config):
         self.config = config
         self.environment = config.get("environment", "SIMULATION")
-        self.trading_enabled = bool(config.get("trading_enabled", False))
         self.accounts = self._load_accounts(config.get("accounts", []))
         self.inbound = queue.Queue(maxsize=int(config.get("max_pending_commands", 1000)))
         self.order_events = queue.Queue()
@@ -640,7 +639,7 @@ class BridgeRuntime(object):
         self.store = OrderStore(config["db_path"])
         self.pipe = PipeServer(
             self,
-            config.get("pipe_name", r"\\.\pipe\pazq_qmt_adapter_v1"),
+            config.get("pipe_name", r"\\.\pipe\qmt_adapter_v1"),
             config["auth_token"],
             int(config.get("max_message_size", MAX_MESSAGE_SIZE)),
         )
@@ -683,7 +682,6 @@ class BridgeRuntime(object):
             "result": {
                 "protocol_version": PROTOCOL_VERSION,
                 "environment": self.environment,
-                "trading_enabled": self.trading_enabled,
                 "idempotency_mode": "CLIENT_ORDER_ID_ENFORCED",
                 "accounts": list(self.accounts.values()),
                 "commands": [
@@ -920,7 +918,6 @@ class BridgeRuntime(object):
         return {
             "status": "OK" if not self.last_error else "DEGRADED",
             "environment": self.environment,
-            "trading_enabled": self.trading_enabled,
             "connected": self.connected,
             "configured_accounts": list(self.accounts.values()),
             "pending_commands": self.inbound.qsize(),
@@ -1099,8 +1096,6 @@ class BridgeRuntime(object):
                     },
                 )
             return self._place_order_result(existing, request_id, True)
-        if not self.trading_enabled:
-            raise BridgeError("TRADING_DISABLED", "trading_enabled is false")
         try:
             if not context_info.is_last_bar():
                 raise BridgeError("QMT_NOT_READY", "QMT is not on the latest bar")
@@ -1184,8 +1179,6 @@ class BridgeRuntime(object):
         return {"items": [self._order_row(row) for row in rows], "count": len(rows)}
 
     def cancel_order(self, payload, request_id, context_info):
-        if not self.trading_enabled:
-            raise BridgeError("TRADING_DISABLED", "trading_enabled is false")
         client_order_id = str(payload.get("client_order_id", "")).strip()
         if not client_order_id:
             raise BridgeError("INVALID_ARGUMENT", "client_order_id is required")
@@ -1332,7 +1325,8 @@ def _load_config():
     if not config.get("auth_token"):
         raise BridgeError("INVALID_CONFIG", "auth_token is required")
     if not config.get("db_path"):
-        config["db_path"] = os.path.join(os.path.dirname(CONFIG_PATH), "bridge.db")
+        install_root = os.path.dirname(os.path.dirname(CONFIG_PATH))
+        config["db_path"] = os.path.join(install_root, "data", "bridge.db")
     return config
 
 
@@ -1358,7 +1352,6 @@ def init(ContextInfo):
         )
         setattr(builtins, _RUNTIME_SLOT, _RUNTIME)
         print("QMT Adapter bridge is ready: %s" % config.get("pipe_name"))
-        print("QMT Adapter trading_enabled=%s" % _RUNTIME.trading_enabled)
     except Exception as exc:
         print("QMT Adapter startup failed: %s: %s" % (type(exc).__name__, exc))
         print(traceback.format_exc())

@@ -6,6 +6,7 @@ from .config import ConfigPath, load_config
 from .exceptions import RemoteError, RequestTimeout, ValidationError
 from .models import OrderReceipt, OrderRequest
 from .protocol import NamedPipeConnection
+from .version import __version__
 
 
 PROTOCOL_VERSION = 2
@@ -61,7 +62,7 @@ class QmtClient:
                 "type": "hello",
                 "message_id": message_id,
                 "client_id": self.client_id,
-                "client_version": "0.2.0",
+                "client_version": __version__,
                 "auth_token": self.config["auth_token"],
                 "environment": self.config.get("environment", "SIMULATION"),
             },
@@ -104,7 +105,7 @@ class QmtClient:
             timeout: 等待响应的最长秒数。
 
         Returns:
-            包含环境、交易开关、命令队列和 QMT 定时器统计的字典。
+            包含环境、连接状态、命令队列和 QMT 定时器统计的字典。
         """
         return self._request("system.health", {}, timeout=timeout)
 

@@ -1,10 +1,9 @@
 {
   "version": 1,
-  "pipe_name": "\\\\.\\pipe\\pazq_qmt_adapter_v1",
+  "pipe_name": "\\\\.\\pipe\\qmt_adapter_v1",
   "auth_token": "replace-with-a-random-64-character-hex-token",
   "environment": "SIMULATION",
-  "trading_enabled": false,
-  "db_path": "C:\\pazq_qmt_simulate\\userdata\\qmt_adapter\\bridge.db",
+  "db_path": "C:\\QMTAdapter\\data\\bridge.db",
   "accounts": [
     {
       "account_id": "replace-with-stock-account-id",

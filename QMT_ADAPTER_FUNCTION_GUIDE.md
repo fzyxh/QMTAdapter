@@ -68,36 +68,60 @@ from qmt_adapter import (
 
 ## 3. 大 QMT 端部署
 
-### 3.1 创建配置文件
+### 3.1 安装外部库
 
-复制：
+在虚拟环境中安装当前仓库：
 
-```text
-config/bridge_config.example.json
+```powershell
+.\.venv\Scripts\python.exe -m pip install -e .
 ```
 
-到大 QMT 安装目录下：
+外部库安装在该虚拟环境中；QMT 端运行文件由下面的部署命令复制到固定目录，
+两者不是同一个安装位置。
 
-```text
-userdata/qmt_adapter/bridge_config.json
+### 3.2 首次部署
+
+首次部署时传入股票资金账号：
+
+```powershell
+.\.venv\Scripts\qmt-adapter.exe deploy --account-id YOUR_ACCOUNT_ID
 ```
 
-默认路径为：
+默认创建以下目录：
 
 ```text
-C:\pazq_qmt_simulate\userdata\qmt_adapter\bridge_config.json
+C:\QMTAdapter\
+├── qmt_adapter_loader.py
+├── runtime\qmt_adapter_qmt.py
+├── config\bridge_config.json
+└── data\
+    ├── bridge.db
+    ├── bridge.db-wal
+    └── bridge.db-shm
 ```
 
-配置示例：
+所有路径均为与券商软件安装目录无关的绝对路径。`auth_token` 由部署命令随机生成。
+`bridge.db` 不会被预先创建，而是在 QMT Bridge 第一次启动时由 QMT 端创建。
+SQLite 启用 WAL 后，运行期间可能在同一目录生成 `bridge.db-wal` 和
+`bridge.db-shm`。
+
+| 文件 | 固定绝对路径 | 创建或更新方 |
+|---|---|---|
+| QMT 短加载器 | `C:\QMTAdapter\qmt_adapter_loader.py` | 部署命令更新 |
+| QMT Bridge | `C:\QMTAdapter\runtime\qmt_adapter_qmt.py` | 部署命令更新 |
+| JSON 配置 | `C:\QMTAdapter\config\bridge_config.json` | 部署命令仅首次创建 |
+| SQLite 数据库 | `C:\QMTAdapter\data\bridge.db` | QMT Bridge 首次启动时创建 |
+| SQLite WAL/SHM | `C:\QMTAdapter\data\bridge.db-wal`、`bridge.db-shm` | SQLite 按运行状态创建或删除 |
+
+生成的配置结构如下：
 
 ```json
 {
   "version": 1,
-  "pipe_name": "\\\\.\\pipe\\pazq_qmt_adapter_v1",
-  "auth_token": "请替换为随机的64位十六进制字符串",
+  "pipe_name": "\\\\.\\pipe\\qmt_adapter_v1",
+  "auth_token": "由部署命令生成的64位十六进制字符串",
   "environment": "SIMULATION",
-  "trading_enabled": true,
-  "db_path": "C:\\pazq_qmt_simulate\\userdata\\qmt_adapter\\bridge.db",
+  "db_path": "C:\\QMTAdapter\\data\\bridge.db",
   "accounts": [
     {
       "account_id": "股票资金账号",
@@ -119,9 +143,8 @@ C:\pazq_qmt_simulate\userdata\qmt_adapter\bridge_config.json
 |---|---|
 | `version` | 当前固定为 `1` |
 | `pipe_name` | 本机 Windows 命名管道名称，外部库必须使用相同配置 |
-| `auth_token` | 连接鉴权令牌，外部库和 QMT 端必须一致 |
+| `auth_token` | 部署时随机生成的连接鉴权令牌，外部库和 QMT 端读取同一配置 |
 | `environment` | 当前模拟账户使用 `SIMULATION` |
-| `trading_enabled` | `false` 时拒绝下单和撤单，查询仍可使用 |
 | `db_path` | QMT 端委托持久化 SQLite 文件路径 |
 | `accounts` | 允许查询和交易的股票资金账号白名单 |
 | `timer_period` | QMT 处理命令的定时器周期，当前实测可用值为 `10nMilliSecond` |
@@ -131,11 +154,11 @@ C:\pazq_qmt_simulate\userdata\qmt_adapter\bridge_config.json
 | `max_message_size` | 单个管道消息最大字节数 |
 | `qmt_remark_max_bytes` | 传入 QMT 的委托备注最大字节数 |
 
-### 3.2 创建并运行 QMT 策略
+### 3.3 创建并运行 QMT 策略
 
 1. 在大 QMT 的“模型交易”中创建 Python 策略。
-2. 将 `qmt_side/qmt_adapter_qmt.py` 的完整内容放入策略代码。
-   源文件使用 UTF-8；首行编码声明必须与实际文件编码保持一致。
+2. 将 `C:\QMTAdapter\qmt_adapter_loader.py` 的完整内容放入策略代码。
+   加载器只包含 ASCII 字符并声明为 GBK，避免复制时发生编码转换问题。
 3. 账户类型选择“股票账号”。
 4. 资金账号选择配置文件中同一个账号。
 5. 主图代码可以使用 `000300`，运行周期使用“日线”。主图只用于启动策略运行环境，不参与适配器交易标的选择。
@@ -143,9 +166,12 @@ C:\pazq_qmt_simulate\userdata\qmt_adapter\bridge_config.json
 7. 启动后确认日志出现：
 
 ```text
-QMT Adapter bridge is ready: \\.\pipe\pazq_qmt_adapter_v1
-QMT Adapter trading_enabled=True
+QMT Adapter bridge is ready: \\.\pipe\qmt_adapter_v1
 ```
+
+短加载器只在策略启动时读取和编译一次
+`C:\QMTAdapter\runtime\qmt_adapter_qmt.py`。加载完成后，QMT 直接调用外部脚本
+定义的入口函数，不会为每次回调、查询或下单增加文件读取或额外转发。
 
 QMT 自动调用以下入口，不需要外部程序直接调用：
 
@@ -157,39 +183,36 @@ QMT 自动调用以下入口，不需要外部程序直接调用：
 | `order_callback(ContextInfo, orderInfo)` | 接收委托回报、保存QMT委托ID及原始字段 |
 | `stop(ContextInfo)` | 停止管道线程并关闭SQLite |
 
-如果大 QMT 的实际安装目录不同，需要同步修改 QMT 脚本顶部的 `CONFIG_PATH`，或者在启动 QMT 前设置 `QMT_ADAPTER_CONFIG` 环境变量。
+### 3.4 升级 QMT 端脚本
+
+安装新版 Python 包后再次执行：
+
+```powershell
+.\.venv\Scripts\qmt-adapter.exe deploy
+```
+
+部署命令会原子替换完整 Bridge 和加载器，但不会覆盖
+`C:\QMTAdapter\config` 与 `C:\QMTAdapter\data` 下的配置、数据库或 WAL 文件。
+随后停止并重新启动 QMT 策略即可加载新代码，不需要再次把完整 Bridge 复制进 QMT。
 
 ## 4. 外部库使用准备
 
-将整个 `qmt_adapter` 目录复制到外部项目根目录，保证项目结构类似：
-
-```text
-your_project/
-  qmt_adapter/
-    __init__.py
-    async_client.py
-    client.py
-    config.py
-    exceptions.py
-    models.py
-    protocol.py
-  your_strategy.py
-```
-
-外部库只使用 Python 标准库，不需要安装 QMT Python 包。
+在策略自己的虚拟环境中安装 `qmt-adapter` 即可。外部库只使用 Python 标准库，
+不需要安装 QMT Python 包。
 
 外部库的公开类和方法包含内联 Type Hints，并提供 `qmt_adapter/py.typed`
 标记。支持 PEP 561 的 IDE 和静态检查工具可以识别参数类型、返回类型、
 `OrderRequest` 和 `OrderReceipt` 字段类型。Type Hints 只用于开发期检查，
 不会改变 Python 的运行时参数校验规则。
 
-推荐显式传入配置路径：
+不传配置路径时默认读取：
 
 ```python
-CONFIG_PATH = r"C:\pazq_qmt_simulate\userdata\qmt_adapter\bridge_config.json"
+CONFIG_PATH = r"C:\QMTAdapter\config\bridge_config.json"
 ```
 
-外部库读取同一个配置文件中的 `pipe_name`、`auth_token` 和 `environment`，不会读取 SQLite 作为通信通道。
+外部库读取同一个 JSON 配置中的 `pipe_name`、`auth_token` 和 `environment`。
+外部库不会直接读取或写入 SQLite；实时请求和响应只通过命名管道传输。
 
 ## 5. 同步客户端 QmtClient
 
@@ -231,7 +254,6 @@ client.hello
 {
     "protocol_version": 2,
     "environment": "SIMULATION",
-    "trading_enabled": True,
     "idempotency_mode": "CLIENT_ORDER_ID_ENFORCED",
     "accounts": [...],
     "commands": [...],
@@ -244,7 +266,7 @@ client.hello
 result = client.health(timeout=5.0)
 ```
 
-用途：检查 QMT Bridge 是否运行、是否允许交易、命令队列和 QMT 定时器状态。
+用途：检查 QMT Bridge 是否运行、命令队列和 QMT 定时器状态。
 
 主要返回字段：
 
@@ -252,7 +274,6 @@ result = client.health(timeout=5.0)
 |---|---|
 | `status` | `OK` 或 `DEGRADED` |
 | `environment` | 当前环境 |
-| `trading_enabled` | 是否允许下单和撤单 |
 | `configured_accounts` | 配置的账号白名单 |
 | `pending_commands` | 等待QMT主线程处理的命令数 |
 | `last_error` | Bridge最近一次错误 |
@@ -707,7 +728,7 @@ except QmtAdapterError as exc:
 启动大QMT并登录账号
   -> 启动QMT Adapter策略
   -> 外部客户端connect
-  -> health确认环境和trading_enabled
+  -> health确认环境和运行状态
   -> get_account/list_positions确认账号
   -> place_order
   -> 保存client_order_id

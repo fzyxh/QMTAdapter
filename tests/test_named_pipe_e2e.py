@@ -140,7 +140,6 @@ class NamedPipeEndToEndTests(unittest.TestCase):
             "pipe_name": r"\\.\pipe\qmt_adapter_test_%s" % uuid.uuid4().hex,
             "auth_token": uuid.uuid4().hex + uuid.uuid4().hex,
             "environment": "SIMULATION",
-            "trading_enabled": True,
             "db_path": str(base / "bridge.db"),
             "accounts": [
                 {"account_id": ACCOUNT_ID, "account_type": "STOCK"}
@@ -169,8 +168,6 @@ class NamedPipeEndToEndTests(unittest.TestCase):
         ) as client:
             health = client.health()
             self.assertEqual(health["environment"], "SIMULATION")
-            self.assertTrue(health["trading_enabled"])
-
             account = client.get_account(ACCOUNT_ID)
             self.assertEqual(account["count"], 1)
             self.assertEqual(account["items"][0]["available_cash"], 123456.78)
@@ -322,7 +319,6 @@ class NamedPipeEndToEndTests(unittest.TestCase):
             first = client.place_order(order, wait_for="BROKER_ID", timeout=5)
 
         self.harness.stop()
-        self.config["trading_enabled"] = False
         self.harness = BridgeHarness(self.config, self.fake_api)
         self.harness.start()
 

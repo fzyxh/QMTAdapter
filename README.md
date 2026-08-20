@@ -25,19 +25,61 @@
 
 ## 文件说明
 
-- `qmt_side/qmt_adapter_qmt.py`：作为 QMT Python 模型导入或粘贴到 QMT 中运行。
+- `qmt_side/qmt_adapter_qmt.py`：由部署命令更新到固定目录的大 QMT 端完整脚本。
 - `qmt_adapter/`：外部同步客户端和 asyncio 客户端，均不依赖或导入 QMT 模块。
 - `scripts/query_account.py`：只读的账户和持仓验证脚本。
 - `scripts/place_stock_order.py`：带安全检查的模拟账户下单脚本；完成只读验证前不要使用。
 - `scripts/stress_test_calls.py`：只读的同步/异步调用耗时对比脚本。
-- QMT 配置文件：QMT 安装目录下的 `userdata/qmt_adapter/bridge_config.json`。
+- 默认部署根目录：`C:\QMTAdapter`，不依赖券商软件的安装目录。
+
+## 安装与部署
+
+当前仓库可以作为 Python 包安装到虚拟环境：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -e .
+```
+
+首次部署时提供股票资金账号：
+
+```powershell
+.\.venv\Scripts\qmt-adapter.exe deploy --account-id YOUR_ACCOUNT_ID
+```
+
+命令会创建：
+
+```text
+C:\QMTAdapter\
+├── qmt_adapter_loader.py
+├── runtime\qmt_adapter_qmt.py
+├── config\bridge_config.json
+└── data\
+    ├── bridge.db
+    ├── bridge.db-wal
+    └── bridge.db-shm
+```
+
+以上均为与券商软件安装目录无关的绝对路径。部署命令首次创建
+`C:\QMTAdapter\config\bridge_config.json` 并生成随机鉴权令牌；配置中的
+`db_path` 固定为 `C:\QMTAdapter\data\bridge.db`。数据库不会由部署命令预先
+创建，而是在 QMT Bridge 第一次启动时创建。启用 WAL 后，SQLite 运行期间还可能
+生成同目录的 `bridge.db-wal` 和 `bridge.db-shm`。
+
+第一次使用时，在大 QMT“模型交易”中新建一个 Python 策略，把
+`C:\QMTAdapter\qmt_adapter_loader.py` 的完整内容复制进去。该加载器只在模型
+启动时读取并执行一次外部 Bridge 脚本；之后 QMT 直接调用已经加载的函数，
+不会在行情回调、查询或下单时重复读取文件。
+
+升级时再次执行 `qmt-adapter deploy`。命令只更新
+`C:\QMTAdapter\runtime\qmt_adapter_qmt.py` 和加载器，不覆盖 `config` 与
+`data` 目录中的配置、数据库和 WAL 文件。更新后停止并重新启动 QMT 策略，
+使其加载新代码。
 
 ## 第一步：验证账户和持仓
 
-1. 保持 `trading_enabled` 为 `false`。
-2. 在 `bridge_config.json` 的 `accounts` 数组中填写需要验证的股票模拟资金账号。
-3. 在 QMT 模型研究中使用 `qmt_side/qmt_adapter_qmt.py` 新建 Python 模型并运行。
-4. 在本仓库目录中执行：
+1. 确认 `C:\QMTAdapter\config\bridge_config.json` 中的账号正确。
+2. 在 QMT 模型交易中启动已经复制短加载器的 Python 策略。
+3. 在本仓库目录中执行：
 
 ```powershell
 .\.venv\Scripts\python.exe .\scripts\query_account.py --account-id YOUR_ACCOUNT_ID
@@ -48,7 +90,7 @@ QMT 手册明确列出的 `m_dAvailable`、`m_strInstrumentID` 和 `m_nVolume`�
 
 ## 交易验证
 
-检查账户和持仓返回结果前，应保持交易功能关闭。启用交易并选择模拟委托，应作为单独且明确的操作进行。
+调用下单或撤单接口时，大 QMT 策略必须使用交易运行模式。
 
 ## Asyncio 客户端
 

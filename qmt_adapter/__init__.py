@@ -7,7 +7,14 @@ from .exceptions import (
     RequestTimeout,
     ValidationError,
 )
-from .models import OrderReceipt, OrderRequest
+from .models import (
+    AlgoOrderReceipt,
+    AlgoOrderRequest,
+    BOOK_LIQUIDITY_WEIGHTED_DEFAULTS,
+    OrderReceipt,
+    OrderRequest,
+    STOCK_EXECUTION_ALGORITHMS,
+)
 from .version import __version__
 
 __all__ = [
@@ -15,6 +22,10 @@ __all__ = [
     "AsyncQmtClient",
     "OrderRequest",
     "OrderReceipt",
+    "AlgoOrderRequest",
+    "AlgoOrderReceipt",
+    "STOCK_EXECUTION_ALGORITHMS",
+    "BOOK_LIQUIDITY_WEIGHTED_DEFAULTS",
     "QmtAdapterError",
     "ConnectionClosed",
     "RemoteError",

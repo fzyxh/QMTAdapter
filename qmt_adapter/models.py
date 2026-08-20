@@ -43,6 +43,23 @@ STOCK_NATIVE_MARKET_PRICE_TYPES = {
     "MARKET_SZ_FULL_OR_CANCEL": {"SZ"},
 }
 
+STOCK_EXECUTION_ALGORITHMS = {
+    "BOOK_LIQUIDITY_WEIGHTED",  # 盘口流动性加权拆单（已实现）
+    "TWAP",  # 时间加权拆单（仅预留标识，尚未实现）
+    "VWAP",  # 成交量加权拆单（仅预留标识，尚未实现）
+}
+
+BOOK_LIQUIDITY_WEIGHTED_DEFAULTS = {
+    "big_order_threshold": "1000000",
+    "min_child_notional": "10000",
+    "max_child_notional": "500000",
+    "primary_levels": 3,
+    "max_levels": 5,
+    "chase_ticks": 2,
+    "timeout_seconds": 20.0,
+    "max_retries": 3,
+}
+
 
 PriceValue = Union[str, int, float, Decimal]
 
@@ -197,6 +214,133 @@ class OrderReceipt:
             command_status=value.get("command_status", "UNKNOWN"),
             order_status=value.get("order_status", "UNKNOWN"),
             qmt_order_id=value.get("qmt_order_id"),
+            idempotent_replay=bool(value.get("idempotent_replay", False)),
+            raw=dict(value),
+        )
+
+
+@dataclass(frozen=True)
+class AlgoOrderRequest:
+    """股票算法委托请求。
+
+    Args:
+        account_id: 配置白名单中的股票资金账号。
+        instrument: ``代码.市场`` 格式，例如 ``601919.SH``。
+        side: ``BUY`` 或 ``SELL``。
+        algorithm: 执行算法。当前仅实现 ``BOOK_LIQUIDITY_WEIGHTED``；
+            ``TWAP``、``VWAP`` 是保留标识，QMT Bridge 会明确拒绝执行。
+        target_amount: 目标金额。与 ``quantity`` 必须且只能填写一个。
+        quantity: 目标股数。与 ``target_amount`` 必须且只能填写一个；
+            买入必须为100股的整数倍。
+        params: 算法参数。盘口流动性加权拆单支持
+            ``big_order_threshold``、``min_child_notional``、
+            ``max_child_notional``、``primary_levels``、``max_levels``、
+            ``chase_ticks``、``timeout_seconds``、``max_retries``。
+        remark: 父委托备注；子单备注由 Bridge 自动生成。
+        algo_order_id: 父委托唯一ID；不传时在对象创建时生成一次UUID4。
+
+    Note:
+        ``target_amount`` 不保证最终成交金额精确等于该值。Bridge 会按100股
+        整手换算目标数量，并保证买入计划金额不超过该上限。
+    """
+
+    account_id: str
+    instrument: str
+    side: str
+    algorithm: str = "BOOK_LIQUIDITY_WEIGHTED"
+    target_amount: Optional[PriceValue] = None
+    quantity: Optional[int] = None
+    params: Mapping[str, Any] = field(default_factory=dict)
+    remark: str = ""
+    algo_order_id: str = field(default_factory=new_id)
+
+    def to_payload(self) -> Dict[str, Any]:
+        """验证字段并转换为 ``algo_order.place`` 协议负载。"""
+        algo_order_id = str(self.algo_order_id or "").strip()
+        account_id = str(self.account_id or "").strip()
+        instrument = str(self.instrument or "").strip().upper()
+        side = str(self.side or "").upper()
+        algorithm = str(self.algorithm or "").upper()
+
+        if not algo_order_id:
+            raise ValidationError("algo_order_id is required")
+        if not account_id:
+            raise ValidationError("account_id is required")
+        if not instrument or "." not in instrument:
+            raise ValidationError("instrument must use code.market format")
+        if side not in STOCK_SIDES:
+            raise ValidationError("side must be BUY or SELL")
+        if algorithm not in STOCK_EXECUTION_ALGORITHMS:
+            raise ValidationError("unsupported algorithm: %s" % algorithm)
+        has_amount = self.target_amount is not None
+        has_quantity = self.quantity is not None
+        if has_amount == has_quantity:
+            raise ValidationError(
+                "exactly one of target_amount and quantity is required"
+            )
+
+        normalized_amount: Optional[str] = None
+        if has_amount:
+            try:
+                amount = Decimal(str(self.target_amount))
+            except (InvalidOperation, TypeError, ValueError):
+                raise ValidationError("target_amount must be positive")
+            if not amount.is_finite() or amount <= 0:
+                raise ValidationError("target_amount must be positive")
+            normalized_amount = _decimal_text(self.target_amount)  # type: ignore[arg-type]
+
+        if has_quantity:
+            if not isinstance(self.quantity, int) or isinstance(self.quantity, bool):
+                raise ValidationError("quantity must be an integer")
+            if self.quantity <= 0:
+                raise ValidationError("quantity must be greater than zero")
+            if self.quantity % 100 != 0:
+                raise ValidationError(
+                    "algorithm quantity must be a multiple of 100"
+                )
+
+        if not isinstance(self.params, Mapping):
+            raise ValidationError("params must be a mapping")
+
+        return {
+            "algo_order_id": algo_order_id,
+            "account_id": account_id,
+            "account_type": "STOCK",
+            "business_type": "CASH",
+            "instrument": instrument,
+            "side": side,
+            "algorithm": algorithm,
+            "target_amount": normalized_amount,
+            "quantity": self.quantity,
+            "params": dict(self.params),
+            "remark": str(self.remark or ""),
+        }
+
+
+@dataclass(frozen=True)
+class AlgoOrderReceipt:
+    """Bridge 接受算法父委托后返回的回执。"""
+
+    request_id: str
+    algo_order_id: str
+    command_status: str
+    algo_status: str
+    resolved_quantity: int
+    child_count: int
+    idempotent_replay: bool = False
+    raw: Optional[Dict[str, Any]] = None
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "AlgoOrderReceipt":
+        """从 Bridge 返回字典构造算法委托回执。"""
+        children = value.get("children") or []
+        return cls(
+            request_id=str(value.get("request_id", "")),
+            algo_order_id=str(value["algo_order_id"]),
+            command_status=str(value.get("command_status", "UNKNOWN")),
+            algo_status=str(value.get("algo_status", "UNKNOWN")),
+            resolved_quantity=int(value.get("resolved_quantity", 0)),
+            child_count=int(value.get("child_count", len(children))),
             idempotent_replay=bool(value.get("idempotent_replay", False)),
             raw=dict(value),
         )

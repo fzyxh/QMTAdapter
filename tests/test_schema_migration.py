@@ -65,6 +65,14 @@ class OrderStoreMigrationTests(unittest.TestCase):
                 }
                 row = store.get_order("CLIENT-OLD-0001")
                 self.assertIn("payload_hash", columns)
+                tables = {
+                    item[0]
+                    for item in store.conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    )
+                }
+                self.assertIn("algo_orders", tables)
+                self.assertIn("algo_children", tables)
                 self.assertEqual(len(row["payload_hash"]), 64)
                 self.assertEqual(
                     row["payload_hash"],

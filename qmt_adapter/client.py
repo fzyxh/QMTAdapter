@@ -4,7 +4,7 @@ from typing import Any, Dict, Optional, Type
 
 from .config import ConfigPath, load_config
 from .exceptions import RemoteError, RequestTimeout, ValidationError
-from .models import OrderReceipt, OrderRequest
+from .models import AlgoOrderReceipt, AlgoOrderRequest, OrderReceipt, OrderRequest
 from .protocol import NamedPipeConnection
 from .version import __version__
 
@@ -254,6 +254,84 @@ class QmtClient:
         return self._request(
             "order.cancel",
             {"client_order_id": str(client_order_id)},
+            timeout=timeout,
+        )
+
+    def preview_algo_order(
+        self,
+        order: AlgoOrderRequest,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """只生成并校验算法拆单计划，不下单也不写入父子委托表。
+
+        Args:
+            order: :class:`AlgoOrderRequest`。
+            timeout: 等待 QMT 读取账户、持仓和五档行情的最长秒数。
+
+        Returns:
+            标准化五档行情、目标股数、预计金额和全部子单计划。
+
+        Raises:
+            ValidationError: ``order`` 类型或参数不合法。
+            RemoteError: 行情不可用、资金/可用持仓不足，或算法尚未实现。
+        """
+        if not isinstance(order, AlgoOrderRequest):
+            raise ValidationError("order must be an AlgoOrderRequest")
+        return self._request(
+            "algo_order.preview",
+            order.to_payload(),
+            timeout=timeout,
+        )
+
+    def place_algo_order(
+        self,
+        order: AlgoOrderRequest,
+        timeout: float = 30.0,
+    ) -> AlgoOrderReceipt:
+        """提交一笔股票算法父委托。
+
+        Bridge 会在 QMT 主线程内读取盘口、生成完整计划、检查数量守恒，
+        将父单和全部子单计划持久化，然后逐笔调用 ``passorder``。同一
+        ``algo_order_id`` 和相同参数重试不会重复创建父单。
+        """
+        if not isinstance(order, AlgoOrderRequest):
+            raise ValidationError("order must be an AlgoOrderRequest")
+        result = self._request(
+            "algo_order.place",
+            order.to_payload(),
+            timeout=timeout,
+        )
+        return AlgoOrderReceipt.from_dict(result)
+
+    def get_algo_order(
+        self, algo_order_id: str, timeout: float = 5.0
+    ) -> Dict[str, Any]:
+        """按父委托 ID 查询算法状态及全部子单。"""
+        return self._request(
+            "algo_order.get",
+            {"algo_order_id": str(algo_order_id)},
+            timeout=timeout,
+        )
+
+    def list_algo_orders(
+        self, account_id: Optional[str] = None, timeout: float = 5.0
+    ) -> Dict[str, Any]:
+        """列出算法父委托；可选按资金账号过滤。"""
+        payload: Dict[str, Any] = {}
+        if account_id is not None:
+            payload["account_id"] = str(account_id)
+        return self._request("algo_order.list", payload, timeout=timeout)
+
+    def cancel_algo_order(
+        self, algo_order_id: str, timeout: float = 10.0
+    ) -> Dict[str, Any]:
+        """停止算法并请求撤销该父单当前所有可撤子单。
+
+        重复调用是允许的；返回当前父单和各子单的撤单请求结果。
+        """
+        return self._request(
+            "algo_order.cancel",
+            {"algo_order_id": str(algo_order_id)},
             timeout=timeout,
         )
 

@@ -11,10 +11,13 @@
 - 普通股票买入、卖出；
 - 查询本适配器发出的委托；
 - 撤销本适配器发出的委托；
+- 盘口流动性加权算法父单的预览、提交、查询和整体撤单；
+- 算法父单及其确定性子单关系的 SQLite 持久化；
 - 同步调用和 `asyncio` 异步调用；
 - 以 `client_order_id` 为唯一身份的下单幂等重放与冲突检测。
 
-当前不支持信用、期货、期权、组合、算法任务、行情订阅和成交明细独立查询。
+`TWAP`、`VWAP` 当前只保留算法标识和请求结构，尚未实现。当前不支持信用、
+期货、期权、组合、行情订阅和成交明细独立查询。
 
 当前没有单独的公开 `idempotency_key`。`client_order_id` 同时承担逻辑委托 ID
 和下单幂等键的作用：相同 ID 与相同委托参数只执行一次；相同 ID 与不同参数
@@ -33,6 +36,7 @@ qmt_side/qmt_adapter_qmt.py
 该脚本在大 QMT 的 Python 策略中运行，是唯一调用 QMT 内置交易函数的部分。它负责：
 
 - 调用 `get_trade_detail_data` 查询账户、持仓和委托；
+- 调用 `ContextInfo.get_full_tick` 读取算法下单所需的当前五档盘口；
 - 调用 `passorder` 下单；
 - 调用 `can_cancel_order` 和 `cancel` 撤单；
 - 接收 QMT 的 `order_callback` 委托回报；
@@ -55,6 +59,8 @@ qmt_adapter/
 ```python
 from qmt_adapter import (
     AsyncQmtClient,
+    AlgoOrderReceipt,
+    AlgoOrderRequest,
     ConnectionClosed,
     OrderReceipt,
     OrderRequest,
@@ -457,7 +463,9 @@ result = client.list_orders(timeout=5.0)
 }
 ```
 
-当前版本没有把所有 QMT 状态码标准化成统一成交状态。判断成交情况时应结合 `raw` 中的字段，例如：
+Bridge 已将 QMT 普通股票委托状态 48 至 57 标准化为
+`SUBMITTED`、`CANCEL_PENDING`、`PARTIALLY_FILLED`、`CANCELED`、
+`FILLED` 和 `REJECTED`。同时仍保留 `raw`，可核对以下原始字段：
 
 - `m_nVolumeTotalOriginal`：原始委托数量；
 - `m_nVolumeTraded`：已成交数量；
@@ -467,7 +475,8 @@ result = client.list_orders(timeout=5.0)
 - `m_nOrderStatus`：QMT原始委托状态码；
 - `m_strErrorMsg`：QMT错误信息。
 
-不同 QMT 版本的数字状态枚举可能不同，不应只根据单个数字状态码编写跨版本逻辑。
+算法父单的成交汇总以每个子单的 `m_nVolumeTraded` 求和，不会把“第一个子单
+终态”误认为整个父单终态。
 
 ### 5.9 cancel_order
 
@@ -719,8 +728,9 @@ except QmtAdapterError as exc:
 - 当前管道服务只允许一个活动客户端连接；
 - 单个同步或异步客户端也只允许一条请求在途；
 - 正常断开后，服务端会重新创建管道并接受下一次连接；
-- QMT账户、持仓、下单和撤单命令在QMT主线程的定时器中执行；
-- `system.health`、`order.get` 和 `order.list` 是本地持久化读取，不需要调用QMT交易函数。
+- QMT账户、持仓、普通下单、算法下单和撤单命令在QMT主线程的定时器中执行；
+- `system.health`、`order.get/list` 和 `algo_order.get/list` 是本地持久化读取，
+  不需要调用QMT交易函数。
 
 ## 11. 推荐的基本调用顺序
 
@@ -730,14 +740,15 @@ except QmtAdapterError as exc:
   -> 外部客户端connect
   -> health确认环境和运行状态
   -> get_account/list_positions确认账号
-  -> place_order
-  -> 保存client_order_id
+  -> 普通委托：place_order并保存client_order_id
+  -> 算法委托：preview_algo_order后place_algo_order并保存algo_order_id
   -> get_order/list_orders查看QMT委托ID及回调
   -> 如需撤单则cancel_order(client_order_id)
   -> close
 ```
 
-外部业务程序至少应持久化 `client_order_id`、请求参数和最终获得的 `qmt_order_id`，避免程序重启后失去委托关联。
+外部业务程序至少应持久化普通单的 `client_order_id` 或算法父单的
+`algo_order_id` 及原始请求参数，避免程序重启后失去委托关联。
 
 ## 12. 升级说明
 
@@ -745,3 +756,119 @@ except QmtAdapterError as exc:
 连接旧 v1 Bridge，或旧客户端连接 v2 Bridge，都会收到
 `PROTOCOL_MISMATCH`，不会继续发送交易命令。升级时先停止外部客户端，替换并
 重启 QMT 策略，再启动外部客户端。
+
+## 13. 盘口流动性加权算法委托
+
+### 13.1 统一模型
+
+执行算法和子单报价类型是两个不同维度：
+
+- `algorithm="BOOK_LIQUIDITY_WEIGHTED"` 表示父单如何拆分、跟踪和重试；
+- 算法生成的每笔子单固定使用 `price_type="LIMIT"`；
+- `TWAP`、`VWAP` 与盘口算法使用同一个 `AlgoOrderRequest` 模型，但当前调用
+  会返回 `ALGORITHM_NOT_IMPLEMENTED`，不会写父单或调用 `passorder`；
+- 所有算法共用同一个大 QMT 模型和同一条 Bridge，不需要为每种算法新建策略。
+
+### 13.2 请求对象
+
+```python
+from qmt_adapter import AlgoOrderRequest
+
+
+order = AlgoOrderRequest(
+    account_id="YOUR_ACCOUNT_ID",
+    instrument="601919.SH",
+    side="BUY",
+    target_amount="10000000",
+    algorithm="BOOK_LIQUIDITY_WEIGHTED",
+    params={
+        "big_order_threshold": "1000000",
+        "min_child_notional": "10000",
+        "max_child_notional": "500000",
+        "primary_levels": 3,
+        "max_levels": 5,
+        "chase_ticks": 2,
+        "timeout_seconds": 20.0,
+        "max_retries": 3,
+    },
+    remark="book-liquidity",
+)
+```
+
+`target_amount` 与 `quantity` 必须且只能传一个。金额买入会换算成不超过该金额
+的最大整手目标数量；明确数量必须是100股的整数倍。
+
+参数默认值和含义：
+
+| 参数 | 默认值 | 含义 |
+|---|---:|---|
+| `big_order_threshold` | 1000000 | 预计金额不超过该值时只使用对手一档，但仍执行单笔上限拆分 |
+| `min_child_notional` | 10000 | 大单中某盘口档位参与分配的最小金额 |
+| `max_child_notional` | 500000 | 所有子单（包括追价子单）的硬性金额上限 |
+| `primary_levels` | 3 | 首次按流动性权重分配的档位数 |
+| `max_levels` | 5 | 最多使用的可见盘口档位数 |
+| `chase_ticks` | 2 | 五档仍不足时，相对最后有效档位的追价跳数；每跳取 QMT `PriceTick`，最终同时受涨跌停价和价格笼子约束 |
+| `timeout_seconds` | 20.0 | 当前轮次子单超时秒数 |
+| `max_retries` | 3 | 初始轮次之外允许重新读取盘口和重算的次数 |
+
+### 13.3 先预览、后提交
+
+```python
+from qmt_adapter import QmtClient
+
+
+with QmtClient() as client:
+    preview = client.preview_algo_order(order, timeout=10.0)
+    print(preview["depth"])
+    print(preview["resolved_quantity"], preview["planned_notional"])
+    print(preview["children"])
+
+    assert preview["planned_quantity"] == preview["resolved_quantity"]
+    receipt = client.place_algo_order(order, timeout=30.0)
+    print(receipt.algo_order_id, receipt.algo_status, receipt.child_count)
+```
+
+`preview_algo_order()` 不写 SQLite、不调用 `passorder`。它返回：
+
+- 大 QMT 模型上下文返回的买卖完整五档（不连接外部 `xtdata`）；
+- 最新价、昨收、实时涨跌幅；
+- `get_instrument_detail` 返回的当日涨跌停价、最小价位和交易状态；
+- 由大 QMT 盘口与最小价位按交易所规则计算的动态价格笼子；
+- `volume_lots`（手）与 `visible_quantity`（股，按100股/手换算）；
+- 账户可用资金或标的可用持仓；
+- 解析后的目标股数、预计委托金额和全部子单。
+
+`place_algo_order()` 会重新读取即时盘口并重新执行相同的资源和守恒检查，不能
+假设其结果与更早的预览完全一致。新父单的处理顺序固定为：生成完整计划 →
+验证总量与金额 → 在一个 SQLite 事务中写父单和全部子单计划 → 逐笔调用
+`passorder`。
+
+### 13.4 查询和整体撤单
+
+```python
+current = client.get_algo_order(receipt.algo_order_id)
+items = client.list_algo_orders(account_id="YOUR_ACCOUNT_ID")
+cancelled = client.cancel_algo_order(receipt.algo_order_id)
+```
+
+父单的主要状态为 `PLACING`、`WORKING`、`RETRY_CANCELING`、`CANCELING`、
+`UNKNOWN`、`FILLED`、`CANCELED`、`FAILED`。查询结果包含全部轮次子单、每笔
+QMT 委托号、标准化委托状态、已成交数量和原始回报。
+
+整体撤单允许重复调用。Bridge 只对当前可撤子单发出撤单请求；父单在所有活动
+子单进入终态后才变为 `CANCELED`。算法超时重试也遵守同样顺序：先撤当前轮次，
+等待 QMT 回报确认终态，再用“父单目标数量减去所有轮次累计成交数量”生成下一
+轮子单。因此不会在旧单仍可能成交时直接按原数量重下。
+
+### 13.5 同步与异步方法
+
+同步客户端公开：
+
+- `preview_algo_order()`
+- `place_algo_order()`
+- `get_algo_order()`
+- `list_algo_orders()`
+- `cancel_algo_order()`
+
+`AsyncQmtClient` 提供同名异步方法。它们仍通过一个工作线程和一条持久命名管道
+严格串行调用 QMT，不会并行执行 `passorder`。

@@ -6,7 +6,7 @@ from typing import Any, Callable, Dict, Optional, Type, TypeVar
 
 from .client import QmtClient
 from .config import ConfigPath
-from .models import OrderReceipt, OrderRequest
+from .models import AlgoOrderReceipt, AlgoOrderRequest, OrderReceipt, OrderRequest
 
 
 T = TypeVar("T")
@@ -142,6 +142,60 @@ class AsyncQmtClient:
         return await self._call(
             self._client.cancel_order,
             client_order_id,
+            timeout=timeout,
+        )
+
+    async def preview_algo_order(
+        self,
+        order: AlgoOrderRequest,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """异步生成算法拆单预览；不会下单或写入父子委托表。"""
+        return await self._call(
+            self._client.preview_algo_order,
+            order,
+            timeout=timeout,
+        )
+
+    async def place_algo_order(
+        self,
+        order: AlgoOrderRequest,
+        timeout: float = 30.0,
+    ) -> AlgoOrderReceipt:
+        """异步提交算法父委托；参数和返回值同同步客户端。"""
+        return await self._call(
+            self._client.place_algo_order,
+            order,
+            timeout=timeout,
+        )
+
+    async def get_algo_order(
+        self, algo_order_id: str, timeout: float = 5.0
+    ) -> Dict[str, Any]:
+        """异步查询算法父委托及子单。"""
+        return await self._call(
+            self._client.get_algo_order,
+            algo_order_id,
+            timeout=timeout,
+        )
+
+    async def list_algo_orders(
+        self, account_id: Optional[str] = None, timeout: float = 5.0
+    ) -> Dict[str, Any]:
+        """异步列出算法父委托。"""
+        return await self._call(
+            self._client.list_algo_orders,
+            account_id=account_id,
+            timeout=timeout,
+        )
+
+    async def cancel_algo_order(
+        self, algo_order_id: str, timeout: float = 10.0
+    ) -> Dict[str, Any]:
+        """异步停止算法并请求撤销当前所有可撤子单。"""
+        return await self._call(
+            self._client.cancel_algo_order,
+            algo_order_id,
             timeout=timeout,
         )
 

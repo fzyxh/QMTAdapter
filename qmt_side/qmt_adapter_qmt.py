@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""QMT-side bridge for stock account, position, order and cancel operations.
+"""QMT-side bridge for stock account, position, order and algorithm operations.
 
 This file intentionally uses Python 3.6 compatible syntax and UTF-8 source text.
 Only this module calls QMT-provided functions.
@@ -36,6 +36,21 @@ MAX_MESSAGE_SIZE = 1024 * 1024
 STRATEGY_NAME = "QMT_ADAPTER_V1"
 _RUNTIME = None
 
+ALGORITHM_BOOK_LIQUIDITY_WEIGHTED = "BOOK_LIQUIDITY_WEIGHTED"
+RESERVED_EXECUTION_ALGORITHMS = ("TWAP", "VWAP")
+ALGO_TERMINAL_STATUSES = ("FILLED", "CANCELED", "FAILED")
+ORDER_TERMINAL_STATUSES = ("FILLED", "CANCELED", "REJECTED")
+BOOK_LIQUIDITY_DEFAULTS = {
+    "big_order_threshold": "1000000",
+    "min_child_notional": "10000",
+    "max_child_notional": "500000",
+    "primary_levels": 3,
+    "max_levels": 5,
+    "chase_ticks": 2,
+    "timeout_seconds": 20.0,
+    "max_retries": 3,
+}
+
 STOCK_NATIVE_MARKET_PRICE_TYPES = {
     "MARKET_SH_CONVERT_5_CANCEL": {"SH", "BJ"},
     "MARKET_SH_CONVERT_5_LIMIT": {"SH", "BJ"},
@@ -64,6 +79,18 @@ def _utc_now_text():
     return datetime.datetime.now(datetime.timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%S.%fZ"
     )
+
+
+def _utc_text_timestamp(value):
+    if not value:
+        return 0.0
+    try:
+        parsed = datetime.datetime.strptime(
+            str(value), "%Y-%m-%dT%H:%M:%S.%fZ"
+        )
+        return (parsed - datetime.datetime(1970, 1, 1)).total_seconds()
+    except Exception:
+        return 0.0
 
 
 def _canonical_json(value):
@@ -103,6 +130,497 @@ def _order_payload_hash(
         "side": str(side).upper(),
     }
     return hashlib.sha256(_canonical_json(identity).encode("ascii")).hexdigest()
+
+
+def _algo_payload_hash(payload):
+    identity = {
+        "account_id": str(payload.get("account_id", "")),
+        "account_type": "STOCK",
+        "algorithm": str(payload.get("algorithm", "")).upper(),
+        "business_type": "CASH",
+        "instrument": str(payload.get("instrument", "")).upper(),
+        "params": payload.get("params") or {},
+        "quantity": payload.get("quantity"),
+        "remark": str(payload.get("remark", "")),
+        "side": str(payload.get("side", "")).upper(),
+        "target_amount": _canonical_price(payload.get("target_amount")),
+    }
+    return hashlib.sha256(_canonical_json(identity).encode("ascii")).hexdigest()
+
+
+def _positive_decimal(value, name, allow_zero=False):
+    try:
+        number = decimal.Decimal(str(value))
+    except Exception:
+        raise BridgeError("INVALID_ARGUMENT", "%s must be numeric" % name)
+    if not number.is_finite() or number < 0 or (not allow_zero and number == 0):
+        comparison = "non-negative" if allow_zero else "positive"
+        raise BridgeError(
+            "INVALID_ARGUMENT", "%s must be %s" % (name, comparison)
+        )
+    return number
+
+
+def _normalize_book_params(raw):
+    raw = raw or {}
+    if not isinstance(raw, dict):
+        raise BridgeError("INVALID_ARGUMENT", "params must be an object")
+    unknown = sorted(set(raw) - set(BOOK_LIQUIDITY_DEFAULTS))
+    if unknown:
+        raise BridgeError(
+            "INVALID_ARGUMENT",
+            "unsupported BOOK_LIQUIDITY_WEIGHTED params: %s" % ", ".join(unknown),
+        )
+    values = dict(BOOK_LIQUIDITY_DEFAULTS)
+    values.update(raw)
+    for name in (
+        "big_order_threshold",
+        "min_child_notional",
+        "max_child_notional",
+    ):
+        values[name] = _canonical_price(_positive_decimal(values[name], name))
+    if decimal.Decimal(values["min_child_notional"]) > decimal.Decimal(
+        values["max_child_notional"]
+    ):
+        raise BridgeError(
+            "INVALID_ARGUMENT",
+            "min_child_notional cannot exceed max_child_notional",
+        )
+    for name, minimum, maximum in (
+        ("primary_levels", 1, 5),
+        ("max_levels", 1, 5),
+        ("chase_ticks", 0, 100),
+        ("max_retries", 0, 10),
+    ):
+        value = values[name]
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise BridgeError("INVALID_ARGUMENT", "%s must be an integer" % name)
+        if value < minimum or value > maximum:
+            raise BridgeError(
+                "INVALID_ARGUMENT",
+                "%s must be between %s and %s" % (name, minimum, maximum),
+            )
+    if values["primary_levels"] > values["max_levels"]:
+        raise BridgeError(
+            "INVALID_ARGUMENT", "primary_levels cannot exceed max_levels"
+        )
+    timeout_seconds = _positive_decimal(values["timeout_seconds"], "timeout_seconds")
+    if timeout_seconds > decimal.Decimal("86400"):
+        raise BridgeError(
+            "INVALID_ARGUMENT", "timeout_seconds cannot exceed 86400"
+        )
+    values["timeout_seconds"] = float(timeout_seconds)
+    return values
+
+
+def _depth_sequence(tick, prefix, alternative_prefix):
+    values = tick.get(prefix)
+    if isinstance(values, (list, tuple)):
+        return list(values[:5])
+    result = []
+    for index in range(1, 6):
+        candidates = (
+            "%s%s" % (prefix, index),
+            "%s%s_%s" % (alternative_prefix, index, "price" if "Price" in prefix else "vol"),
+        )
+        found = None
+        for key in candidates:
+            if key in tick:
+                found = tick.get(key)
+                break
+        result.append(found)
+    return result
+
+
+def _normalize_depth_tick(tick, instrument, side):
+    if not isinstance(tick, dict):
+        raise BridgeError("MARKET_DATA_UNAVAILABLE", "QMT tick is not an object")
+    ask_prices = _depth_sequence(tick, "askPrice", "ask")
+    ask_volumes = _depth_sequence(tick, "askVol", "ask")
+    bid_prices = _depth_sequence(tick, "bidPrice", "bid")
+    bid_volumes = _depth_sequence(tick, "bidVol", "bid")
+    if side == "BUY":
+        prices = ask_prices
+        volumes = ask_volumes
+        book_side = "ASK"
+    else:
+        prices = bid_prices
+        volumes = bid_volumes
+        book_side = "BID"
+    levels = []
+    for index in range(min(len(prices), len(volumes), 5)):
+        try:
+            price = decimal.Decimal(str(prices[index]))
+            volume_lots = int(volumes[index])
+        except Exception:
+            continue
+        if not price.is_finite() or price <= 0 or volume_lots < 0:
+            continue
+        levels.append(
+            {
+                "level": index + 1,
+                "price": _canonical_price(price),
+                "volume_lots": volume_lots,
+                "visible_quantity": volume_lots * 100,
+            }
+        )
+    if not levels:
+        raise BridgeError(
+            "MARKET_DATA_UNAVAILABLE",
+            "no valid opposite-side depth for %s" % instrument,
+        )
+    def positive_price_text(value):
+        try:
+            price = decimal.Decimal(str(value))
+        except Exception:
+            return None
+        if price.is_finite() and price > 0:
+            return _canonical_price(price)
+        return None
+
+    def nonnegative_lots(value):
+        try:
+            lots = int(value)
+        except Exception:
+            return None
+        return lots if lots >= 0 else None
+
+    def quote_levels(level_prices, level_volumes):
+        result = []
+        for index in range(5):
+            price = positive_price_text(
+                level_prices[index] if index < len(level_prices) else None
+            )
+            lots = nonnegative_lots(
+                level_volumes[index] if index < len(level_volumes) else None
+            )
+            result.append(
+                {
+                    "level": index + 1,
+                    "price": price,
+                    "volume_lots": lots,
+                    "visible_quantity": lots * 100 if lots is not None else None,
+                }
+            )
+        return result
+
+    def first_positive(values):
+        for value in values:
+            price = positive_price_text(value)
+            if price is not None:
+                return price
+        return None
+
+    return {
+        "instrument": instrument,
+        "book_side": book_side,
+        "volume_unit": "LOTS",
+        "lot_size": 100,
+        "last_price": positive_price_text(tick.get("lastPrice")),
+        "last_close": positive_price_text(tick.get("lastClose")),
+        "best_ask": first_positive(ask_prices),
+        "best_bid": first_positive(bid_prices),
+        "timetag": tick.get("timetag") or tick.get("stime"),
+        "quote": {
+            "ask_levels": quote_levels(ask_prices, ask_volumes),
+            "bid_levels": quote_levels(bid_prices, bid_volumes),
+        },
+        "levels": levels,
+    }
+
+
+def _balanced_price_chunks(
+    quantity, price_text, source, min_child_notional, max_child_notional
+):
+    if quantity <= 0 or quantity % 100:
+        raise BridgeError("PLAN_INVALID", "child allocation must use whole lots")
+    price = decimal.Decimal(str(price_text))
+    max_notional = decimal.Decimal(str(max_child_notional))
+    min_notional = decimal.Decimal(str(min_child_notional))
+    maximum_lots = int(max_notional / (price * 100))
+    if maximum_lots < 1:
+        raise BridgeError(
+            "PLAN_INVALID",
+            "max_child_notional is below one board lot at price %s" % price_text,
+        )
+    total_lots = quantity // 100
+    child_count = (total_lots + maximum_lots - 1) // maximum_lots
+    base_lots = total_lots // child_count
+    extra_lots = total_lots % child_count
+    result = []
+    for index in range(child_count):
+        lots = base_lots + (1 if index < extra_lots else 0)
+        child_quantity = lots * 100
+        child_notional = price * child_quantity
+        if child_count > 1 and child_notional < min_notional:
+            raise BridgeError(
+                "PLAN_INVALID",
+                "min_child_notional and max_child_notional cannot both be met",
+            )
+        result.append(
+            {
+                "price": _canonical_price(price),
+                "quantity": child_quantity,
+                "estimated_notional": _canonical_price(child_notional),
+                "source": source,
+            }
+        )
+    return result
+
+
+def _weighted_lot_allocations(target_lots, levels):
+    capacities = [max(0, int(level["visible_quantity"]) // 100) for level in levels]
+    total_capacity = sum(capacities)
+    distributed = min(target_lots, total_capacity)
+    if distributed <= 0 or total_capacity <= 0:
+        return [0 for unused in levels]
+    allocations = [
+        min(capacity, distributed * capacity // total_capacity)
+        for capacity in capacities
+    ]
+    remaining = distributed - sum(allocations)
+    order = sorted(
+        range(len(levels)),
+        key=lambda index: (
+            (distributed * capacities[index]) % total_capacity,
+            capacities[index] - allocations[index],
+            -index,
+        ),
+        reverse=True,
+    )
+    while remaining > 0:
+        progressed = False
+        for index in order:
+            if allocations[index] < capacities[index]:
+                allocations[index] += 1
+                remaining -= 1
+                progressed = True
+                if remaining == 0:
+                    break
+        if not progressed:
+            break
+    return allocations
+
+
+def _price_on_tick(value, price_tick, rounding):
+    units = (value / price_tick).to_integral_value(rounding=rounding)
+    return units * price_tick
+
+
+def _calculate_price_cage(depth, price_tick):
+    def price_or_none(value):
+        try:
+            price = decimal.Decimal(str(value))
+        except Exception:
+            return None
+        if not price.is_finite() or price <= 0:
+            return None
+        return price
+
+    best_ask = price_or_none(depth.get("best_ask"))
+    best_bid = price_or_none(depth.get("best_bid"))
+    last_price = price_or_none(depth.get("last_price"))
+    last_close = price_or_none(depth.get("last_close"))
+    buy_reference = best_ask or best_bid or last_price or last_close
+    sell_reference = best_bid or best_ask or last_price or last_close
+    if buy_reference is None or sell_reference is None:
+        raise BridgeError(
+            "MARKET_DATA_UNAVAILABLE", "price-cage reference price is unavailable"
+        )
+    buy_boundary = max(
+        buy_reference * decimal.Decimal("1.02"),
+        buy_reference + price_tick * 10,
+    )
+    sell_boundary = min(
+        sell_reference * decimal.Decimal("0.98"),
+        sell_reference - price_tick * 10,
+    )
+    buy_maximum = _price_on_tick(
+        buy_boundary, price_tick, decimal.ROUND_FLOOR
+    )
+    sell_minimum = _price_on_tick(
+        sell_boundary, price_tick, decimal.ROUND_CEILING
+    )
+    return {
+        "buy_reference": _canonical_price(buy_reference),
+        "buy_maximum": _canonical_price(buy_maximum),
+        "sell_reference": _canonical_price(sell_reference),
+        "sell_minimum": _canonical_price(sell_minimum),
+        "price_tick": _canonical_price(price_tick),
+    }
+
+
+def _plan_book_quantity(quantity, depth, side, params):
+    if quantity <= 0 or quantity % 100:
+        raise BridgeError(
+            "INVALID_ARGUMENT", "algorithm quantity must be a multiple of 100"
+        )
+    levels = list(depth["levels"][: int(params["max_levels"])])
+    price_limits = depth.get("price_limits") or {}
+    try:
+        upper_limit = decimal.Decimal(str(price_limits["upper_limit"]))
+        lower_limit = decimal.Decimal(str(price_limits["lower_limit"]))
+    except Exception:
+        raise BridgeError(
+            "MARKET_DATA_UNAVAILABLE", "daily price limits are unavailable"
+        )
+    if upper_limit <= 0 or lower_limit <= 0 or upper_limit < lower_limit:
+        raise BridgeError("MARKET_DATA_UNAVAILABLE", "daily price limits are invalid")
+    price_cage = depth.get("price_cage") or {}
+    try:
+        buy_cage_maximum = decimal.Decimal(str(price_cage["buy_maximum"]))
+        sell_cage_minimum = decimal.Decimal(str(price_cage["sell_minimum"]))
+        price_tick = decimal.Decimal(str(price_cage["price_tick"]))
+    except Exception:
+        raise BridgeError("MARKET_DATA_UNAVAILABLE", "price cage is unavailable")
+    if price_tick <= 0:
+        raise BridgeError("MARKET_DATA_UNAVAILABLE", "price tick is invalid")
+    best_price = decimal.Decimal(levels[0]["price"])
+    threshold = decimal.Decimal(params["big_order_threshold"])
+    min_child = decimal.Decimal(params["min_child_notional"])
+    max_child = decimal.Decimal(params["max_child_notional"])
+    assignments = []
+    target_lots = quantity // 100
+    if best_price * quantity <= threshold:
+        assignments.append((levels[0], target_lots, "BEST_OPPOSITE"))
+    else:
+        primary = levels[: int(params["primary_levels"])]
+        allocations = _weighted_lot_allocations(target_lots, primary)
+        assigned_lots = 0
+        for level, lots in zip(primary, allocations):
+            if lots > 0 and decimal.Decimal(level["price"]) * lots * 100 >= min_child:
+                assignments.append((level, lots, "DEPTH_%s" % level["level"]))
+                assigned_lots += lots
+        remaining_lots = target_lots - assigned_lots
+        for level in levels[len(primary) :]:
+            if remaining_lots <= 0:
+                break
+            capacity = max(0, int(level["visible_quantity"]) // 100)
+            lots = min(remaining_lots, capacity)
+            if lots > 0 and decimal.Decimal(level["price"]) * lots * 100 >= min_child:
+                assignments.append((level, lots, "DEPTH_%s" % level["level"]))
+                assigned_lots += lots
+                remaining_lots -= lots
+        if remaining_lots > 0:
+            last_price = decimal.Decimal(levels[-1]["price"])
+            ticks = decimal.Decimal(int(params["chase_ticks"])) * price_tick
+            chase_price = last_price + ticks if side == "BUY" else last_price - ticks
+            clamp_source = None
+            if side == "BUY":
+                maximum_price = min(upper_limit, buy_cage_maximum)
+                if chase_price > maximum_price:
+                    chase_price = maximum_price
+                    clamp_source = (
+                        "CHASE_DAILY_LIMIT_CLAMPED"
+                        if upper_limit <= buy_cage_maximum
+                        else "CHASE_PRICE_CAGE_CLAMPED"
+                    )
+            else:
+                minimum_price = max(lower_limit, sell_cage_minimum)
+                if chase_price < minimum_price:
+                    chase_price = minimum_price
+                    clamp_source = (
+                        "CHASE_DAILY_LIMIT_CLAMPED"
+                        if lower_limit >= sell_cage_minimum
+                        else "CHASE_PRICE_CAGE_CLAMPED"
+                    )
+            if chase_price <= 0:
+                raise BridgeError("PLAN_INVALID", "calculated chase price is invalid")
+            chase_level = {
+                "level": "CHASE",
+                "price": _canonical_price(chase_price),
+                "visible_quantity": 0,
+            }
+            assignments.append(
+                (
+                    chase_level,
+                    remaining_lots,
+                    clamp_source or "CHASE",
+                )
+            )
+
+    children = []
+    for level, lots, source in assignments:
+        children.extend(
+            _balanced_price_chunks(
+                lots * 100,
+                level["price"],
+                source,
+                min_child,
+                max_child,
+            )
+        )
+    planned_quantity = sum(child["quantity"] for child in children)
+    if planned_quantity != quantity:
+        raise BridgeError(
+            "PLAN_INVALID",
+            "planned quantity does not equal target quantity",
+            {"target_quantity": quantity, "planned_quantity": planned_quantity},
+        )
+    for index, child in enumerate(children):
+        child_price = decimal.Decimal(child["price"])
+        if child_price > upper_limit or child_price < lower_limit:
+            raise BridgeError(
+                "PLAN_INVALID",
+                "child price is outside daily price limits",
+                {
+                    "child_price": child["price"],
+                    "upper_limit": _canonical_price(upper_limit),
+                    "lower_limit": _canonical_price(lower_limit),
+                },
+            )
+        if side == "BUY" and child_price > buy_cage_maximum:
+            raise BridgeError(
+                "PLAN_INVALID", "buy child price is above the price cage"
+            )
+        if side == "SELL" and child_price < sell_cage_minimum:
+            raise BridgeError(
+                "PLAN_INVALID", "sell child price is below the price cage"
+            )
+        child["child_index"] = index
+    return children
+
+
+def _plan_notional(children):
+    return sum(
+        (
+            decimal.Decimal(child["price"]) * int(child["quantity"])
+            for child in children
+        ),
+        decimal.Decimal("0"),
+    )
+
+
+def _plan_book_target(target_amount, quantity, depth, side, params):
+    if target_amount is None:
+        resolved_quantity = int(quantity)
+        children = _plan_book_quantity(resolved_quantity, depth, side, params)
+        return resolved_quantity, children
+    amount = _positive_decimal(target_amount, "target_amount")
+    best_price = decimal.Decimal(depth["levels"][0]["price"])
+    upper_lots = int(amount / (best_price * 100))
+    if upper_lots < 1:
+        raise BridgeError(
+            "INVALID_ARGUMENT", "target_amount is below one board lot"
+        )
+    lower = 1
+    upper = upper_lots
+    best_lots = 0
+    best_children = None
+    while lower <= upper:
+        middle = (lower + upper) // 2
+        children = _plan_book_quantity(middle * 100, depth, side, params)
+        if _plan_notional(children) <= amount:
+            best_lots = middle
+            best_children = children
+            lower = middle + 1
+        else:
+            upper = middle - 1
+    if not best_children:
+        raise BridgeError(
+            "INVALID_ARGUMENT", "target_amount cannot fund one planned board lot"
+        )
+    return best_lots * 100, best_children
 
 
 def _safe_value(value, depth=0):
@@ -163,6 +681,66 @@ def _normalize_position(raw, configured_account_id):
         "total_quantity": raw.get("m_nVolume"),
         "raw": raw,
     }
+
+
+def _raw_integer(raw, name):
+    value = raw.get(name) if raw else None
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _order_filled_quantity(raw):
+    value = _raw_integer(raw, "m_nVolumeTraded")
+    return max(0, value or 0)
+
+
+def _derive_order_status(raw, current_status):
+    if not raw:
+        return current_status
+    order_status = _raw_integer(raw, "m_nOrderStatus")
+    status_map = {
+        48: "SUBMITTED",
+        49: "SUBMITTED",
+        50: "SUBMITTED",
+        51: "CANCEL_PENDING",
+        52: "CANCEL_PENDING",
+        53: "CANCELED",
+        54: "CANCELED",
+        55: "PARTIALLY_FILLED",
+        56: "FILLED",
+        57: "REJECTED",
+        255: "UNKNOWN",
+    }
+    if order_status in status_map:
+        reported_status = status_map[order_status]
+        if current_status == "CANCEL_PENDING" and reported_status in (
+            "SUBMITTED",
+            "PARTIALLY_FILLED",
+        ):
+            return "CANCEL_PENDING"
+        return reported_status
+    original = _raw_integer(raw, "m_nVolumeTotalOriginal")
+    traded = _raw_integer(raw, "m_nVolumeTraded")
+    remaining = _raw_integer(raw, "m_nVolumeTotal")
+    error_message = str(raw.get("m_strErrorMsg", "") or "").strip()
+    if error_message:
+        return "REJECTED"
+    if original is not None and original > 0 and traded is not None:
+        if traded >= original:
+            return "FILLED"
+        if traded > 0:
+            if remaining == 0 and current_status == "CANCEL_PENDING":
+                return "CANCELED"
+            return "PARTIALLY_FILLED"
+    if remaining == 0 and current_status == "CANCEL_PENDING":
+        return "CANCELED"
+    if current_status in ("PENDING_QMT", "PENDING_BROKER_ID", "UNKNOWN"):
+        return "SUBMITTED"
+    return current_status
 
 
 class PipeServer(object):
@@ -481,6 +1059,45 @@ class OrderStore(object):
             CREATE UNIQUE INDEX IF NOT EXISTS uq_orders_qmt_id
             ON orders(account_id, qmt_order_id)
             WHERE qmt_order_id IS NOT NULL;
+
+            CREATE TABLE IF NOT EXISTS algo_orders (
+                algo_order_id TEXT PRIMARY KEY,
+                request_id TEXT NOT NULL UNIQUE,
+                payload_hash TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                instrument TEXT NOT NULL,
+                side TEXT NOT NULL,
+                algorithm TEXT NOT NULL,
+                target_amount TEXT,
+                target_quantity INTEGER,
+                resolved_quantity INTEGER NOT NULL,
+                filled_quantity INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                current_attempt INTEGER NOT NULL DEFAULT 0,
+                params_json TEXT NOT NULL,
+                user_remark TEXT,
+                cancel_requested INTEGER NOT NULL DEFAULT 0,
+                error_code TEXT,
+                error_message TEXT,
+                attempt_started_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS algo_children (
+                algo_order_id TEXT NOT NULL,
+                client_order_id TEXT NOT NULL UNIQUE,
+                attempt INTEGER NOT NULL,
+                child_index INTEGER NOT NULL,
+                price TEXT NOT NULL,
+                quantity INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(algo_order_id, attempt, child_index),
+                FOREIGN KEY(algo_order_id) REFERENCES algo_orders(algo_order_id)
+            );
+            CREATE INDEX IF NOT EXISTS ix_algo_children_parent
+            ON algo_children(algo_order_id, attempt, child_index);
             """
         )
         columns = {
@@ -587,9 +1204,159 @@ class OrderStore(object):
         with self.lock:
             return self.conn.execute(
                 "SELECT client_order_id,wire_order_tag,account_id,status FROM orders "
-                "WHERE qmt_order_id IS NULL OR "
-                "status IN ('PENDING_BROKER_ID','CANCEL_PENDING')"
+                "WHERE status NOT IN ('FILLED','CANCELED','REJECTED')"
             ).fetchall()
+
+    def create_algo_order(
+        self, request_id, payload, payload_hash, resolved_quantity, params, children
+    ):
+        now = _utc_now_text()
+        with self.lock:
+            try:
+                self.conn.execute(
+                    "INSERT INTO algo_orders(algo_order_id,request_id,payload_hash,"
+                    "account_id,instrument,side,algorithm,target_amount,target_quantity,"
+                    "resolved_quantity,status,current_attempt,params_json,user_remark,"
+                    "attempt_started_at,created_at,updated_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,'PLACING',0,?,?,?,?,?)",
+                    (
+                        payload["algo_order_id"],
+                        request_id,
+                        payload_hash,
+                        payload["account_id"],
+                        payload["instrument"],
+                        payload["side"],
+                        payload["algorithm"],
+                        payload.get("target_amount"),
+                        payload.get("quantity"),
+                        int(resolved_quantity),
+                        _canonical_json(params),
+                        payload.get("remark", ""),
+                        now,
+                        now,
+                        now,
+                    ),
+                )
+                for child in children:
+                    self.conn.execute(
+                        "INSERT INTO algo_children(algo_order_id,client_order_id,"
+                        "attempt,child_index,price,quantity,source,created_at) "
+                        "VALUES(?,?,?,?,?,?,?,?)",
+                        (
+                            payload["algo_order_id"],
+                            child["client_order_id"],
+                            0,
+                            int(child["child_index"]),
+                            str(child["price"]),
+                            int(child["quantity"]),
+                            str(child["source"]),
+                            now,
+                        ),
+                    )
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def start_algo_attempt(self, algo_order_id, attempt, children):
+        now = _utc_now_text()
+        with self.lock:
+            try:
+                for child in children:
+                    self.conn.execute(
+                        "INSERT INTO algo_children(algo_order_id,client_order_id,"
+                        "attempt,child_index,price,quantity,source,created_at) "
+                        "VALUES(?,?,?,?,?,?,?,?)",
+                        (
+                            algo_order_id,
+                            child["client_order_id"],
+                            int(attempt),
+                            int(child["child_index"]),
+                            str(child["price"]),
+                            int(child["quantity"]),
+                            str(child["source"]),
+                            now,
+                        ),
+                    )
+                self.conn.execute(
+                    "UPDATE algo_orders SET current_attempt=?,status='PLACING',"
+                    "attempt_started_at=?,error_code=NULL,error_message=NULL,"
+                    "updated_at=? WHERE algo_order_id=?",
+                    (int(attempt), now, now, algo_order_id),
+                )
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def update_algo_order(self, algo_order_id, **values):
+        allowed = {
+            "filled_quantity",
+            "status",
+            "current_attempt",
+            "cancel_requested",
+            "error_code",
+            "error_message",
+            "attempt_started_at",
+        }
+        assignments = []
+        parameters = []
+        for name, value in values.items():
+            if name not in allowed:
+                raise ValueError("unsupported algo_orders column: %s" % name)
+            assignments.append("%s=?" % name)
+            parameters.append(value)
+        if not assignments:
+            return
+        assignments.append("updated_at=?")
+        parameters.append(_utc_now_text())
+        parameters.append(algo_order_id)
+        with self.lock:
+            self.conn.execute(
+                "UPDATE algo_orders SET %s WHERE algo_order_id=?"
+                % ",".join(assignments),
+                tuple(parameters),
+            )
+            self.conn.commit()
+
+    def get_algo_order(self, algo_order_id):
+        with self.lock:
+            return self.conn.execute(
+                "SELECT * FROM algo_orders WHERE algo_order_id=?", (algo_order_id,)
+            ).fetchone()
+
+    def list_algo_orders(self, account_id=None, active_only=False):
+        with self.lock:
+            clauses = []
+            parameters = []
+            if account_id:
+                clauses.append("account_id=?")
+                parameters.append(account_id)
+            if active_only:
+                clauses.append("status NOT IN ('FILLED','CANCELED','FAILED')")
+            sql = "SELECT * FROM algo_orders"
+            if clauses:
+                sql += " WHERE " + " AND ".join(clauses)
+            sql += " ORDER BY created_at DESC"
+            return self.conn.execute(sql, tuple(parameters)).fetchall()
+
+    def list_algo_children(self, algo_order_id, attempt=None):
+        with self.lock:
+            sql = (
+                "SELECT c.algo_order_id,c.client_order_id,c.attempt,c.child_index,"
+                "c.price,c.quantity,c.source,c.created_at AS child_created_at,"
+                "o.request_id AS order_request_id,o.qmt_order_id,o.status AS "
+                "order_status,o.raw_json,o.created_at AS order_created_at,"
+                "o.updated_at AS order_updated_at FROM algo_children c "
+                "LEFT JOIN orders o ON o.client_order_id=c.client_order_id "
+                "WHERE c.algo_order_id=?"
+            )
+            parameters = [algo_order_id]
+            if attempt is not None:
+                sql += " AND c.attempt=?"
+                parameters.append(int(attempt))
+            sql += " ORDER BY c.attempt,c.child_index"
+            return self.conn.execute(sql, tuple(parameters)).fetchall()
 
 
 class BridgeRuntime(object):
@@ -631,6 +1398,8 @@ class BridgeRuntime(object):
         self.connected = False
         self.last_error = ""
         self.last_reconcile = 0.0
+        self.last_algo_scan = 0.0
+        self.algo_cancel_attempts = {}
         self.tick_lock = threading.Lock()
         self.tick_count = 0
         self.last_tick_time = None
@@ -692,6 +1461,11 @@ class BridgeRuntime(object):
                     "order.get",
                     "order.list",
                     "order.cancel",
+                    "algo_order.preview",
+                    "algo_order.place",
+                    "algo_order.get",
+                    "algo_order.list",
+                    "algo_order.cancel",
                 ],
             },
         }
@@ -706,7 +1480,13 @@ class BridgeRuntime(object):
             )
 
     def is_local_read_command(self, command):
-        return str(command or "") in ("system.health", "order.get", "order.list")
+        return str(command or "") in (
+            "system.health",
+            "order.get",
+            "order.list",
+            "algo_order.get",
+            "algo_order.list",
+        )
 
     def process_local_request(self, message):
         return self._process_request(message, None)
@@ -719,6 +1499,12 @@ class BridgeRuntime(object):
             self.last_tick_time = now
             self.tick_count += 1
         self.process_order_events()
+        if time.monotonic() - self.last_algo_scan >= 0.1:
+            self.last_algo_scan = time.monotonic()
+            try:
+                self.process_algo_orders(context_info)
+            except Exception as exc:
+                self.set_error("algorithm order processing failed: %s" % exc)
         max_commands = int(self.config.get("max_commands_per_tick", 20))
         for unused in range(max_commands):
             try:
@@ -836,9 +1622,7 @@ class BridgeRuntime(object):
         row = self.store.get_order_by_wire_tag(wire_order_tag)
         if not row:
             return None
-        status = row["status"]
-        if status in ("PENDING_QMT", "PENDING_BROKER_ID", "UNKNOWN"):
-            status = "SUBMITTED"
+        status = _derive_order_status(raw, row["status"])
         self.store.update_order(
             row["client_order_id"],
             status=status,
@@ -900,6 +1684,16 @@ class BridgeRuntime(object):
             return self.list_orders(payload)
         if command == "order.cancel":
             return self.cancel_order(payload, request_id, context_info)
+        if command == "algo_order.preview":
+            return self.preview_algo_order(payload, context_info)
+        if command == "algo_order.place":
+            return self.place_algo_order(payload, request_id, context_info)
+        if command == "algo_order.get":
+            return self.get_algo_order(payload)
+        if command == "algo_order.list":
+            return self.list_algo_orders(payload)
+        if command == "algo_order.cancel":
+            return self.cancel_algo_order(payload, request_id, context_info)
         raise BridgeError("UNSUPPORTED_COMMAND", "unsupported command: %s" % command)
 
     def health(self):
@@ -978,6 +1772,711 @@ class BridgeRuntime(object):
             "count": len(items),
             "as_of": _utc_now_text(),
         }
+
+    def _require_latest_bar(self, context_info):
+        try:
+            if not context_info.is_last_bar():
+                raise BridgeError("QMT_NOT_READY", "QMT is not on the latest bar")
+        except AttributeError:
+            raise BridgeError(
+                "QMT_NOT_READY", "ContextInfo.is_last_bar is unavailable"
+            )
+
+    def _validate_algo_order(self, payload):
+        account_id = self._require_account(payload)
+        if str(payload.get("account_type", "STOCK")).upper() != "STOCK":
+            raise BridgeError("INVALID_ARGUMENT", "only STOCK is supported")
+        if str(payload.get("business_type", "CASH")).upper() != "CASH":
+            raise BridgeError("INVALID_ARGUMENT", "only CASH is supported")
+        algo_order_id = str(payload.get("algo_order_id", "")).strip()
+        if not algo_order_id:
+            raise BridgeError("INVALID_ARGUMENT", "algo_order_id is required")
+        instrument = str(payload.get("instrument", "")).upper()
+        if not re.match(r"^[0-9]{6}\.(SH|SZ|BJ)$", instrument):
+            raise BridgeError("INVALID_ARGUMENT", "invalid stock code: %s" % instrument)
+        side = str(payload.get("side", "")).upper()
+        if side not in ("BUY", "SELL"):
+            raise BridgeError("INVALID_ARGUMENT", "side must be BUY or SELL")
+        algorithm = str(payload.get("algorithm", "")).upper()
+        if algorithm in RESERVED_EXECUTION_ALGORITHMS:
+            raise BridgeError(
+                "ALGORITHM_NOT_IMPLEMENTED",
+                "%s is reserved but not implemented" % algorithm,
+            )
+        if algorithm != ALGORITHM_BOOK_LIQUIDITY_WEIGHTED:
+            raise BridgeError(
+                "INVALID_ARGUMENT", "unsupported algorithm: %s" % algorithm
+            )
+        has_amount = payload.get("target_amount") is not None
+        has_quantity = payload.get("quantity") is not None
+        if has_amount == has_quantity:
+            raise BridgeError(
+                "INVALID_ARGUMENT",
+                "exactly one of target_amount and quantity is required",
+            )
+        target_amount = None
+        quantity = None
+        if has_amount:
+            target_amount = _canonical_price(
+                _positive_decimal(payload.get("target_amount"), "target_amount")
+            )
+        else:
+            quantity = payload.get("quantity")
+            if (
+                not isinstance(quantity, int)
+                or isinstance(quantity, bool)
+                or quantity <= 0
+                or quantity % 100
+            ):
+                raise BridgeError(
+                    "INVALID_ARGUMENT",
+                    "algorithm quantity must be a positive multiple of 100",
+                )
+        params = _normalize_book_params(payload.get("params") or {})
+        return {
+            "algo_order_id": algo_order_id,
+            "account_id": account_id,
+            "account_type": "STOCK",
+            "business_type": "CASH",
+            "instrument": instrument,
+            "side": side,
+            "algorithm": algorithm,
+            "target_amount": target_amount,
+            "quantity": quantity,
+            "params": params,
+            "remark": str(payload.get("remark", "") or ""),
+        }
+
+    def _read_stock_depth(self, instrument, side, context_info):
+        get_full_tick = getattr(context_info, "get_full_tick", None)
+        if not callable(get_full_tick):
+            raise BridgeError(
+                "QMT_API_MISSING", "ContextInfo.get_full_tick is unavailable"
+            )
+        ticks = get_full_tick([instrument])
+        if not ticks or instrument not in ticks:
+            raise BridgeError(
+                "MARKET_DATA_UNAVAILABLE", "no full tick for %s" % instrument
+            )
+        depth = _normalize_depth_tick(ticks[instrument], instrument, side)
+        get_instrument_detail = getattr(context_info, "get_instrument_detail", None)
+        if not callable(get_instrument_detail):
+            raise BridgeError(
+                "QMT_API_MISSING", "ContextInfo.get_instrument_detail is unavailable"
+            )
+        detail = get_instrument_detail(instrument)
+        if not isinstance(detail, dict):
+            raise BridgeError(
+                "MARKET_DATA_UNAVAILABLE", "instrument detail is unavailable"
+            )
+        try:
+            upper_limit = _positive_decimal(
+                detail.get("UpStopPrice"), "UpStopPrice"
+            )
+            lower_limit = _positive_decimal(
+                detail.get("DownStopPrice"), "DownStopPrice"
+            )
+            price_tick = _positive_decimal(detail.get("PriceTick"), "PriceTick")
+        except BridgeError:
+            raise BridgeError(
+                "MARKET_DATA_UNAVAILABLE",
+                "daily price limits or price tick are unavailable",
+            )
+        if detail.get("IsTrading") is False:
+            raise BridgeError(
+                "MARKET_NOT_TRADING", "%s is not tradable" % instrument
+            )
+        try:
+            pre_close = _positive_decimal(
+                depth.get("last_close") or detail.get("PreClose"), "PreClose"
+            )
+        except BridgeError:
+            raise BridgeError(
+                "MARKET_DATA_UNAVAILABLE", "previous close is unavailable"
+            )
+        depth["last_close"] = _canonical_price(pre_close)
+        try:
+            last_price = _positive_decimal(depth.get("last_price"), "lastPrice")
+            if last_price > 0 and pre_close > 0:
+                depth["change_percent"] = float(
+                    (last_price / pre_close - 1) * 100
+                )
+            else:
+                depth["change_percent"] = None
+        except BridgeError:
+            depth["change_percent"] = None
+        depth["price_limits"] = {
+            "upper_limit": _canonical_price(upper_limit),
+            "lower_limit": _canonical_price(lower_limit),
+        }
+        depth["price_cage"] = _calculate_price_cage(depth, price_tick)
+        depth["instrument_detail"] = {
+            "instrument_name": detail.get("InstrumentName"),
+            "pre_close": _canonical_price(pre_close),
+            "price_tick": _canonical_price(price_tick),
+            "instrument_status": detail.get("InstrumentStatus"),
+            "is_trading": detail.get("IsTrading"),
+        }
+        return depth
+
+    def _account_available_cash(self, account_id):
+        objects = self._qmt_function("get_trade_detail_data")(
+            account_id, "STOCK", "ACCOUNT"
+        )
+        if not objects:
+            raise BridgeError("ACCOUNT_DATA_UNAVAILABLE", "account data is empty")
+        raw = _serialize_qmt_object(objects[0])
+        try:
+            available = decimal.Decimal(str(raw["m_dAvailable"]))
+        except Exception:
+            raise BridgeError(
+                "ACCOUNT_DATA_UNAVAILABLE", "m_dAvailable is unavailable"
+            )
+        if not available.is_finite() or available < 0:
+            raise BridgeError(
+                "ACCOUNT_DATA_UNAVAILABLE", "m_dAvailable is invalid"
+            )
+        return available
+
+    def _position_available_quantity(self, account_id, instrument):
+        objects = self._qmt_function("get_trade_detail_data")(
+            account_id, "STOCK", "POSITION"
+        )
+        for obj in objects or []:
+            raw = _serialize_qmt_object(obj)
+            if str(raw.get("m_strInstrumentID", "")).upper() != instrument:
+                continue
+            if "m_nCanUseVolume" not in raw:
+                raise BridgeError(
+                    "POSITION_DATA_UNAVAILABLE", "m_nCanUseVolume is unavailable"
+                )
+            try:
+                return max(0, int(raw["m_nCanUseVolume"]))
+            except Exception:
+                raise BridgeError(
+                    "POSITION_DATA_UNAVAILABLE", "m_nCanUseVolume is invalid"
+                )
+        return 0
+
+    def _check_algo_resources(self, payload, resolved_quantity, planned_notional):
+        if payload["side"] == "BUY":
+            available_cash = self._account_available_cash(payload["account_id"])
+            if planned_notional > available_cash:
+                raise BridgeError(
+                    "INSUFFICIENT_CASH",
+                    "available cash is below planned order notional",
+                    {
+                        "available_cash": _canonical_price(available_cash),
+                        "planned_notional": _canonical_price(planned_notional),
+                    },
+                )
+            return {
+                "available_cash": _canonical_price(available_cash),
+                "available_quantity": None,
+            }
+        available_quantity = self._position_available_quantity(
+            payload["account_id"], payload["instrument"]
+        )
+        if resolved_quantity > available_quantity:
+            raise BridgeError(
+                "INSUFFICIENT_POSITION",
+                "available position is below planned sell quantity",
+                {
+                    "available_quantity": available_quantity,
+                    "planned_quantity": resolved_quantity,
+                },
+            )
+        return {
+            "available_cash": None,
+            "available_quantity": available_quantity,
+        }
+
+    def _build_algo_preview(self, payload, context_info):
+        self._require_latest_bar(context_info)
+        depth = self._read_stock_depth(
+            payload["instrument"], payload["side"], context_info
+        )
+        resolved_quantity, children = _plan_book_target(
+            payload.get("target_amount"),
+            payload.get("quantity"),
+            depth,
+            payload["side"],
+            payload["params"],
+        )
+        planned_quantity = sum(child["quantity"] for child in children)
+        if planned_quantity != resolved_quantity:
+            raise BridgeError(
+                "PLAN_INVALID",
+                "planned quantity does not equal resolved quantity",
+                {
+                    "resolved_quantity": resolved_quantity,
+                    "planned_quantity": planned_quantity,
+                },
+            )
+        planned_notional = _plan_notional(children)
+        if payload.get("target_amount") is not None and payload["side"] == "BUY":
+            if planned_notional > decimal.Decimal(payload["target_amount"]):
+                raise BridgeError(
+                    "PLAN_INVALID", "buy plan exceeds target_amount"
+                )
+        resources = self._check_algo_resources(
+            payload, resolved_quantity, planned_notional
+        )
+        return {
+            "algo_order_id": payload["algo_order_id"],
+            "account_id": payload["account_id"],
+            "instrument": payload["instrument"],
+            "side": payload["side"],
+            "algorithm": payload["algorithm"],
+            "target_amount": payload.get("target_amount"),
+            "target_quantity": payload.get("quantity"),
+            "resolved_quantity": resolved_quantity,
+            "planned_quantity": planned_quantity,
+            "planned_notional": _canonical_price(planned_notional),
+            "child_count": len(children),
+            "children": children,
+            "depth": depth,
+            "resources": resources,
+            "params": payload["params"],
+            "as_of": _utc_now_text(),
+        }
+
+    def preview_algo_order(self, payload, context_info):
+        normalized = self._validate_algo_order(payload)
+        return self._build_algo_preview(normalized, context_info)
+
+    def _prepare_algo_children(self, algo_order_id, attempt, children):
+        prepared = []
+        for child in children:
+            item = dict(child)
+            item["client_order_id"] = "%s:a%s:c%s" % (
+                algo_order_id,
+                attempt,
+                child["child_index"],
+            )
+            prepared.append(item)
+        return prepared
+
+    def _algo_place_result(self, row, request_id, idempotent_replay):
+        result = self._algo_row(row)
+        result["request_id"] = request_id
+        result["original_request_id"] = row["request_id"]
+        result["command_status"] = "SUCCEEDED"
+        result["idempotent_replay"] = bool(idempotent_replay)
+        return result
+
+    def place_algo_order(self, payload, request_id, context_info):
+        normalized = self._validate_algo_order(payload)
+        payload_hash = _algo_payload_hash(normalized)
+        existing = self.store.get_algo_order(normalized["algo_order_id"])
+        if existing:
+            if existing["payload_hash"] != payload_hash:
+                raise BridgeError(
+                    "ALGO_ORDER_ID_CONFLICT",
+                    "algo_order_id is already bound to different parameters",
+                    {"algo_order_id": normalized["algo_order_id"]},
+                )
+            return self._algo_place_result(existing, request_id, True)
+
+        preview = self._build_algo_preview(normalized, context_info)
+        children = self._prepare_algo_children(
+            normalized["algo_order_id"], 0, preview["children"]
+        )
+        try:
+            self.store.create_algo_order(
+                request_id,
+                normalized,
+                payload_hash,
+                preview["resolved_quantity"],
+                normalized["params"],
+                children,
+            )
+        except sqlite3.IntegrityError:
+            raise BridgeError(
+                "ALGO_ORDER_ID_CONFLICT",
+                "algo_order_id or request_id already exists",
+                {"algo_order_id": normalized["algo_order_id"]},
+            )
+        self._submit_algo_attempt(normalized["algo_order_id"], 0, context_info)
+        row = self.store.get_algo_order(normalized["algo_order_id"])
+        return self._algo_place_result(row, request_id, False)
+
+    def _child_order_payload(self, parent, child):
+        remark = "algo a%s/c%s %s" % (
+            child["attempt"],
+            child["child_index"],
+            parent["user_remark"] or "",
+        )
+        return {
+            "client_order_id": child["client_order_id"],
+            "account_id": parent["account_id"],
+            "account_type": "STOCK",
+            "business_type": "CASH",
+            "instrument": parent["instrument"],
+            "side": parent["side"],
+            "quantity_type": "SHARES",
+            "quantity": int(child["quantity"]),
+            "price_type": "LIMIT",
+            "limit_price": child["price"],
+            "remark": remark,
+        }
+
+    def _submit_algo_attempt(self, algo_order_id, attempt, context_info):
+        parent = self.store.get_algo_order(algo_order_id)
+        if not parent:
+            raise BridgeError("ALGO_ORDER_NOT_FOUND", "algorithm order was not found")
+        children = self.store.list_algo_children(algo_order_id, attempt)
+        try:
+            for child in children:
+                if child["order_status"] is not None:
+                    continue
+                child_request_id = "ALG" + hashlib.sha256(
+                    child["client_order_id"].encode("utf-8")
+                ).hexdigest()
+                self.place_order(
+                    self._child_order_payload(parent, child),
+                    child_request_id,
+                    context_info,
+                )
+        except UncertainError:
+            self.store.update_algo_order(algo_order_id, status="UNKNOWN")
+            raise
+        except BridgeError as exc:
+            self.store.update_algo_order(
+                algo_order_id,
+                status="FINAL_CANCELING",
+                error_code=exc.code,
+                error_message=exc.message,
+            )
+            raise
+        self.store.update_algo_order(
+            algo_order_id,
+            status="WORKING",
+            attempt_started_at=_utc_now_text(),
+            error_code=None,
+            error_message=None,
+        )
+
+    def _algo_child_row(self, row):
+        raw = json.loads(row["raw_json"]) if row["raw_json"] else None
+        status = row["order_status"] or "PLANNED"
+        if raw:
+            status = _derive_order_status(raw, status)
+        return {
+            "client_order_id": row["client_order_id"],
+            "attempt": row["attempt"],
+            "child_index": row["child_index"],
+            "price": row["price"],
+            "quantity": row["quantity"],
+            "estimated_notional": _canonical_price(
+                decimal.Decimal(row["price"]) * int(row["quantity"])
+            ),
+            "source": row["source"],
+            "qmt_order_id": row["qmt_order_id"],
+            "order_status": status,
+            "filled_quantity": _order_filled_quantity(raw),
+            "raw": raw,
+            "created_at": row["order_created_at"] or row["child_created_at"],
+            "updated_at": row["order_updated_at"],
+        }
+
+    def _algo_row(self, row):
+        children = [
+            self._algo_child_row(child)
+            for child in self.store.list_algo_children(row["algo_order_id"])
+        ]
+        filled_quantity = sum(child["filled_quantity"] for child in children)
+        current_children = [
+            child for child in children if child["attempt"] == row["current_attempt"]
+        ]
+        return {
+            "algo_order_id": row["algo_order_id"],
+            "request_id": row["request_id"],
+            "account_id": row["account_id"],
+            "account_type": "STOCK",
+            "instrument": row["instrument"],
+            "side": row["side"],
+            "algorithm": row["algorithm"],
+            "target_amount": row["target_amount"],
+            "target_quantity": row["target_quantity"],
+            "resolved_quantity": row["resolved_quantity"],
+            "filled_quantity": filled_quantity,
+            "remaining_quantity": max(0, row["resolved_quantity"] - filled_quantity),
+            "algo_status": row["status"],
+            "current_attempt": row["current_attempt"],
+            "params": json.loads(row["params_json"]),
+            "remark": row["user_remark"],
+            "cancel_requested": bool(row["cancel_requested"]),
+            "error": (
+                {"code": row["error_code"], "message": row["error_message"]}
+                if row["error_code"] or row["error_message"]
+                else None
+            ),
+            "child_count": len(children),
+            "current_attempt_child_count": len(current_children),
+            "current_attempt_planned_quantity": sum(
+                child["quantity"] for child in current_children
+            ),
+            "children": children,
+            "attempt_started_at": row["attempt_started_at"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def get_algo_order(self, payload):
+        algo_order_id = str(payload.get("algo_order_id", "")).strip()
+        if not algo_order_id:
+            raise BridgeError("INVALID_ARGUMENT", "algo_order_id is required")
+        row = self.store.get_algo_order(algo_order_id)
+        if not row:
+            raise BridgeError("ALGO_ORDER_NOT_FOUND", "algorithm order was not found")
+        return self._algo_row(row)
+
+    def list_algo_orders(self, payload):
+        account_id = payload.get("account_id")
+        if account_id:
+            account_id = self._require_account(payload)
+        rows = self.store.list_algo_orders(account_id)
+        return {"items": [self._algo_row(row) for row in rows], "count": len(rows)}
+
+    def _algo_child_states(self, algo_order_id):
+        return [
+            self._algo_child_row(child)
+            for child in self.store.list_algo_children(algo_order_id)
+        ]
+
+    def _cancel_algo_children(self, parent, context_info):
+        results = []
+        now = time.monotonic()
+        for child in self._algo_child_states(parent["algo_order_id"]):
+            if child["order_status"] in ORDER_TERMINAL_STATUSES:
+                continue
+            if child["order_status"] == "CANCEL_PENDING":
+                continue
+            if not child["qmt_order_id"]:
+                continue
+            last_attempt = self.algo_cancel_attempts.get(child["client_order_id"], 0.0)
+            if now - last_attempt < 1.0:
+                continue
+            self.algo_cancel_attempts[child["client_order_id"]] = now
+            try:
+                result = self.cancel_order(
+                    {"client_order_id": child["client_order_id"]},
+                    "ALGO-CANCEL-%s" % child["client_order_id"],
+                    context_info,
+                )
+                results.append(result)
+            except BridgeError as exc:
+                results.append(
+                    {
+                        "client_order_id": child["client_order_id"],
+                        "cancel_requested": False,
+                        "error": {"code": exc.code, "message": exc.message},
+                    }
+                )
+        return results
+
+    def cancel_algo_order(self, payload, request_id, context_info):
+        algo_order_id = str(payload.get("algo_order_id", "")).strip()
+        if not algo_order_id:
+            raise BridgeError("INVALID_ARGUMENT", "algo_order_id is required")
+        row = self.store.get_algo_order(algo_order_id)
+        if not row:
+            raise BridgeError("ALGO_ORDER_NOT_FOUND", "algorithm order was not found")
+        if row["status"] in ALGO_TERMINAL_STATUSES:
+            result = self._algo_row(row)
+            result["cancel_requests"] = []
+            result["idempotent_replay"] = bool(row["cancel_requested"])
+            return result
+        was_cancel_requested = bool(row["cancel_requested"])
+        self.store.update_algo_order(
+            algo_order_id, cancel_requested=1, status="CANCELING"
+        )
+        row = self.store.get_algo_order(algo_order_id)
+        cancel_requests = self._cancel_algo_children(row, context_info)
+        result = self._algo_row(self.store.get_algo_order(algo_order_id))
+        result["cancel_requests"] = cancel_requests
+        result["idempotent_replay"] = was_cancel_requested
+        return result
+
+    def _retry_algo_order(self, parent, remaining_quantity, context_info):
+        params = json.loads(parent["params_json"])
+        depth = self._read_stock_depth(
+            parent["instrument"], parent["side"], context_info
+        )
+        children = _plan_book_quantity(
+            remaining_quantity, depth, parent["side"], params
+        )
+        planned_notional = _plan_notional(children)
+        existing_children = self._algo_child_states(parent["algo_order_id"])
+        if parent["side"] == "BUY" and parent["target_amount"] is not None:
+            spent_upper_bound = sum(
+                (
+                    decimal.Decimal(child["price"])
+                    * int(child["filled_quantity"])
+                    for child in existing_children
+                ),
+                decimal.Decimal("0"),
+            )
+            remaining_budget = decimal.Decimal(parent["target_amount"]) - spent_upper_bound
+            if planned_notional > remaining_budget:
+                raise BridgeError(
+                    "TARGET_AMOUNT_EXHAUSTED",
+                    "retry plan would exceed the original target_amount",
+                    {
+                        "remaining_budget": _canonical_price(max(remaining_budget, 0)),
+                        "retry_planned_notional": _canonical_price(planned_notional),
+                    },
+                )
+        resource_payload = {
+            "account_id": parent["account_id"],
+            "instrument": parent["instrument"],
+            "side": parent["side"],
+        }
+        self._check_algo_resources(
+            resource_payload, remaining_quantity, planned_notional
+        )
+        next_attempt = int(parent["current_attempt"]) + 1
+        prepared = self._prepare_algo_children(
+            parent["algo_order_id"], next_attempt, children
+        )
+        self.store.start_algo_attempt(
+            parent["algo_order_id"], next_attempt, prepared
+        )
+        self._submit_algo_attempt(
+            parent["algo_order_id"], next_attempt, context_info
+        )
+
+    def _refresh_algo_order(self, parent, context_info):
+        algo_order_id = parent["algo_order_id"]
+        states = self._algo_child_states(algo_order_id)
+        unknown = [child for child in states if child["order_status"] == "UNKNOWN"]
+        missing = [child for child in states if child["order_status"] == "PLANNED"]
+        if (
+            missing
+            and not unknown
+            and not parent["cancel_requested"]
+            and parent["status"] in ("PLACING", "UNKNOWN")
+        ):
+            self._submit_algo_attempt(
+                algo_order_id, int(parent["current_attempt"]), context_info
+            )
+            parent = self.store.get_algo_order(algo_order_id)
+            states = self._algo_child_states(algo_order_id)
+            unknown = [
+                child for child in states if child["order_status"] == "UNKNOWN"
+            ]
+
+        filled_quantity = sum(child["filled_quantity"] for child in states)
+        if filled_quantity != int(parent["filled_quantity"]):
+            self.store.update_algo_order(
+                algo_order_id, filled_quantity=filled_quantity
+            )
+            parent = self.store.get_algo_order(algo_order_id)
+        if filled_quantity >= int(parent["resolved_quantity"]):
+            self.store.update_algo_order(
+                algo_order_id,
+                status="FILLED",
+                error_code=None,
+                error_message=None,
+            )
+            return
+        if unknown:
+            if parent["status"] != "UNKNOWN":
+                self.store.update_algo_order(algo_order_id, status="UNKNOWN")
+            return
+
+        active = [
+            child
+            for child in states
+            if child["order_status"] not in ORDER_TERMINAL_STATUSES
+            and child["order_status"] != "PLANNED"
+        ]
+        rejected = [
+            child for child in states if child["order_status"] == "REJECTED"
+        ]
+        status = parent["status"]
+        if parent["cancel_requested"] or status == "CANCELING":
+            if active:
+                self._cancel_algo_children(parent, context_info)
+                return
+            self.store.update_algo_order(algo_order_id, status="CANCELED")
+            return
+
+        if rejected and status not in ("FINAL_CANCELING", "RETRY_CANCELING"):
+            self.store.update_algo_order(
+                algo_order_id,
+                status="FINAL_CANCELING",
+                error_code="CHILD_REJECTED",
+                error_message="one or more child orders were rejected",
+            )
+            parent = self.store.get_algo_order(algo_order_id)
+            if active:
+                self._cancel_algo_children(parent, context_info)
+                return
+            status = "FINAL_CANCELING"
+
+        if status == "FINAL_CANCELING":
+            if active:
+                self._cancel_algo_children(parent, context_info)
+                return
+            self.store.update_algo_order(algo_order_id, status="FAILED")
+            return
+
+        if status == "RETRY_CANCELING":
+            if active:
+                self._cancel_algo_children(parent, context_info)
+                return
+            params = json.loads(parent["params_json"])
+            if int(parent["current_attempt"]) >= int(params["max_retries"]):
+                self.store.update_algo_order(
+                    algo_order_id,
+                    status="FAILED",
+                    error_code="MAX_RETRIES_EXCEEDED",
+                    error_message="algorithm child timeout retries exhausted",
+                )
+                return
+            remaining_quantity = int(parent["resolved_quantity"]) - filled_quantity
+            try:
+                self._retry_algo_order(parent, remaining_quantity, context_info)
+            except BridgeError as exc:
+                self.store.update_algo_order(
+                    algo_order_id,
+                    status="FAILED",
+                    error_code=exc.code,
+                    error_message=exc.message,
+                )
+            return
+
+        if not active:
+            self.store.update_algo_order(
+                algo_order_id,
+                status="FAILED",
+                error_code="INCOMPLETE_WITHOUT_ACTIVE_CHILD",
+                error_message="algorithm is incomplete but no child order is active",
+            )
+            return
+
+        timeout_seconds = float(json.loads(parent["params_json"])["timeout_seconds"])
+        attempt_started = _utc_text_timestamp(parent["attempt_started_at"])
+        now_utc = time.time()
+        if attempt_started and now_utc - attempt_started >= timeout_seconds:
+            self.store.update_algo_order(algo_order_id, status="RETRY_CANCELING")
+            self._cancel_algo_children(
+                self.store.get_algo_order(algo_order_id), context_info
+            )
+        elif status in ("PLACING", "UNKNOWN"):
+            self.store.update_algo_order(algo_order_id, status="WORKING")
+
+    def process_algo_orders(self, context_info):
+        for parent in self.store.list_algo_orders(active_only=True):
+            try:
+                self._refresh_algo_order(parent, context_info)
+            except Exception as exc:
+                self.set_error(
+                    "algorithm order %s refresh failed: %s"
+                    % (parent["algo_order_id"], exc)
+                )
 
     def _validate_stock_order(self, payload):
         account_id = self._require_account(payload)
@@ -1245,13 +2744,7 @@ class BridgeRuntime(object):
                     continue
                 for wire_tag, row in tags.items():
                     if remark.startswith(wire_tag):
-                        status = row["status"]
-                        if status in (
-                            "PENDING_QMT",
-                            "PENDING_BROKER_ID",
-                            "UNKNOWN",
-                        ):
-                            status = "SUBMITTED"
+                        status = _derive_order_status(raw, row["status"])
                         self.store.update_order(
                             row["client_order_id"],
                             status=status,
@@ -1285,12 +2778,9 @@ class BridgeRuntime(object):
             qmt_order_id = str(raw.get("m_strOrderSysID", "")).strip()
             if qmt_order_id:
                 result["qmt_order_id"] = qmt_order_id
-                if result["order_status"] in (
-                    "PENDING_QMT",
-                    "PENDING_BROKER_ID",
-                    "UNKNOWN",
-                ):
-                    result["order_status"] = "SUBMITTED"
+                result["order_status"] = _derive_order_status(
+                    raw, result["order_status"]
+                )
                 result["raw"] = raw
         return result
 

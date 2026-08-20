@@ -13,15 +13,22 @@
 - 普通现金账户股票买入和卖出；
 - 沪深交易所原生股票市价申报；
 - 委托查询和撤单；
+- 盘口流动性加权拆单：父单预览、提交、查询和整体撤单；
+- 子单超时后先撤单；确认旧子单已经成交、撤销或被拒绝，不会再继续成交后，
+  再按剩余未成交数量重新读取盘口并计算下一轮委托；
 - 使用 SQLite 持久化客户端委托 ID 与 QMT 委托 ID 的映射；
 - 以 `client_order_id` 为唯一逻辑标识的持久化幂等下单。
+- 以 `algo_order_id` 为唯一逻辑标识的算法父单幂等和父子单持久化。
 
 `client_order_id` 是委托的唯一逻辑标识。同一个 `client_order_id` 携带完全
 相同的规范化委托参数再次提交时，Adapter 会返回已保存的委托，不会再次调用
 `passorder`；如果参数不同，则拒绝请求。对外接口不再提供单独的
 `idempotency_key`。
 
-当前暂不支持信用交易、期货、期权、算法任务、组合交易、行情或多个客户端并发接入。
+`TWAP`、`VWAP` 已保留统一算法标识和请求结构，但尚未实现，调用时会明确返回
+`ALGORITHM_NOT_IMPLEMENTED`，不会产生子单。
+
+当前暂不支持信用交易、期货、期权、组合交易、行情订阅或多个客户端并发接入。
 
 ## 文件说明
 
@@ -91,6 +98,36 @@ QMT 手册明确列出的 `m_dAvailable`、`m_strInstrumentID` 和 `m_nVolume`�
 ## 交易验证
 
 调用下单或撤单接口时，大 QMT 策略必须使用交易运行模式。
+
+盘口流动性加权拆单使用独立的 `algorithm` 字段，不属于
+`STOCK_PRICE_TYPES`。算法生成的每笔子单都是明确价格的 `LIMIT` 委托。
+建议先预览，再提交同一个请求对象：
+
+```python
+from qmt_adapter import AlgoOrderRequest, QmtClient
+
+
+order = AlgoOrderRequest(
+    account_id="YOUR_ACCOUNT_ID",
+    instrument="601919.SH",
+    side="BUY",
+    target_amount="10000000",
+    algorithm="BOOK_LIQUIDITY_WEIGHTED",
+    remark="liquidity-example",
+)
+
+with QmtClient() as client:
+    preview = client.preview_algo_order(order)
+    assert preview["planned_quantity"] == preview["resolved_quantity"]
+    receipt = client.place_algo_order(order)
+    current = client.get_algo_order(receipt.algo_order_id)
+```
+
+`preview_algo_order()` 只从大 QMT 模型上下文读取当前买卖五档、最新价、昨收、
+涨跌停价、最小价位以及账户资金或可用持仓，并返回实时涨跌幅和动态价格笼子；
+不连接外部 `xtdata`，不写数据库且不调用 `passorder`。
+`place_algo_order()` 会重新读取即时盘口并执行，所以预览与实单的价格和数量可能
+随行情变化。
 
 ## Asyncio 客户端
 

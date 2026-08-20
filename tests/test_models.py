@@ -1,6 +1,6 @@
 import unittest
 
-from qmt_adapter import OrderRequest, ValidationError
+from qmt_adapter import AlgoOrderRequest, OrderRequest, ValidationError
 
 
 class OrderRequestTests(unittest.TestCase):
@@ -120,6 +120,51 @@ class OrderRequestTests(unittest.TestCase):
                         limit_price=value,
                     ).to_payload()
 
+
+class AlgoOrderRequestTests(unittest.TestCase):
+    def test_target_amount_payload_and_stable_parent_id(self):
+        order = AlgoOrderRequest(
+            account_id="SIM001",
+            instrument="601919.sh",
+            side="buy",
+            target_amount="10000000",
+        )
+
+        first = order.to_payload()
+        second = order.to_payload()
+
+        self.assertEqual(first["instrument"], "601919.SH")
+        self.assertEqual(first["target_amount"], "10000000")
+        self.assertEqual(first["algo_order_id"], second["algo_order_id"])
+
+    def test_exactly_one_target_is_required(self):
+        invalid = (
+            AlgoOrderRequest(
+                account_id="SIM001", instrument="601919.SH", side="BUY"
+            ),
+            AlgoOrderRequest(
+                account_id="SIM001",
+                instrument="601919.SH",
+                side="BUY",
+                target_amount="100000",
+                quantity=100,
+            ),
+        )
+        for order in invalid:
+            with self.subTest(order=order):
+                with self.assertRaises(ValidationError):
+                    order.to_payload()
+
+    def test_reserved_algorithm_identifier_is_accepted_by_client_model(self):
+        payload = AlgoOrderRequest(
+            account_id="SIM001",
+            instrument="601919.SH",
+            side="BUY",
+            quantity=100,
+            algorithm="TWAP",
+        ).to_payload()
+
+        self.assertEqual(payload["algorithm"], "TWAP")
 
 if __name__ == "__main__":
     unittest.main()

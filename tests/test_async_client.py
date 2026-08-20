@@ -6,7 +6,7 @@ import asyncio
 import unittest
 import uuid
 
-from qmt_adapter import AsyncQmtClient, OrderRequest
+from qmt_adapter import AlgoOrderRequest, AsyncQmtClient, OrderRequest
 from tests.test_named_pipe_e2e import ACCOUNT_ID, BridgeHarness, FakeQmtApi
 
 
@@ -49,7 +49,7 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(health["environment"], "SIMULATION")
 
             account = await client.get_account(ACCOUNT_ID)
-            self.assertEqual(account["items"][0]["available_cash"], 123456.78)
+            self.assertEqual(account["items"][0]["available_cash"], 20000000.0)
 
             positions = await client.list_positions(ACCOUNT_ID)
             self.assertEqual(positions["items"][0]["instrument"], "600000.SH")
@@ -104,6 +104,23 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(qmt_order_ids), 50)
             self.assertEqual(len(set(qmt_order_ids)), 50)
             self.assertEqual(len(self.fake_api.passorder_calls), 50)
+
+    async def test_async_algo_preview_place_and_query(self):
+        order = AlgoOrderRequest(
+            account_id=ACCOUNT_ID,
+            instrument="601919.SH",
+            side="BUY",
+            quantity=1000,
+            algo_order_id="ASYNC-ALGO-0001",
+        )
+        async with AsyncQmtClient(config_path=self.config_path) as client:
+            preview = await client.preview_algo_order(order, timeout=5)
+            receipt = await client.place_algo_order(order, timeout=5)
+            current = await client.get_algo_order(receipt.algo_order_id, timeout=5)
+
+        self.assertEqual(preview["resolved_quantity"], 1000)
+        self.assertEqual(receipt.algo_order_id, order.algo_order_id)
+        self.assertEqual(current["resolved_quantity"], 1000)
 
 
 if __name__ == "__main__":

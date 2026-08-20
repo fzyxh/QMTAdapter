@@ -439,13 +439,29 @@ class NamedPipeEndToEndTests(unittest.TestCase):
             )
 
             receipt = client.place_algo_order(order, timeout=5)
-            initial_call_count = len(self.fake_api.passorder_calls)
+            call_count_at_receipt = len(self.fake_api.passorder_calls)
             replay = client.place_algo_order(order, timeout=5)
+            deadline = time.monotonic() + 2
+            while (
+                len(self.fake_api.passorder_calls) < receipt.child_count
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
             current = client.get_algo_order(order.algo_order_id, timeout=5)
 
         self.assertGreater(receipt.child_count, 1)
-        self.assertEqual(initial_call_count, receipt.child_count)
-        self.assertEqual(len(self.fake_api.passorder_calls), initial_call_count)
+        self.assertEqual(call_count_at_receipt, 1)
+        self.assertEqual(receipt.algo_status, "PLACING")
+        self.assertEqual(len(self.fake_api.passorder_calls), receipt.child_count)
+        intervals = [
+            later - earlier
+            for earlier, later in zip(
+                self.fake_api.passorder_call_times,
+                self.fake_api.passorder_call_times[1:],
+            )
+        ]
+        self.assertTrue(intervals)
+        self.assertTrue(all(interval >= 0.045 for interval in intervals))
         self.assertTrue(replay.idempotent_replay)
         self.assertEqual(current["algo_order_id"], order.algo_order_id)
         self.assertEqual(
@@ -496,6 +512,58 @@ class NamedPipeEndToEndTests(unittest.TestCase):
             self.fake_api.passorder_call_times[1],
             self.fake_api.cancel_callback_times[0],
         )
+
+    def test_algo_cancel_stops_children_that_have_not_been_submitted(self):
+        order = AlgoOrderRequest(
+            account_id=ACCOUNT_ID,
+            instrument="601919.SH",
+            side="BUY",
+            target_amount="1200000",
+            algo_order_id="ALGO-CANCEL-SCHEDULE-0001",
+        )
+        with QmtClient(config_path=self.config_path) as client:
+            receipt = client.place_algo_order(order, timeout=5)
+            self.assertGreater(receipt.child_count, 1)
+            self.assertEqual(len(self.fake_api.passorder_calls), 1)
+            client.cancel_algo_order(order.algo_order_id, timeout=5)
+            time.sleep(0.2)
+            current = client.get_algo_order(order.algo_order_id, timeout=5)
+
+        self.assertEqual(len(self.fake_api.passorder_calls), 1)
+        self.assertIn(current["algo_status"], ("CANCELING", "CANCELED"))
+
+    def test_planned_children_resume_after_bridge_restart_with_interval(self):
+        order = AlgoOrderRequest(
+            account_id=ACCOUNT_ID,
+            instrument="601919.SH",
+            side="BUY",
+            target_amount="1200000",
+            algo_order_id="ALGO-RESTART-SCHEDULE-0001",
+        )
+        with QmtClient(config_path=self.config_path) as client:
+            receipt = client.place_algo_order(order, timeout=5)
+        self.assertGreater(receipt.child_count, 1)
+        self.assertEqual(len(self.fake_api.passorder_calls), 1)
+
+        self.harness.stop()
+        self.harness = BridgeHarness(self.config, self.fake_api)
+        self.harness.start()
+        deadline = time.monotonic() + 2
+        while (
+            len(self.fake_api.passorder_calls) < receipt.child_count
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+
+        self.assertEqual(len(self.fake_api.passorder_calls), receipt.child_count)
+        intervals = [
+            later - earlier
+            for earlier, later in zip(
+                self.fake_api.passorder_call_times[1:],
+                self.fake_api.passorder_call_times[2:],
+            )
+        ]
+        self.assertTrue(all(interval >= 0.045 for interval in intervals))
 
 
 if __name__ == "__main__":

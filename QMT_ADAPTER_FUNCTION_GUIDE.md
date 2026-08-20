@@ -748,8 +748,7 @@ except QmtAdapterError as exc:
 
 ## 12. 升级说明
 
-本版本的命名管道协议为 v2。外部库和 QMT 端脚本必须同时升级；v2 客户端
-连接旧 v1 Bridge，或旧客户端连接 v2 Bridge，都会收到
+本版本的命名管道协议为 v3。外部库和 QMT 端脚本必须同时升级；协议版本不同会收到
 `PROTOCOL_MISMATCH`，不会继续发送交易命令。升级时先停止外部客户端，替换并
 重启 QMT 策略，再启动外部客户端。
 
@@ -784,6 +783,7 @@ order = AlgoOrderRequest(
         "primary_levels": 3,
         "max_levels": 5,
         "chase_ticks": 2,
+        "child_interval_ms": 50,
         "timeout_seconds": 20.0,
         "max_retries": 3,
     },
@@ -804,6 +804,7 @@ order = AlgoOrderRequest(
 | `primary_levels` | 3 | 首次按流动性权重分配的档位数 |
 | `max_levels` | 5 | 最多使用的可见盘口档位数 |
 | `chase_ticks` | 2 | 五档仍不足时，相对最后有效档位的追价跳数；每跳取 QMT `PriceTick`，最终同时受涨跌停价和价格笼子约束 |
+| `child_interval_ms` | 50 | QMT 端相邻两次算法子单 `passorder` 调用的最小间隔；允许10至60000毫秒 |
 | `timeout_seconds` | 20.0 | 当前轮次子单超时秒数 |
 | `max_retries` | 3 | 初始轮次之外允许重新读取盘口和重算的次数 |
 
@@ -836,8 +837,9 @@ with QmtClient() as client:
 
 `place_algo_order()` 会重新读取即时盘口并重新执行相同的资源和守恒检查，不能
 假设其结果与更早的预览完全一致。新父单的处理顺序固定为：生成完整计划 →
-验证总量与金额 → 在一个 SQLite 事务中写父单和全部子单计划 → 逐笔调用
-`passorder`。
+验证总量与金额 → 在一个 SQLite 事务中写父单和全部子单计划 → 第一笔可立即
+提交，其余子单由 QMT 定时回调按 `child_interval_ms` 逐笔调用 `passorder`。
+该方法返回表示 Bridge 已接受并开始调度，不表示全部子单已经提交。
 
 ### 13.4 查询和整体撤单
 
@@ -868,4 +870,6 @@ QMT 委托号、标准化委托状态、已成交数量和原始回报。
 - `cancel_algo_order()`
 
 `AsyncQmtClient` 提供同名异步方法。它们仍通过一个工作线程和一条持久命名管道
-严格串行调用 QMT，不会并行执行 `passorder`。
+严格串行发送请求，不会并行执行 `passorder`。同步调用在等待 Bridge 接受计划时
+阻塞当前线程；异步调用只是不阻塞调用方的 asyncio 事件循环。两者使用完全相同的
+QMT 端50毫秒子单调度，不会因为使用异步客户端而绕过或缩短间隔。

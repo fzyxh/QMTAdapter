@@ -290,8 +290,9 @@ class QmtClient:
         """提交一笔股票算法父委托。
 
         Bridge 会在 QMT 主线程内读取盘口、生成完整计划、检查数量守恒，
-        将父单和全部子单计划持久化，然后逐笔调用 ``passorder``。同一
-        ``algo_order_id`` 和相同参数重试不会重复创建父单。
+        将父单和全部子单计划持久化，然后按 ``child_interval_ms`` 非阻塞地
+        逐笔调用 ``passorder``。本方法在 Bridge 接受计划后返回，不等待全部
+        子单提交或成交。同一 ``algo_order_id`` 和相同参数重试不会重复创建父单。
         """
         if not isinstance(order, AlgoOrderRequest):
             raise ValidationError("order must be an AlgoOrderRequest")

@@ -36,6 +36,11 @@ class BookLiquidityPlannerTests(unittest.TestCase):
         values.update(overrides)
         return bridge._normalize_book_params(values)
 
+    def test_child_interval_defaults_to_fifty_ms_and_is_validated(self):
+        self.assertEqual(bridge._normalize_book_params({})["child_interval_ms"], 50)
+        with self.assertRaises(bridge.BridgeError):
+            bridge._normalize_book_params({"child_interval_ms": 9})
+
     def test_top_three_weights_use_original_target(self):
         children = bridge._plan_book_quantity(
             10000,

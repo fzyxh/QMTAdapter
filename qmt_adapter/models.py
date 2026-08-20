@@ -56,6 +56,7 @@ BOOK_LIQUIDITY_WEIGHTED_DEFAULTS = {
     "primary_levels": 3,
     "max_levels": 5,
     "chase_ticks": 2,
+    "child_interval_ms": 50,
     "timeout_seconds": 20.0,
     "max_retries": 3,
 }
@@ -235,7 +236,8 @@ class AlgoOrderRequest:
         params: 算法参数。盘口流动性加权拆单支持
             ``big_order_threshold``、``min_child_notional``、
             ``max_child_notional``、``primary_levels``、``max_levels``、
-            ``chase_ticks``、``timeout_seconds``、``max_retries``。
+            ``chase_ticks``、``child_interval_ms``、``timeout_seconds``、
+            ``max_retries``。
         remark: 父委托备注；子单备注由 Bridge 自动生成。
         algo_order_id: 父委托唯一ID；不传时在对象创建时生成一次UUID4。
 

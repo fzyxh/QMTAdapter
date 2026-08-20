@@ -47,6 +47,7 @@ BOOK_LIQUIDITY_DEFAULTS = {
     "primary_levels": 3,
     "max_levels": 5,
     "chase_ticks": 2,
+    "child_interval_ms": 50,
     "timeout_seconds": 20.0,
     "max_retries": 3,
 }
@@ -190,6 +191,7 @@ def _normalize_book_params(raw):
         ("primary_levels", 1, 5),
         ("max_levels", 1, 5),
         ("chase_ticks", 0, 100),
+        ("child_interval_ms", 10, 60000),
         ("max_retries", 0, 10),
     ):
         value = values[name]
@@ -1386,12 +1388,18 @@ class BridgeRuntime(object):
         self.last_reconcile = 0.0
         self.last_algo_scan = 0.0
         self.algo_cancel_attempts = {}
+        self.algo_submission_pending = False
+        self.next_algo_submit_at = 0.0
         self.tick_lock = threading.Lock()
         self.tick_count = 0
         self.last_tick_time = None
         self.tick_intervals = deque(maxlen=500)
         self.started_at = _utc_now_text()
         self.store = OrderStore(config["db_path"])
+        self.algo_submission_pending = any(
+            row["status"] == "PLACING"
+            for row in self.store.list_algo_orders(active_only=True)
+        )
         self.pipe = PipeServer(
             self,
             config.get("pipe_name", r"\\.\pipe\qmt_adapter_v1"),
@@ -1504,6 +1512,10 @@ class BridgeRuntime(object):
             self._send_completed_response(
                 connection_id, response_queue, response
             )
+        try:
+            self.process_algo_submissions(context_info)
+        except Exception as exc:
+            self.set_error("algorithm child submission failed: %s" % exc)
         interval = float(self.config.get("reconcile_interval_seconds", 1.0))
         if time.monotonic() - self.last_reconcile >= interval:
             self.last_reconcile = time.monotonic()
@@ -2052,9 +2064,16 @@ class BridgeRuntime(object):
     def place_algo_order(self, payload, request_id, context_info):
         normalized = self._validate_algo_order(payload)
         payload_hash = _algo_payload_hash(normalized)
+        legacy_payload_hash = None
+        if normalized["params"].get("child_interval_ms") == 50:
+            legacy_normalized = dict(normalized)
+            legacy_params = dict(normalized["params"])
+            del legacy_params["child_interval_ms"]
+            legacy_normalized["params"] = legacy_params
+            legacy_payload_hash = _algo_payload_hash(legacy_normalized)
         existing = self.store.get_algo_order(normalized["algo_order_id"])
         if existing:
-            if existing["payload_hash"] != payload_hash:
+            if existing["payload_hash"] not in (payload_hash, legacy_payload_hash):
                 raise BridgeError(
                     "ALGO_ORDER_ID_CONFLICT",
                     "algo_order_id is already bound to different parameters",
@@ -2081,6 +2100,7 @@ class BridgeRuntime(object):
                 "algo_order_id or request_id already exists",
                 {"algo_order_id": normalized["algo_order_id"]},
             )
+        self.algo_submission_pending = True
         self._submit_algo_attempt(normalized["algo_order_id"], 0, context_info)
         row = self.store.get_algo_order(normalized["algo_order_id"])
         return self._algo_place_result(row, request_id, False)
@@ -2109,19 +2129,36 @@ class BridgeRuntime(object):
         parent = self.store.get_algo_order(algo_order_id)
         if not parent:
             raise BridgeError("ALGO_ORDER_NOT_FOUND", "algorithm order was not found")
+        if parent["status"] != "PLACING" or parent["cancel_requested"]:
+            return False
         children = self.store.list_algo_children(algo_order_id, attempt)
+        if any(child["order_status"] == "UNKNOWN" for child in children):
+            return False
+        if any(child["order_status"] == "REJECTED" for child in children):
+            return False
+        planned = [child for child in children if child["order_status"] is None]
+        if not planned:
+            self.store.update_algo_order(
+                algo_order_id,
+                status="WORKING",
+                attempt_started_at=_utc_now_text(),
+                error_code=None,
+                error_message=None,
+            )
+            return False
+        now = time.monotonic()
+        if now < self.next_algo_submit_at:
+            return False
+        child = planned[0]
         try:
-            for child in children:
-                if child["order_status"] is not None:
-                    continue
-                child_request_id = "ALG" + hashlib.sha256(
-                    child["client_order_id"].encode("utf-8")
-                ).hexdigest()
-                self.place_order(
-                    self._child_order_payload(parent, child),
-                    child_request_id,
-                    context_info,
-                )
+            child_request_id = "ALG" + hashlib.sha256(
+                child["client_order_id"].encode("utf-8")
+            ).hexdigest()
+            self.place_order(
+                self._child_order_payload(parent, child),
+                child_request_id,
+                context_info,
+            )
         except UncertainError:
             self.store.update_algo_order(algo_order_id, status="UNKNOWN")
             raise
@@ -2133,12 +2170,45 @@ class BridgeRuntime(object):
                 error_message=exc.message,
             )
             raise
-        self.store.update_algo_order(
-            algo_order_id,
-            status="WORKING",
-            attempt_started_at=_utc_now_text(),
-            error_code=None,
-            error_message=None,
+        params = json.loads(parent["params_json"])
+        self.next_algo_submit_at = time.monotonic() + (
+            float(params.get("child_interval_ms", 50)) / 1000.0
+        )
+        remaining = [
+            item
+            for item in self.store.list_algo_children(algo_order_id, attempt)
+            if item["order_status"] is None
+        ]
+        if not remaining:
+            self.store.update_algo_order(
+                algo_order_id,
+                status="WORKING",
+                attempt_started_at=_utc_now_text(),
+                error_code=None,
+                error_message=None,
+            )
+        return True
+
+    def process_algo_submissions(self, context_info):
+        if not self.algo_submission_pending:
+            return
+        if time.monotonic() < self.next_algo_submit_at:
+            return
+        parents = [
+            parent
+            for parent in reversed(self.store.list_algo_orders(active_only=True))
+            if parent["status"] == "PLACING" and not parent["cancel_requested"]
+        ]
+        submitted = False
+        for parent in parents:
+            if self._submit_algo_attempt(
+                parent["algo_order_id"], int(parent["current_attempt"]), context_info
+            ):
+                submitted = True
+                break
+        self.algo_submission_pending = submitted or any(
+            parent["status"] == "PLACING" and not parent["cancel_requested"]
+            for parent in self.store.list_algo_orders(active_only=True)
         )
 
     def _algo_child_row(self, row):
@@ -2327,6 +2397,7 @@ class BridgeRuntime(object):
         self.store.start_algo_attempt(
             parent["algo_order_id"], next_attempt, prepared
         )
+        self.algo_submission_pending = True
         self._submit_algo_attempt(
             parent["algo_order_id"], next_attempt, context_info
         )
@@ -2336,20 +2407,6 @@ class BridgeRuntime(object):
         states = self._algo_child_states(algo_order_id)
         unknown = [child for child in states if child["order_status"] == "UNKNOWN"]
         missing = [child for child in states if child["order_status"] == "PLANNED"]
-        if (
-            missing
-            and not unknown
-            and not parent["cancel_requested"]
-            and parent["status"] in ("PLACING", "UNKNOWN")
-        ):
-            self._submit_algo_attempt(
-                algo_order_id, int(parent["current_attempt"]), context_info
-            )
-            parent = self.store.get_algo_order(algo_order_id)
-            states = self._algo_child_states(algo_order_id)
-            unknown = [
-                child for child in states if child["order_status"] == "UNKNOWN"
-            ]
 
         filled_quantity = sum(child["filled_quantity"] for child in states)
         if filled_quantity != int(parent["filled_quantity"]):
@@ -2432,6 +2489,9 @@ class BridgeRuntime(object):
                 )
             return
 
+        if missing and status == "PLACING":
+            return
+
         if not active:
             self.store.update_algo_order(
                 algo_order_id,
@@ -2449,7 +2509,7 @@ class BridgeRuntime(object):
             self._cancel_algo_children(
                 self.store.get_algo_order(algo_order_id), context_info
             )
-        elif status in ("PLACING", "UNKNOWN"):
+        elif status == "UNKNOWN":
             self.store.update_algo_order(algo_order_id, status="WORKING")
 
     def process_algo_orders(self, context_info):

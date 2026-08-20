@@ -109,17 +109,20 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             account_id=ACCOUNT_ID,
             instrument="601919.SH",
             side="BUY",
-            quantity=1000,
+            target_amount="1200000",
             algo_order_id="ASYNC-ALGO-0001",
         )
         async with AsyncQmtClient(config_path=self.config_path) as client:
             preview = await client.preview_algo_order(order, timeout=5)
             receipt = await client.place_algo_order(order, timeout=5)
+            call_count_at_receipt = len(self.fake_api.passorder_calls)
             current = await client.get_algo_order(receipt.algo_order_id, timeout=5)
 
-        self.assertEqual(preview["resolved_quantity"], 1000)
+        self.assertGreater(preview["resolved_quantity"], 0)
         self.assertEqual(receipt.algo_order_id, order.algo_order_id)
-        self.assertEqual(current["resolved_quantity"], 1000)
+        self.assertGreater(receipt.child_count, 1)
+        self.assertEqual(call_count_at_receipt, 1)
+        self.assertEqual(current["resolved_quantity"], preview["resolved_quantity"])
 
 
 if __name__ == "__main__":

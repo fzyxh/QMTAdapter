@@ -31,7 +31,7 @@ CONFIG_PATH = globals().get("QMT_ADAPTER_CONFIG_PATH") or os.environ.get(
     r"C:\QMTAdapter\config\bridge_config.json",
 )
 
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 6
 MAX_MESSAGE_SIZE = 1024 * 1024
 STRATEGY_NAME = "QMT_ADAPTER_V1"
 _RUNTIME = None
@@ -40,6 +40,17 @@ ALGORITHM_BOOK_LIQUIDITY_WEIGHTED = "BOOK_LIQUIDITY_WEIGHTED"
 RESERVED_EXECUTION_ALGORITHMS = ("TWAP", "VWAP")
 ALGO_TERMINAL_STATUSES = ("FILLED", "CANCELED", "FAILED")
 ORDER_TERMINAL_STATUSES = ("FILLED", "CANCELED", "REJECTED")
+ORDER_STATUSES = (
+    "PENDING_QMT",
+    "PENDING_BROKER_ID",
+    "SUBMITTED",
+    "PARTIALLY_FILLED",
+    "CANCEL_PENDING",
+    "FILLED",
+    "CANCELED",
+    "REJECTED",
+    "UNKNOWN",
+)
 BOOK_LIQUIDITY_DEFAULTS = {
     "big_order_threshold": "1000000",
     "min_child_notional": "10000",
@@ -60,6 +71,26 @@ STOCK_NATIVE_MARKET_PRICE_TYPES = {
     "MARKET_SZ_INSTBUSI_RESTCANCEL": {"SZ"},
     "MARKET_SZ_CONVERT_5_CANCEL": {"SZ"},
     "MARKET_SZ_FULL_OR_CANCEL": {"SZ"},
+}
+REVERSE_REPO_INSTRUMENTS = {
+    "204001.SH",
+    "204002.SH",
+    "204003.SH",
+    "204004.SH",
+    "204007.SH",
+    "204014.SH",
+    "204028.SH",
+    "204091.SH",
+    "204182.SH",
+    "131800.SZ",
+    "131801.SZ",
+    "131802.SZ",
+    "131803.SZ",
+    "131805.SZ",
+    "131806.SZ",
+    "131809.SZ",
+    "131810.SZ",
+    "131811.SZ",
 }
 _RUNTIME_SLOT = "_qmt_adapter_bridge_runtime_v1"
 
@@ -109,7 +140,17 @@ def _canonical_price(value):
 
 
 def _order_payload_hash(
-    account_id, instrument, side, quantity, price_type, limit_price, remark
+    account_id,
+    instrument,
+    side,
+    quantity,
+    price_type,
+    limit_price,
+    remark,
+    order_kind="STOCK",
+    business_type="CASH",
+    quantity_type="SHARES",
+    metadata=None,
 ):
     price_type = str(price_type).upper()
     if price_type == "LIMIT":
@@ -121,15 +162,18 @@ def _order_payload_hash(
     identity = {
         "account_id": str(account_id),
         "account_type": "STOCK",
-        "business_type": "CASH",
+        "business_type": str(business_type).upper(),
         "instrument": str(instrument).upper(),
         "limit_price": identity_price,
         "price_type": price_type,
         "quantity": int(quantity),
-        "quantity_type": "SHARES",
+        "quantity_type": str(quantity_type).upper(),
         "remark": str(remark or ""),
         "side": str(side).upper(),
     }
+    if str(order_kind).upper() != "STOCK":
+        identity["order_kind"] = str(order_kind).upper()
+        identity["metadata"] = metadata or {}
     return hashlib.sha256(_canonical_json(identity).encode("ascii")).hexdigest()
 
 
@@ -675,12 +719,70 @@ def _normalize_account(raw, configured_account_id):
     }
 
 
-def _normalize_position(raw, configured_account_id):
-    return {
+def _normalize_position(raw, configured_account_id, include_raw=False):
+    result = {
         "account_id": configured_account_id,
         "account_type": "STOCK",
-        "instrument": raw.get("m_strInstrumentID"),
-        "total_quantity": raw.get("m_nVolume"),
+        "instrument": _normalized_instrument(raw),
+        "total_quantity": _raw_integer(raw, "m_nVolume"),
+        "available_quantity": _raw_integer(raw, "m_nCanUseVolume"),
+        "frozen_quantity": _raw_integer(raw, "m_nFrozenVolume"),
+        "cost_price": _optional_three_decimal_text(raw.get("m_dOpenPrice")),
+        "current_price": _optional_three_decimal_text(raw.get("m_dLastPrice")),
+        "market_value": _optional_three_decimal_text(raw.get("m_dMarketValue")),
+        "position_profit": _optional_three_decimal_text(
+            raw.get("m_dPositionProfit")
+        ),
+    }
+    if include_raw:
+        result["raw"] = raw
+    return result
+
+
+def _first_mapping_value(mapping, names):
+    for name in names:
+        if name in mapping and mapping.get(name) not in (None, ""):
+            return mapping.get(name)
+    return None
+
+
+def _normalize_new_issue_item(key, value, issue_type):
+    raw = _safe_value(value)
+    if not isinstance(raw, dict):
+        raw = {"value": raw}
+    instrument = str(key or "").strip().upper()
+    if not re.match(r"^[0-9]{6}\.(SH|SZ|BJ)$", instrument):
+        candidate = _first_mapping_value(
+            raw,
+            (
+                "purchaseCode",
+                "subscribeCode",
+                "issueCode",
+                "stockCode",
+                "code",
+            ),
+        )
+        instrument = str(candidate or instrument).strip().upper()
+    market = _first_mapping_value(raw, ("market", "exchange", "marketCode"))
+    market = str(market or "").strip().upper()
+    if re.match(r"^[0-9]{6}$", instrument) and market in ("SH", "SZ", "BJ"):
+        instrument += "." + market
+    return {
+        "instrument": instrument,
+        "issue_type": str(issue_type).upper(),
+        "name": _first_mapping_value(
+            raw, ("name", "issueName", "stockName", "instrumentName")
+        ),
+        "issue_price": _first_mapping_value(raw, ("issuePrice", "price")),
+        "min_quantity": _first_mapping_value(
+            raw, ("minPurchaseNum", "minPurchaseQuantity")
+        ),
+        "max_quantity": _first_mapping_value(
+            raw, ("maxPurchaseNum", "maxPurchaseQuantity")
+        ),
+        "subscription_date": _first_mapping_value(
+            raw, ("purchaseDate", "subscribeDate", "issueDate")
+        ),
         "raw": raw,
     }
 
@@ -693,6 +795,225 @@ def _raw_integer(raw, name):
         return int(value)
     except Exception:
         return None
+
+
+def _optional_decimal_text(value):
+    if value in (None, ""):
+        return None
+    try:
+        number = decimal.Decimal(str(value))
+    except Exception:
+        return None
+    if not number.is_finite():
+        return None
+    return _canonical_price(number)
+
+
+def _optional_three_decimal_text(value):
+    text = _optional_decimal_text(value)
+    if text is None:
+        return None
+    number = decimal.Decimal(text).quantize(
+        decimal.Decimal("0.001"), rounding=decimal.ROUND_HALF_UP
+    )
+    return format(number, ".3f")
+
+
+def _positive_three_decimal_text(value):
+    text = _optional_decimal_text(value)
+    if text is None or decimal.Decimal(text) <= 0:
+        return None
+    return _optional_three_decimal_text(text)
+
+
+def _quote_levels(prices, volumes):
+    if not isinstance(prices, (list, tuple)):
+        prices = []
+    if not isinstance(volumes, (list, tuple)):
+        volumes = []
+    levels = []
+    for index in range(min(len(prices), 5)):
+        price = _positive_three_decimal_text(prices[index])
+        if price is None:
+            continue
+        volume_lots = None
+        if index < len(volumes):
+            try:
+                candidate = int(volumes[index])
+                if candidate > 0:
+                    volume_lots = candidate
+            except Exception:
+                pass
+        if volume_lots is None:
+            continue
+        levels.append(
+            {
+                "level": index + 1,
+                "price": price,
+                "volume_lots": volume_lots,
+            }
+        )
+    return levels
+
+
+def _normalize_quote(tick, detail, instrument, as_of, include_raw=False):
+    exchange = str(detail.get("ExchangeID", "") or "").strip().upper()
+    if exchange not in ("SH", "SZ", "BJ"):
+        exchange = instrument.rsplit(".", 1)[-1]
+    name = str(detail.get("InstrumentName", "") or "").strip() or None
+    last_price_text = _optional_decimal_text(tick.get("lastPrice"))
+    previous_close_text = _optional_decimal_text(
+        tick.get("lastClose")
+        if tick.get("lastClose") not in (None, "")
+        else detail.get("PreClose")
+    )
+    change = None
+    change_percent = None
+    try:
+        last_price = decimal.Decimal(last_price_text)
+        previous_close = decimal.Decimal(previous_close_text)
+        if previous_close > 0:
+            change = _optional_three_decimal_text(last_price - previous_close)
+            change_percent = _optional_three_decimal_text(
+                (last_price - previous_close)
+                / previous_close
+                * decimal.Decimal("100")
+            )
+    except Exception:
+        pass
+
+    upper_limit = _positive_three_decimal_text(detail.get("UpStopPrice"))
+    lower_limit = _positive_three_decimal_text(detail.get("DownStopPrice"))
+    try:
+        if (
+            upper_limit is None
+            or lower_limit is None
+            or decimal.Decimal(upper_limit) <= decimal.Decimal(lower_limit)
+        ):
+            upper_limit = None
+            lower_limit = None
+    except Exception:
+        upper_limit = None
+        lower_limit = None
+
+    ask_levels = _quote_levels(tick.get("askPrice"), tick.get("askVol"))
+    bid_levels = _quote_levels(tick.get("bidPrice"), tick.get("bidVol"))
+    result = {
+        "instrument": instrument,
+        "exchange": exchange,
+        "instrument_name": name,
+        "trading_day": str(detail.get("TradingDay") or "") or None,
+        "quote_time": str(tick.get("timetag") or "") or None,
+        "quote_timestamp_ms": _raw_integer(tick, "time"),
+        "last_price": _optional_three_decimal_text(tick.get("lastPrice")),
+        "previous_close": _optional_three_decimal_text(previous_close_text),
+        "open_price": _optional_three_decimal_text(tick.get("open")),
+        "high_price": _optional_three_decimal_text(tick.get("high")),
+        "low_price": _optional_three_decimal_text(tick.get("low")),
+        "change": change,
+        "change_percent": change_percent,
+        "turnover_amount": _optional_three_decimal_text(tick.get("amount")),
+        "volume_lots": _raw_integer(tick, "volume"),
+        "price_tick": _positive_three_decimal_text(detail.get("PriceTick")),
+        "upper_limit": upper_limit,
+        "lower_limit": lower_limit,
+        "best_ask_price": ask_levels[0]["price"] if ask_levels else None,
+        "best_bid_price": bid_levels[0]["price"] if bid_levels else None,
+        "ask_levels": ask_levels,
+        "bid_levels": bid_levels,
+        "as_of": as_of,
+    }
+    if include_raw:
+        result["raw"] = {
+            "full_tick": _safe_value(tick),
+            "instrument_detail": _safe_value(detail),
+        }
+    return result
+
+
+def _raw_decimal_text(raw, name):
+    return _optional_decimal_text(raw.get(name) if raw else None)
+
+
+def _optional_money_text(value):
+    text = _optional_decimal_text(value)
+    if text is None:
+        return None
+    amount = decimal.Decimal(text).quantize(
+        decimal.Decimal("0.01"), rounding=decimal.ROUND_HALF_UP
+    )
+    return _canonical_price(amount)
+
+
+def _normalized_instrument(raw, fallback=None):
+    instrument = str((raw or {}).get("m_strInstrumentID", "") or "").strip().upper()
+    if not instrument:
+        return fallback
+    if "." in instrument:
+        return instrument
+    exchange = str((raw or {}).get("m_strExchangeID", "") or "").strip().upper()
+    exchange_aliases = {
+        "SSE": "SH",
+        "XSHG": "SH",
+        "SZSE": "SZ",
+        "XSHE": "SZ",
+        "BSE": "BJ",
+    }
+    exchange = exchange_aliases.get(exchange, exchange)
+    if exchange in ("SH", "SZ", "BJ"):
+        return instrument + "." + exchange
+    return instrument
+
+
+def _normalized_trade_side(raw, order_row=None):
+    if order_row is not None:
+        side = str(order_row["side"] or "").upper()
+        if side in ("BUY", "SELL"):
+            return side
+    option_name = str((raw or {}).get("m_strOptName", "") or "").strip()
+    if "买" in option_name:
+        return "BUY"
+    if "卖" in option_name:
+        return "SELL"
+    return None
+
+
+def _normalize_trade(raw, configured_account_id, order_row=None, include_raw=False):
+    result = {
+        "trade_id": str(raw.get("m_strTradeID", "") or "").strip(),
+        "account_id": str(
+            raw.get("m_strAccountID", configured_account_id) or configured_account_id
+        ),
+        "client_order_id": (
+            str(order_row["client_order_id"]) if order_row is not None else None
+        ),
+        "qmt_order_id": str(raw.get("m_strOrderSysID", "") or "").strip(),
+        "instrument": _normalized_instrument(
+            raw, order_row["instrument"] if order_row is not None else None
+        ),
+        "side": _normalized_trade_side(raw, order_row),
+        "price": _raw_decimal_text(raw, "m_dPrice"),
+        "quantity": _raw_integer(raw, "m_nVolume"),
+        "amount": _optional_money_text(raw.get("m_dTradeAmount")),
+        "commission": _optional_money_text(
+            raw.get("m_dComssion", raw.get("m_dCommission"))
+        ),
+        "trade_date": str(raw.get("m_strTradeDate", "") or "").strip(),
+        "trade_time": str(raw.get("m_strTradeTime", "") or "").strip(),
+    }
+    if include_raw:
+        result["raw"] = raw
+    return result
+
+
+def _order_reject_reason(raw):
+    if not raw:
+        return None
+    for name in ("m_strCancelInfo", "m_strErrorMsg"):
+        value = str(raw.get(name, "") or "").strip()
+        if value:
+            return value
+    return None
 
 
 def _order_filled_quantity(raw):
@@ -813,6 +1134,15 @@ class PipeServer(object):
         k32.ReadFile.restype = wintypes.BOOL
         k32.WriteFile.argtypes = k32.ReadFile.argtypes
         k32.WriteFile.restype = wintypes.BOOL
+        k32.PeekNamedPipe.argtypes = [
+            wintypes.HANDLE,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+            ctypes.POINTER(wintypes.DWORD),
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        k32.PeekNamedPipe.restype = wintypes.BOOL
         k32.CloseHandle.argtypes = [wintypes.HANDLE]
         k32.CloseHandle.restype = wintypes.BOOL
         if hasattr(k32, "CancelIoEx"):
@@ -944,6 +1274,8 @@ class PipeServer(object):
                         completed = True
                         break
                     except queue.Empty:
+                        if not self._peer_is_connected(handle):
+                            return
                         continue
                 if not completed:
                     return
@@ -994,6 +1326,17 @@ class PipeServer(object):
             self.ERROR_NO_DATA,
         )
 
+    def _peer_is_connected(self, handle):
+        available = wintypes.DWORD()
+        if self.kernel32.PeekNamedPipe(
+            handle, None, 0, None, ctypes.byref(available), None
+        ):
+            return True
+        error = ctypes.get_last_error()
+        if error in (self.ERROR_BROKEN_PIPE, self.ERROR_NO_DATA):
+            return False
+        raise ctypes.WinError(error)
+
     def _write_all(self, handle, data):
         offset = 0
         while offset < len(data):
@@ -1009,6 +1352,7 @@ class PipeServer(object):
             offset += written.value
 
     def _close_handle(self, handle, connection_id):
+        self.runtime.discard_broker_responses(connection_id)
         should_close = False
         with self.handle_lock:
             if self.current_handle == handle:
@@ -1054,6 +1398,8 @@ class OrderStore(object):
                 user_remark TEXT,
                 qmt_remark TEXT NOT NULL,
                 payload_hash TEXT NOT NULL,
+                order_kind TEXT NOT NULL DEFAULT 'STOCK',
+                metadata_json TEXT,
                 qmt_order_id TEXT,
                 status TEXT NOT NULL,
                 raw_json TEXT,
@@ -1063,6 +1409,29 @@ class OrderStore(object):
             CREATE UNIQUE INDEX IF NOT EXISTS uq_orders_qmt_id
             ON orders(account_id, qmt_order_id)
             WHERE qmt_order_id IS NOT NULL;
+
+            CREATE TABLE IF NOT EXISTS trades (
+                trade_key TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                trade_id TEXT NOT NULL,
+                qmt_order_id TEXT NOT NULL,
+                client_order_id TEXT,
+                instrument TEXT,
+                side TEXT,
+                price TEXT,
+                quantity INTEGER,
+                amount TEXT,
+                commission TEXT,
+                trade_date TEXT,
+                trade_time TEXT,
+                raw_json TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS ix_trades_client_order
+            ON trades(client_order_id, trade_date, trade_time);
+            CREATE INDEX IF NOT EXISTS ix_trades_qmt_order
+            ON trades(account_id, qmt_order_id);
 
             CREATE TABLE IF NOT EXISTS algo_orders (
                 algo_order_id TEXT PRIMARY KEY,
@@ -1109,6 +1478,13 @@ class OrderStore(object):
         }
         if "payload_hash" not in columns:
             self.conn.execute("ALTER TABLE orders ADD COLUMN payload_hash TEXT")
+        if "order_kind" not in columns:
+            self.conn.execute(
+                "ALTER TABLE orders ADD COLUMN order_kind TEXT NOT NULL "
+                "DEFAULT 'STOCK'"
+            )
+        if "metadata_json" not in columns:
+            self.conn.execute("ALTER TABLE orders ADD COLUMN metadata_json TEXT")
         rows = self.conn.execute(
             "SELECT client_order_id,account_id,instrument,side,quantity,price_type,"
             "limit_price,user_remark FROM orders WHERE payload_hash IS NULL"
@@ -1135,8 +1511,8 @@ class OrderStore(object):
             self.conn.execute(
                 "INSERT INTO orders(client_order_id,request_id,wire_order_tag,account_id,"
                 "instrument,side,quantity,price_type,limit_price,user_remark,qmt_remark,"
-                "payload_hash,status,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'PENDING_QMT',?,?)",
+                "payload_hash,order_kind,metadata_json,status,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'PENDING_QMT',?,?)",
                 (
                     payload["client_order_id"],
                     request_id,
@@ -1150,6 +1526,8 @@ class OrderStore(object):
                     payload.get("remark", ""),
                     qmt_remark,
                     payload_hash,
+                    str(payload.get("order_kind", "STOCK")).upper(),
+                    _canonical_json(payload.get("metadata") or {}),
                     now,
                     now,
                 ),
@@ -1220,6 +1598,93 @@ class OrderStore(object):
                 "SELECT client_order_id,wire_order_tag,account_id,status FROM orders "
                 "WHERE status NOT IN ('FILLED','CANCELED','REJECTED')"
             ).fetchall()
+
+    def upsert_trade(self, trade, raw):
+        trade_id = str(trade.get("trade_id", "") or "").strip()
+        account_id = str(trade.get("account_id", "") or "").strip()
+        qmt_order_id = str(trade.get("qmt_order_id", "") or "").strip()
+        trade_date = str(trade.get("trade_date", "") or "").strip()
+        if not trade_id or not account_id or not qmt_order_id:
+            return False
+        trade_key = hashlib.sha256(
+            _canonical_json(
+                [account_id, trade_date, trade_id, qmt_order_id]
+            ).encode("ascii")
+        ).hexdigest()
+        now = _utc_now_text()
+        values = (
+            account_id,
+            trade_id,
+            qmt_order_id,
+            trade.get("client_order_id"),
+            trade.get("instrument"),
+            trade.get("side"),
+            trade.get("price"),
+            trade.get("quantity"),
+            trade.get("amount"),
+            trade.get("commission"),
+            trade_date,
+            trade.get("trade_time"),
+            _canonical_json(raw),
+            now,
+        )
+        with self.lock:
+            exists = self.conn.execute(
+                "SELECT 1 FROM trades WHERE trade_key=?", (trade_key,)
+            ).fetchone()
+            if exists:
+                self.conn.execute(
+                    "UPDATE trades SET account_id=?,trade_id=?,qmt_order_id=?,"
+                    "client_order_id=?,instrument=?,side=?,price=?,quantity=?,"
+                    "amount=?,commission=?,trade_date=?,trade_time=?,raw_json=?,"
+                    "updated_at=? WHERE trade_key=?",
+                    values + (trade_key,),
+                )
+            else:
+                self.conn.execute(
+                    "INSERT INTO trades(trade_key,account_id,trade_id,qmt_order_id,"
+                    "client_order_id,instrument,side,price,quantity,amount,commission,"
+                    "trade_date,trade_time,raw_json,created_at,updated_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (trade_key,) + values[:-1] + (now, now),
+                )
+            self.conn.commit()
+        return True
+
+    def trade_summary(self, client_order_id):
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT price,quantity,amount FROM trades WHERE client_order_id=?",
+                (client_order_id,),
+            ).fetchall()
+        filled_quantity = 0
+        weighted_value = decimal.Decimal("0")
+        weighted_quantity = 0
+        filled_amount = decimal.Decimal("0")
+        has_amount = False
+        for row in rows:
+            quantity = int(row["quantity"] or 0)
+            if quantity > 0:
+                filled_quantity += quantity
+                price = _optional_decimal_text(row["price"])
+                if price is not None:
+                    weighted_value += decimal.Decimal(price) * quantity
+                    weighted_quantity += quantity
+            amount = _optional_decimal_text(row["amount"])
+            if amount is not None:
+                filled_amount += decimal.Decimal(amount)
+                has_amount = True
+        average_price = None
+        if weighted_quantity > 0:
+            average_price = _canonical_price(
+                weighted_value / decimal.Decimal(weighted_quantity)
+            )
+        return {
+            "trade_count": len(rows),
+            "filled_quantity": filled_quantity,
+            "average_filled_price": average_price,
+            "filled_amount": _canonical_price(filled_amount) if has_amount else None,
+        }
 
     def create_algo_order(
         self, request_id, payload, payload_hash, resolved_quantity, params, children
@@ -1404,8 +1869,11 @@ class BridgeRuntime(object):
         self.accounts = self._load_accounts(config.get("accounts", []))
         self.inbound = queue.Queue(maxsize=int(config.get("max_pending_commands", 1000)))
         self.order_events = queue.Queue()
+        self.trade_events = queue.Queue()
         self.order_event_cache = {}
         self.order_event_cache_lock = threading.Lock()
+        self.order_state_condition = threading.Condition()
+        self.stopping = False
         self.pending_broker_responses = {}
         self.pending_broker_lock = threading.Lock()
         self.connected = False
@@ -1441,7 +1909,7 @@ class BridgeRuntime(object):
                 continue
             if account_type != "STOCK":
                 raise BridgeError(
-                    "INVALID_CONFIG", "only STOCK accounts are supported in v1"
+                    "INVALID_CONFIG", "only STOCK accounts are supported"
                 )
             result[account_id] = {"account_id": account_id, "account_type": "STOCK"}
         return result
@@ -1450,6 +1918,9 @@ class BridgeRuntime(object):
         self.pipe.start()
 
     def stop(self):
+        self.stopping = True
+        with self.order_state_condition:
+            self.order_state_condition.notify_all()
         self.pipe.stop()
         self.store.close()
 
@@ -1475,10 +1946,16 @@ class BridgeRuntime(object):
                     "system.health",
                     "account.get",
                     "position.list",
+                    "quote.get",
+                    "quote.list",
+                    "new_issue.list",
+                    "new_issue.quota.get",
                     "order.place",
                     "order.get",
                     "order.list",
+                    "order.wait",
                     "order.cancel",
+                    "trade.list",
                     "algo_order.preview",
                     "algo_order.place",
                     "algo_order.get",
@@ -1502,6 +1979,7 @@ class BridgeRuntime(object):
             "system.health",
             "order.get",
             "order.list",
+            "order.wait",
             "algo_order.get",
             "algo_order.list",
         )
@@ -1517,6 +1995,7 @@ class BridgeRuntime(object):
             self.last_tick_time = now
             self.tick_count += 1
         self.process_order_events()
+        self.process_trade_events()
         if time.monotonic() - self.last_algo_scan >= 0.1:
             self.last_algo_scan = time.monotonic()
             try:
@@ -1597,6 +2076,18 @@ class BridgeRuntime(object):
         )
         return True
 
+    def discard_broker_responses(self, connection_id):
+        """Drop BROKER_ID waiters owned by a disconnected pipe client."""
+        with self.pending_broker_lock:
+            client_order_ids = [
+                client_order_id
+                for client_order_id, waiter in self.pending_broker_responses.items()
+                if waiter["connection_id"] == connection_id
+            ]
+            for client_order_id in client_order_ids:
+                self.pending_broker_responses.pop(client_order_id, None)
+        return len(client_order_ids)
+
     def _merge_broker_result(self, initial_result, row):
         request_id = initial_result.get("request_id", "")
         original_request_id = initial_result.get(
@@ -1614,6 +2105,10 @@ class BridgeRuntime(object):
             "command_status", "SUCCEEDED"
         )
         return merged
+
+    def _notify_order_state(self):
+        with self.order_state_condition:
+            self.order_state_condition.notify_all()
 
     def enqueue_order_event(self, order_info):
         raw = _serialize_qmt_object(order_info)
@@ -1651,7 +2146,9 @@ class BridgeRuntime(object):
             qmt_order_id=qmt_order_id,
             raw=raw,
         )
-        return self.store.get_order(row["client_order_id"])
+        updated = self.store.get_order(row["client_order_id"])
+        self._notify_order_state()
+        return updated
 
     def process_order_events(self):
         while True:
@@ -1667,6 +2164,67 @@ class BridgeRuntime(object):
                 if self.order_event_cache.get(wire_order_tag) is raw:
                     self.order_event_cache.pop(wire_order_tag, None)
             self._complete_broker_response(row["client_order_id"], row)
+
+    def _order_for_trade_raw(self, raw, configured_account_id):
+        qmt_order_id = str(raw.get("m_strOrderSysID", "") or "").strip()
+        row = None
+        if qmt_order_id:
+            row = self.store.get_order_by_qmt_id(
+                configured_account_id, qmt_order_id
+            )
+        if row is not None:
+            return row
+        remark = str(raw.get("m_strRemark", "") or "")
+        if remark:
+            return self.store.get_order_by_wire_tag(remark.split(":", 1)[0])
+        return None
+
+    def _persist_trade_event(self, raw):
+        account_id = str(raw.get("m_strAccountID", "") or "").strip()
+        if account_id not in self.accounts:
+            return None
+        row = self._order_for_trade_raw(raw, account_id)
+        if row is None:
+            return None
+        trade = _normalize_trade(raw, account_id, row, include_raw=False)
+        if not self.store.upsert_trade(trade, raw):
+            return None
+        qmt_order_id = trade.get("qmt_order_id") or row["qmt_order_id"]
+        summary = self.store.trade_summary(row["client_order_id"])
+        filled_quantity = int(summary["filled_quantity"] or 0)
+        status = row["status"]
+        if filled_quantity >= int(row["quantity"]):
+            status = "FILLED"
+        elif filled_quantity > 0 and status not in ORDER_TERMINAL_STATUSES:
+            status = "PARTIALLY_FILLED"
+        self.store.update_order(
+            row["client_order_id"],
+            status=status,
+            qmt_order_id=qmt_order_id,
+        )
+        updated = self.store.get_order(row["client_order_id"])
+        self._notify_order_state()
+        return updated
+
+    def enqueue_trade_event(self, trade_info):
+        raw = _serialize_qmt_object(trade_info)
+        try:
+            if self._persist_trade_event(raw) is not None:
+                return
+        except Exception as exc:
+            self.set_error("trade callback persistence failed: %s" % exc)
+        self.trade_events.put(raw)
+
+    def process_trade_events(self):
+        while True:
+            try:
+                raw = self.trade_events.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                self._persist_trade_event(raw)
+            except Exception as exc:
+                self.set_error("queued trade persistence failed: %s" % exc)
 
     def _process_request(self, message, context_info):
         request_id = str(message.get("request_id", "")).strip()
@@ -1698,14 +2256,26 @@ class BridgeRuntime(object):
             return self.query_account(payload)
         if command == "position.list":
             return self.query_positions(payload)
+        if command == "quote.get":
+            return self.query_quote(payload, context_info)
+        if command == "quote.list":
+            return self.query_quotes(payload, context_info)
+        if command == "new_issue.list":
+            return self.query_new_issues(payload)
+        if command == "new_issue.quota.get":
+            return self.query_new_issue_quota(payload)
         if command == "order.place":
             return self.place_order(payload, request_id, context_info)
         if command == "order.get":
             return self.get_order(payload)
         if command == "order.list":
             return self.list_orders(payload)
+        if command == "order.wait":
+            return self.wait_orders(payload)
         if command == "order.cancel":
             return self.cancel_order(payload, request_id, context_info)
+        if command == "trade.list":
+            return self.query_trades(payload)
         if command == "algo_order.preview":
             return self.preview_algo_order(payload, context_info)
         if command == "algo_order.place":
@@ -1760,6 +2330,12 @@ class BridgeRuntime(object):
             raise BridgeError("QMT_API_MISSING", "QMT function is unavailable: %s" % name)
         return function
 
+    def _include_raw(self, payload):
+        value = payload.get("include_raw", False)
+        if not isinstance(value, bool):
+            raise BridgeError("INVALID_ARGUMENT", "include_raw must be a boolean")
+        return value
+
     def query_account(self, payload):
         account_id = self._require_account(payload)
         objects = self._qmt_function("get_trade_detail_data")(
@@ -1779,18 +2355,205 @@ class BridgeRuntime(object):
 
     def query_positions(self, payload):
         account_id = self._require_account(payload)
+        include_raw = self._include_raw(payload)
         objects = self._qmt_function("get_trade_detail_data")(
             account_id, "STOCK", "POSITION"
         )
         items = []
         for obj in objects or []:
             raw = _serialize_qmt_object(obj)
-            items.append(_normalize_position(raw, account_id))
+            items.append(
+                _normalize_position(raw, account_id, include_raw=include_raw)
+            )
         return {
             "account_id": account_id,
             "account_type": "STOCK",
             "items": items,
             "count": len(items),
+            "as_of": _utc_now_text(),
+        }
+
+    def _query_quote_items(self, instruments, include_raw, context_info):
+        self._require_latest_bar(context_info)
+        ticks = context_info.get_full_tick(instruments)
+        if not isinstance(ticks, dict):
+            raise BridgeError(
+                "QMT_DATA_ERROR", "ContextInfo.get_full_tick did not return a mapping"
+            )
+        missing = [instrument for instrument in instruments if instrument not in ticks]
+        if missing:
+            raise BridgeError(
+                "MARKET_DATA_UNAVAILABLE",
+                "QMT did not return full tick for: %s" % ", ".join(missing),
+                {"instruments": missing},
+            )
+        as_of = _utc_now_text()
+        items = []
+        for instrument in instruments:
+            tick = ticks.get(instrument)
+            if not isinstance(tick, dict):
+                raise BridgeError(
+                    "MARKET_DATA_UNAVAILABLE",
+                    "QMT full tick is not an object: %s" % instrument,
+                )
+            detail = context_info.get_instrument_detail(instrument)
+            if detail is None:
+                detail = {}
+            if not isinstance(detail, dict):
+                raise BridgeError(
+                    "QMT_DATA_ERROR",
+                    "ContextInfo.get_instrument_detail did not return an object: %s"
+                    % instrument,
+                )
+            items.append(
+                _normalize_quote(
+                    tick, detail, instrument, as_of, include_raw=include_raw
+                )
+            )
+        return items, as_of
+
+    def query_quote(self, payload, context_info):
+        instrument = str(payload.get("instrument", "") or "").strip().upper()
+        if not re.match(r"^[0-9]{6}\.(SH|SZ|BJ)$", instrument):
+            raise BridgeError(
+                "INVALID_ARGUMENT", "invalid instrument code: %s" % instrument
+            )
+        include_raw = self._include_raw(payload)
+        items, unused_as_of = self._query_quote_items(
+            [instrument], include_raw, context_info
+        )
+        return items[0]
+
+    def query_quotes(self, payload, context_info):
+        instruments = payload.get("instruments")
+        if not isinstance(instruments, list) or not instruments:
+            raise BridgeError(
+                "INVALID_ARGUMENT", "instruments must be a non-empty array"
+            )
+        normalized = []
+        seen = set()
+        for value in instruments:
+            instrument = str(value or "").strip().upper()
+            if not re.match(r"^[0-9]{6}\.(SH|SZ|BJ)$", instrument):
+                raise BridgeError(
+                    "INVALID_ARGUMENT", "invalid instrument code: %s" % instrument
+                )
+            if instrument in seen:
+                raise BridgeError(
+                    "INVALID_ARGUMENT", "duplicate instrument: %s" % instrument
+                )
+            seen.add(instrument)
+            normalized.append(instrument)
+        include_raw = self._include_raw(payload)
+        items, as_of = self._query_quote_items(
+            normalized, include_raw, context_info
+        )
+        return {"items": items, "count": len(items), "as_of": as_of}
+
+    def query_trades(self, payload):
+        account_id = self._require_account(payload)
+        scope = str(payload.get("scope", "ADAPTER") or "").upper()
+        if scope not in ("ADAPTER", "ACCOUNT"):
+            raise BridgeError(
+                "INVALID_ARGUMENT", "scope must be ADAPTER or ACCOUNT"
+            )
+        include_raw = self._include_raw(payload)
+        requested_client_order_id = str(
+            payload.get("client_order_id", "") or ""
+        ).strip()
+        requested_order = None
+        if requested_client_order_id:
+            requested_order = self.store.get_order(requested_client_order_id)
+            if requested_order is None:
+                raise BridgeError("ORDER_NOT_FOUND", "order was not found")
+            if requested_order["account_id"] != account_id:
+                raise BridgeError(
+                    "INVALID_ARGUMENT",
+                    "client_order_id does not belong to account_id",
+                )
+        query = self._qmt_function("get_trade_detail_data")
+        if scope == "ADAPTER":
+            objects = query(account_id, "STOCK", "DEAL", STRATEGY_NAME)
+        else:
+            objects = query(account_id, "STOCK", "DEAL")
+        items = []
+        for obj in objects or []:
+            raw = _serialize_qmt_object(obj)
+            raw.setdefault("m_strAccountID", account_id)
+            order_row = self._order_for_trade_raw(raw, account_id)
+            if requested_order is not None:
+                if order_row is None or (
+                    order_row["client_order_id"] != requested_client_order_id
+                ):
+                    continue
+            if order_row is not None:
+                self._persist_trade_event(raw)
+                order_row = self.store.get_order(order_row["client_order_id"])
+            items.append(
+                _normalize_trade(
+                    raw, account_id, order_row, include_raw=include_raw
+                )
+            )
+        items.sort(
+            key=lambda item: (
+                item.get("trade_date") or "",
+                item.get("trade_time") or "",
+                item.get("trade_id") or "",
+            )
+        )
+        return {
+            "account_id": account_id,
+            "account_type": "STOCK",
+            "scope": scope,
+            "items": items,
+            "count": len(items),
+            "as_of": _utc_now_text(),
+        }
+
+    def _new_issue_items(self, issue_type):
+        """Read and normalize QMT's current issue mapping for one issue type."""
+        raw = self._qmt_function("get_ipo_data")(issue_type)
+        if raw is None:
+            raw = {}
+        if not isinstance(raw, dict):
+            raise BridgeError(
+                "QMT_DATA_ERROR", "get_ipo_data did not return a mapping"
+            )
+        return [
+            _normalize_new_issue_item(key, value, issue_type)
+            for key, value in raw.items()
+        ]
+
+    def query_new_issues(self, payload):
+        """Return current stock and/or bond subscription data from QMT."""
+        issue_type = str(payload.get("issue_type", "ALL")).upper()
+        if issue_type not in ("ALL", "STOCK", "BOND"):
+            raise BridgeError(
+                "INVALID_ARGUMENT", "issue_type must be ALL, STOCK or BOND"
+            )
+        types = ("STOCK", "BOND") if issue_type == "ALL" else (issue_type,)
+        items = []
+        for current_type in types:
+            items.extend(self._new_issue_items(current_type))
+        items.sort(key=lambda item: (item["issue_type"], item["instrument"]))
+        return {
+            "issue_type": issue_type,
+            "items": items,
+            "count": len(items),
+            "as_of": _utc_now_text(),
+        }
+
+    def query_new_issue_quota(self, payload):
+        """Return QMT's unmodified new-purchase quota mapping for one account."""
+        account_id = self._require_account(payload)
+        raw = _safe_value(
+            self._qmt_function("get_new_purchase_limit")(account_id)
+        )
+        return {
+            "account_id": account_id,
+            "account_type": "STOCK",
+            "limits": raw,
+            "raw": raw,
             "as_of": _utc_now_text(),
         }
 
@@ -1815,6 +2578,11 @@ class BridgeRuntime(object):
         instrument = str(payload.get("instrument", "")).upper()
         if not re.match(r"^[0-9]{6}\.(SH|SZ|BJ)$", instrument):
             raise BridgeError("INVALID_ARGUMENT", "invalid stock code: %s" % instrument)
+        if instrument.endswith(".BJ"):
+            raise BridgeError(
+                "UNSUPPORTED_MARKET",
+                "algorithm orders do not support Beijing Stock Exchange yet",
+            )
         side = str(payload.get("side", "")).upper()
         if side not in ("BUY", "SELL"):
             raise BridgeError("INVALID_ARGUMENT", "side must be BUY or SELL")
@@ -2564,12 +3332,25 @@ class BridgeRuntime(object):
         quantity = payload.get("quantity")
         if not isinstance(quantity, int) or isinstance(quantity, bool) or quantity <= 0:
             raise BridgeError("INVALID_ARGUMENT", "quantity must be a positive integer")
-        if side == "BUY" and quantity % 100 != 0:
-            raise BridgeError("INVALID_ARGUMENT", "stock buy quantity must be a multiple of 100")
+        market = instrument.rsplit(".", 1)[-1]
+        if market == "BJ":
+            if quantity > 1000000:
+                raise BridgeError(
+                    "INVALID_ARGUMENT",
+                    "Beijing Stock Exchange quantity must not exceed 1000000",
+                )
+            if side == "BUY" and quantity < 100:
+                raise BridgeError(
+                    "INVALID_ARGUMENT",
+                    "Beijing Stock Exchange buy quantity must be at least 100",
+                )
+        elif side == "BUY" and quantity % 100 != 0:
+            raise BridgeError(
+                "INVALID_ARGUMENT", "stock buy quantity must be a multiple of 100"
+            )
         price_type = str(payload.get("price_type", "LATEST")).upper()
         if price_type not in self.PRICE_TYPES:
             raise BridgeError("INVALID_ARGUMENT", "unsupported stock price_type")
-        market = instrument.rsplit(".", 1)[-1]
         allowed_markets = STOCK_NATIVE_MARKET_PRICE_TYPES.get(price_type)
         if allowed_markets is not None and market not in allowed_markets:
             raise BridgeError(
@@ -2626,49 +3407,44 @@ class BridgeRuntime(object):
         result["idempotent_replay"] = bool(idempotent_replay)
         return result
 
-    def place_order(self, payload, request_id, context_info):
-        account_id, instrument, side, quantity, price_type, limit_price = (
-            self._validate_stock_order(payload)
-        )
-        client_order_id = str(payload.get("client_order_id", "")).strip()
-        if not client_order_id:
-            raise BridgeError("INVALID_ARGUMENT", "client_order_id is required")
-        payload_hash = _order_payload_hash(
-            account_id,
-            instrument,
-            side,
-            quantity,
-            price_type,
-            limit_price,
-            payload.get("remark", ""),
-        )
+    def _existing_order_result(self, client_order_id, payload_hash, request_id):
         existing = self.store.get_order(client_order_id)
-        if existing:
-            if existing["payload_hash"] != payload_hash:
-                raise BridgeError(
-                    "CLIENT_ORDER_ID_CONFLICT",
-                    "client_order_id is already bound to different order parameters",
-                    {"client_order_id": client_order_id},
-                )
-            if (
-                existing["status"] in ("PENDING_QMT", "UNKNOWN")
-                and not existing["qmt_order_id"]
-            ):
-                raise UncertainError(
-                    "COMMAND_UNCERTAIN",
-                    "the original order crossed an uncertain QMT call boundary",
-                    {
-                        "client_order_id": client_order_id,
-                        "original_request_id": existing["request_id"],
-                        "idempotent_replay": True,
-                    },
-                )
-            return self._place_order_result(existing, request_id, True)
-        try:
-            if not context_info.is_last_bar():
-                raise BridgeError("QMT_NOT_READY", "QMT is not on the latest bar")
-        except AttributeError:
-            raise BridgeError("QMT_NOT_READY", "ContextInfo.is_last_bar is unavailable")
+        if not existing:
+            return None
+        if existing["payload_hash"] != payload_hash:
+            raise BridgeError(
+                "CLIENT_ORDER_ID_CONFLICT",
+                "client_order_id is already bound to different order parameters",
+                {"client_order_id": client_order_id},
+            )
+        if (
+            existing["status"] in ("PENDING_QMT", "UNKNOWN")
+            and not existing["qmt_order_id"]
+        ):
+            raise UncertainError(
+                "COMMAND_UNCERTAIN",
+                "the original order crossed an uncertain QMT call boundary",
+                {
+                    "client_order_id": client_order_id,
+                    "original_request_id": existing["request_id"],
+                    "idempotent_replay": True,
+                },
+            )
+        return self._place_order_result(existing, request_id, True)
+
+    def _submit_resolved_order(
+        self,
+        payload,
+        payload_hash,
+        request_id,
+        context_info,
+        op_type,
+        pr_type,
+        model_price,
+        volume,
+    ):
+        client_order_id = payload["client_order_id"]
+        self._require_latest_bar(context_info)
         wire_tag, qmt_remark = self._qmt_remark(
             client_order_id, payload.get("remark", "")
         )
@@ -2682,20 +3458,15 @@ class BridgeRuntime(object):
                 "client_order_id or request_id already exists",
                 {"client_order_id": client_order_id},
             )
-        op_type = 23 if side == "BUY" else 24
-        if price_type == "LIMIT" or price_type in STOCK_NATIVE_MARKET_PRICE_TYPES:
-            model_price = float(limit_price)
-        else:
-            model_price = -1
         try:
             self._qmt_function("passorder")(
                 op_type,
                 1101,
-                account_id,
-                instrument,
-                self.PRICE_TYPES[price_type],
+                payload["account_id"],
+                payload["instrument"],
+                pr_type,
                 model_price,
-                quantity,
+                volume,
                 STRATEGY_NAME,
                 2,
                 qmt_remark,
@@ -2723,7 +3494,257 @@ class BridgeRuntime(object):
             self.store.get_order(client_order_id), request_id, False
         )
 
+    def _place_stock_order(self, payload, request_id, context_info):
+        account_id, instrument, side, quantity, price_type, limit_price = (
+            self._validate_stock_order(payload)
+        )
+        client_order_id = str(payload.get("client_order_id", "")).strip()
+        if not client_order_id:
+            raise BridgeError("INVALID_ARGUMENT", "client_order_id is required")
+        payload_hash = _order_payload_hash(
+            account_id,
+            instrument,
+            side,
+            quantity,
+            price_type,
+            limit_price,
+            payload.get("remark", ""),
+        )
+        replay = self._existing_order_result(
+            client_order_id, payload_hash, request_id
+        )
+        if replay is not None:
+            return replay
+        normalized = dict(payload)
+        normalized["order_kind"] = "STOCK"
+        normalized["account_id"] = account_id
+        normalized["instrument"] = instrument
+        normalized["side"] = side
+        normalized["quantity"] = quantity
+        normalized["price_type"] = price_type
+        normalized["limit_price"] = limit_price
+        normalized["metadata"] = {}
+        if price_type == "LIMIT" or price_type in STOCK_NATIVE_MARKET_PRICE_TYPES:
+            model_price = float(limit_price)
+        else:
+            model_price = -1
+        return self._submit_resolved_order(
+            normalized,
+            payload_hash,
+            request_id,
+            context_info,
+            23 if side == "BUY" else 24,
+            self.PRICE_TYPES[price_type],
+            model_price,
+            quantity,
+        )
+
+    def _place_reverse_repo(self, payload, request_id, context_info):
+        """Validate and submit one exchange reverse-repo order."""
+        account_id = self._require_account(payload)
+        client_order_id = str(payload.get("client_order_id", "")).strip()
+        instrument = str(payload.get("instrument", "")).strip().upper()
+        if not client_order_id:
+            raise BridgeError("INVALID_ARGUMENT", "client_order_id is required")
+        if str(payload.get("account_type", "STOCK")).upper() != "STOCK":
+            raise BridgeError("INVALID_ARGUMENT", "only STOCK is supported")
+        if str(payload.get("business_type", "")).upper() != "REVERSE_REPO":
+            raise BridgeError("INVALID_ARGUMENT", "invalid reverse repo business_type")
+        if str(payload.get("quantity_type", "")).upper() != "REPO_UNITS":
+            raise BridgeError("INVALID_ARGUMENT", "invalid reverse repo quantity_type")
+        if instrument not in REVERSE_REPO_INSTRUMENTS:
+            raise BridgeError(
+                "INVALID_ARGUMENT", "unsupported reverse repo instrument: %s" % instrument
+            )
+        amount = payload.get("amount")
+        quantity = payload.get("quantity")
+        if (
+            not isinstance(amount, int)
+            or isinstance(amount, bool)
+            or amount <= 0
+            or amount % 1000
+        ):
+            raise BridgeError(
+                "INVALID_ARGUMENT", "amount must be a positive multiple of 1000 yuan"
+            )
+        if (
+            not isinstance(quantity, int)
+            or isinstance(quantity, bool)
+            or quantity != amount // 100
+        ):
+            raise BridgeError(
+                "INVALID_ARGUMENT", "reverse repo quantity does not match amount"
+            )
+        annual_rate = _positive_decimal(payload.get("limit_price"), "annual_rate")
+        canonical_rate = _canonical_price(annual_rate)
+        metadata = {"amount": amount}
+        payload_hash = _order_payload_hash(
+            account_id,
+            instrument,
+            "SELL",
+            quantity,
+            "LIMIT",
+            canonical_rate,
+            payload.get("remark", ""),
+            "REVERSE_REPO",
+            "REVERSE_REPO",
+            "REPO_UNITS",
+            metadata,
+        )
+        replay = self._existing_order_result(
+            client_order_id, payload_hash, request_id
+        )
+        if replay is not None:
+            return replay
+        normalized = {
+            "order_kind": "REVERSE_REPO",
+            "client_order_id": client_order_id,
+            "account_id": account_id,
+            "instrument": instrument,
+            "side": "SELL",
+            "quantity": quantity,
+            "price_type": "LIMIT",
+            "limit_price": canonical_rate,
+            "remark": str(payload.get("remark", "") or ""),
+            "metadata": metadata,
+        }
+        return self._submit_resolved_order(
+            normalized,
+            payload_hash,
+            request_id,
+            context_info,
+            24,
+            self.PRICE_TYPES["LIMIT"],
+            float(annual_rate),
+            quantity,
+        )
+
+    def _place_new_issue_subscription(self, payload, request_id, context_info):
+        """Resolve QMT's current issue price and submit one subscription."""
+        account_id = self._require_account(payload)
+        client_order_id = str(payload.get("client_order_id", "")).strip()
+        instrument = str(payload.get("instrument", "")).strip().upper()
+        issue_type = str(payload.get("issue_type", "")).upper()
+        quantity = payload.get("quantity")
+        if not client_order_id:
+            raise BridgeError("INVALID_ARGUMENT", "client_order_id is required")
+        if str(payload.get("account_type", "STOCK")).upper() != "STOCK":
+            raise BridgeError("INVALID_ARGUMENT", "only STOCK is supported")
+        if (
+            str(payload.get("business_type", "")).upper()
+            != "NEW_ISSUE_SUBSCRIPTION"
+        ):
+            raise BridgeError(
+                "INVALID_ARGUMENT", "invalid new issue subscription business_type"
+            )
+        if issue_type not in ("STOCK", "BOND"):
+            raise BridgeError("INVALID_ARGUMENT", "issue_type must be STOCK or BOND")
+        if not re.match(r"^[0-9]{6}\.(SH|SZ|BJ)$", instrument):
+            raise BridgeError("INVALID_ARGUMENT", "invalid issue code: %s" % instrument)
+        if not isinstance(quantity, int) or isinstance(quantity, bool) or quantity <= 0:
+            raise BridgeError("INVALID_ARGUMENT", "quantity must be a positive integer")
+        metadata_identity = {"issue_type": issue_type}
+        payload_hash = _order_payload_hash(
+            account_id,
+            instrument,
+            "BUY",
+            quantity,
+            "LIMIT",
+            None,
+            payload.get("remark", ""),
+            "NEW_ISSUE_SUBSCRIPTION",
+            "NEW_ISSUE_SUBSCRIPTION",
+            "SUBSCRIPTION_UNITS",
+            metadata_identity,
+        )
+        replay = self._existing_order_result(
+            client_order_id, payload_hash, request_id
+        )
+        if replay is not None:
+            return replay
+        item = None
+        for candidate in self._new_issue_items(issue_type):
+            if candidate["instrument"] == instrument:
+                item = candidate
+                break
+        if item is None:
+            raise BridgeError(
+                "NEW_ISSUE_NOT_FOUND",
+                "instrument is not present in QMT current %s issue data" % issue_type,
+                {"instrument": instrument, "issue_type": issue_type},
+            )
+        issue_price = _positive_decimal(item.get("issue_price"), "issue_price")
+        for field_name in ("min_quantity", "max_quantity"):
+            raw_limit = item.get(field_name)
+            if raw_limit in (None, ""):
+                continue
+            try:
+                decimal_limit = decimal.Decimal(str(raw_limit))
+                if decimal_limit != decimal_limit.to_integral_value():
+                    raise ValueError()
+                limit = int(decimal_limit)
+            except Exception:
+                raise BridgeError(
+                    "QMT_DATA_ERROR", "%s is not an integer in QMT issue data" % field_name
+                )
+            if field_name == "min_quantity" and quantity < limit:
+                raise BridgeError(
+                    "INVALID_ARGUMENT",
+                    "quantity is below QMT issue minimum",
+                    {"quantity": quantity, "minimum": limit},
+                )
+            if field_name == "max_quantity" and quantity > limit:
+                raise BridgeError(
+                    "INVALID_ARGUMENT",
+                    "quantity exceeds QMT issue maximum",
+                    {"quantity": quantity, "maximum": limit},
+                )
+        canonical_issue_price = _canonical_price(issue_price)
+        metadata = {
+            "issue_type": issue_type,
+            "issue_price": canonical_issue_price,
+            "min_quantity": item.get("min_quantity"),
+            "max_quantity": item.get("max_quantity"),
+        }
+        normalized = {
+            "order_kind": "NEW_ISSUE_SUBSCRIPTION",
+            "client_order_id": client_order_id,
+            "account_id": account_id,
+            "instrument": instrument,
+            "side": "BUY",
+            "quantity": quantity,
+            "price_type": "LIMIT",
+            "limit_price": canonical_issue_price,
+            "remark": str(payload.get("remark", "") or ""),
+            "metadata": metadata,
+        }
+        return self._submit_resolved_order(
+            normalized,
+            payload_hash,
+            request_id,
+            context_info,
+            23,
+            self.PRICE_TYPES["LIMIT"],
+            float(issue_price),
+            quantity,
+        )
+
+    def place_order(self, payload, request_id, context_info):
+        order_kind = str(payload.get("order_kind", "STOCK")).upper()
+        if order_kind == "STOCK":
+            return self._place_stock_order(payload, request_id, context_info)
+        if order_kind == "REVERSE_REPO":
+            return self._place_reverse_repo(payload, request_id, context_info)
+        if order_kind == "NEW_ISSUE_SUBSCRIPTION":
+            return self._place_new_issue_subscription(
+                payload, request_id, context_info
+            )
+        raise BridgeError(
+            "INVALID_ARGUMENT", "unsupported order_kind: %s" % order_kind
+        )
+
     def get_order(self, payload):
+        include_raw = self._include_raw(payload)
         client_order_id = str(payload.get("client_order_id", "")).strip()
         qmt_order_id = str(payload.get("qmt_order_id", "")).strip()
         if client_order_id:
@@ -2737,14 +3758,110 @@ class BridgeRuntime(object):
             )
         if not row:
             raise BridgeError("ORDER_NOT_FOUND", "order was not found")
-        return self._order_row(row)
+        return self._order_row(row, include_raw=include_raw)
 
     def list_orders(self, payload):
+        include_raw = self._include_raw(payload)
         account_id = payload.get("account_id")
         if account_id:
             account_id = self._require_account(payload)
         rows = self.store.list_orders(account_id)
-        return {"items": [self._order_row(row) for row in rows], "count": len(rows)}
+        return {
+            "items": [
+                self._order_row(row, include_raw=include_raw) for row in rows
+            ],
+            "count": len(rows),
+        }
+
+    def wait_orders(self, payload):
+        client_order_ids = payload.get("client_order_ids")
+        if not isinstance(client_order_ids, list) or not client_order_ids:
+            raise BridgeError(
+                "INVALID_ARGUMENT", "client_order_ids must be a non-empty list"
+            )
+        normalized_ids = []
+        seen = set()
+        for value in client_order_ids:
+            client_order_id = str(value or "").strip()
+            if not client_order_id:
+                raise BridgeError(
+                    "INVALID_ARGUMENT", "client_order_ids cannot contain blanks"
+                )
+            if client_order_id in seen:
+                raise BridgeError(
+                    "INVALID_ARGUMENT",
+                    "duplicate client_order_id: %s" % client_order_id,
+                )
+            seen.add(client_order_id)
+            normalized_ids.append(client_order_id)
+        statuses = payload.get("statuses")
+        if not isinstance(statuses, list) or not statuses:
+            raise BridgeError(
+                "INVALID_ARGUMENT", "statuses must be a non-empty list"
+            )
+        normalized_statuses = set()
+        for value in statuses:
+            status = str(value or "").strip().upper()
+            if not status:
+                raise BridgeError(
+                    "INVALID_ARGUMENT", "statuses cannot contain blanks"
+                )
+            if status not in ORDER_STATUSES:
+                raise BridgeError(
+                    "INVALID_ARGUMENT", "unsupported order status: %s" % status
+                )
+            normalized_statuses.add(status)
+        include_raw = self._include_raw(payload)
+        try:
+            timeout_seconds = float(payload.get("timeout_seconds"))
+        except Exception:
+            raise BridgeError(
+                "INVALID_ARGUMENT", "timeout_seconds must be positive"
+            )
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise BridgeError(
+                "INVALID_ARGUMENT", "timeout_seconds must be positive"
+            )
+        deadline = time.monotonic() + timeout_seconds
+        with self.order_state_condition:
+            while True:
+                if self.stopping:
+                    raise BridgeError("CONNECTION_CLOSED", "QMT Bridge is stopping")
+                rows = []
+                for client_order_id in normalized_ids:
+                    row = self.store.get_order(client_order_id)
+                    if row is None:
+                        raise BridgeError(
+                            "ORDER_NOT_FOUND",
+                            "order was not found",
+                            {"client_order_id": client_order_id},
+                        )
+                    rows.append(row)
+                items = [
+                    self._order_row(row, include_raw=include_raw) for row in rows
+                ]
+                pending = [
+                    item["client_order_id"]
+                    for item in items
+                    if item["order_status"] not in normalized_statuses
+                ]
+                result = {
+                    "items": items,
+                    "count": len(items),
+                    "statuses": sorted(normalized_statuses),
+                    "completed": not pending,
+                    "pending_client_order_ids": pending,
+                }
+                if not pending:
+                    return result
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise BridgeError(
+                        "WAIT_TIMEOUT",
+                        "orders did not reach the requested statuses before timeout",
+                        result,
+                    )
+                self.order_state_condition.wait(remaining)
 
     def cancel_order(self, payload, request_id, context_info):
         client_order_id = str(payload.get("client_order_id", "")).strip()
@@ -2788,6 +3905,7 @@ class BridgeRuntime(object):
                 "order_status": row["status"],
             }
         self.store.update_order(client_order_id, status="CANCEL_PENDING")
+        self._notify_order_state()
         return {
             "client_order_id": client_order_id,
             "qmt_order_id": qmt_order_id,
@@ -2820,6 +3938,7 @@ class BridgeRuntime(object):
                             qmt_order_id=qmt_order_id,
                             raw=raw,
                         )
+                        self._notify_order_state()
                         updated = self.store.get_order(row["client_order_id"])
                         if updated is not None:
                             self._complete_broker_response(
@@ -2827,12 +3946,74 @@ class BridgeRuntime(object):
                             )
                         break
 
-    def _order_row(self, row):
+    def _order_row(self, row, include_raw=False):
+        order_kind = str(row["order_kind"] or "STOCK").upper()
+        metadata = (
+            json.loads(row["metadata_json"])
+            if row["metadata_json"]
+            else {}
+        )
+        business_types = {
+            "STOCK": "CASH",
+            "REVERSE_REPO": "REVERSE_REPO",
+            "NEW_ISSUE_SUBSCRIPTION": "NEW_ISSUE_SUBSCRIPTION",
+        }
+        quantity_types = {
+            "STOCK": "SHARES",
+            "REVERSE_REPO": "REPO_UNITS",
+            "NEW_ISSUE_SUBSCRIPTION": "SUBSCRIPTION_UNITS",
+        }
+        raw = json.loads(row["raw_json"]) if row["raw_json"] else None
+        effective_qmt_order_id = row["qmt_order_id"]
+        effective_status = row["status"]
+        with self.order_event_cache_lock:
+            cached_raw = self.order_event_cache.get(row["wire_order_tag"])
+        if cached_raw:
+            cached_qmt_order_id = str(
+                cached_raw.get("m_strOrderSysID", "") or ""
+            ).strip()
+            if cached_qmt_order_id:
+                raw = cached_raw
+                effective_qmt_order_id = cached_qmt_order_id
+                effective_status = _derive_order_status(raw, effective_status)
+
+        trade_summary = self.store.trade_summary(row["client_order_id"])
+        raw_filled_quantity = _raw_integer(raw, "m_nVolumeTraded")
+        trade_filled_quantity = int(trade_summary["filled_quantity"] or 0)
+        filled_quantity = max(raw_filled_quantity or 0, trade_filled_quantity)
+        raw_remaining_quantity = _raw_integer(raw, "m_nVolumeTotal")
+        if (
+            raw_remaining_quantity is not None
+            and raw_filled_quantity is not None
+            and raw_filled_quantity >= trade_filled_quantity
+        ):
+            remaining_quantity = max(0, raw_remaining_quantity)
+        else:
+            remaining_quantity = max(0, int(row["quantity"]) - filled_quantity)
+        average_filled_price = None
+        filled_amount = None
+        if filled_quantity > 0:
+            raw_average = _raw_decimal_text(raw, "m_dTradedPrice")
+            if raw_average is not None and decimal.Decimal(raw_average) > 0:
+                average_filled_price = raw_average
+            else:
+                average_filled_price = trade_summary["average_filled_price"]
+            raw_amount = _optional_money_text(
+                raw.get("m_dTradeAmount") if raw else None
+            )
+            if raw_amount is not None and decimal.Decimal(raw_amount) > 0:
+                filled_amount = raw_amount
+            else:
+                filled_amount = trade_summary["filled_amount"]
+
         result = {
             "client_order_id": row["client_order_id"],
             "request_id": row["request_id"],
             "account_id": row["account_id"],
             "account_type": "STOCK",
+            "order_kind": order_kind,
+            "business_type": business_types.get(order_kind),
+            "quantity_type": quantity_types.get(order_kind),
             "instrument": row["instrument"],
             "side": row["side"],
             "quantity": row["quantity"],
@@ -2840,22 +4021,20 @@ class BridgeRuntime(object):
             "limit_price": row["limit_price"],
             "remark": row["user_remark"],
             "qmt_remark": row["qmt_remark"],
-            "qmt_order_id": row["qmt_order_id"],
-            "order_status": row["status"],
-            "raw": json.loads(row["raw_json"]) if row["raw_json"] else None,
+            "qmt_order_id": effective_qmt_order_id,
+            "order_status": effective_status,
+            "filled_quantity": filled_quantity,
+            "remaining_quantity": remaining_quantity,
+            "average_filled_price": average_filled_price,
+            "filled_amount": filled_amount,
+            "trade_count": int(trade_summary["trade_count"] or 0),
+            "reject_reason": _order_reject_reason(raw),
+            "metadata": metadata,
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
-        with self.order_event_cache_lock:
-            raw = self.order_event_cache.get(row["wire_order_tag"])
-        if raw:
-            qmt_order_id = str(raw.get("m_strOrderSysID", "")).strip()
-            if qmt_order_id:
-                result["qmt_order_id"] = qmt_order_id
-                result["order_status"] = _derive_order_status(
-                    raw, result["order_status"]
-                )
-                result["raw"] = raw
+        if include_raw:
+            result["raw"] = raw
         return result
 
     def _success_response(self, message, result):
@@ -2950,6 +4129,11 @@ def handlebar(ContextInfo):
 def order_callback(ContextInfo, orderInfo):
     if _RUNTIME is not None:
         _RUNTIME.enqueue_order_event(orderInfo)
+
+
+def deal_callback(ContextInfo, dealInfo):
+    if _RUNTIME is not None:
+        _RUNTIME.enqueue_trade_event(dealInfo)
 
 
 def stop(ContextInfo):

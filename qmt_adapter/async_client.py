@@ -6,7 +6,14 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Type, TypeVar
 
 from .client import QmtClient
 from .config import ConfigPath
-from .models import AlgoOrderReceipt, AlgoOrderRequest, OrderReceipt, OrderRequest
+from .models import (
+    AlgoOrderReceipt,
+    AlgoOrderRequest,
+    NewIssueSubscriptionRequest,
+    OrderReceipt,
+    OrderRequest,
+    ReverseRepoRequest,
+)
 
 
 T = TypeVar("T")
@@ -92,11 +99,45 @@ class AsyncQmtClient:
         )
 
     async def list_positions(
-        self, account_id: str, timeout: float = 5.0
+        self,
+        account_id: str,
+        timeout: float = 5.0,
+        include_raw: bool = False,
     ) -> Dict[str, Any]:
         """异步查询股票持仓；参数和返回值同 ``QmtClient.list_positions``。"""
         return await self._call(
-            self._client.list_positions, account_id, timeout=timeout
+            self._client.list_positions,
+            account_id,
+            timeout=timeout,
+            include_raw=include_raw,
+        )
+
+    async def get_quote(
+        self,
+        instrument: str,
+        timeout: float = 5.0,
+        include_raw: bool = False,
+    ) -> Dict[str, Any]:
+        """异步查询一只证券行情；参数和返回值同 ``QmtClient.get_quote``。"""
+        return await self._call(
+            self._client.get_quote,
+            instrument,
+            timeout=timeout,
+            include_raw=include_raw,
+        )
+
+    async def get_quotes(
+        self,
+        instruments: Iterable[str],
+        timeout: float = 5.0,
+        include_raw: bool = False,
+    ) -> Dict[str, Any]:
+        """异步批量查询证券行情；参数和返回值同 ``QmtClient.get_quotes``。"""
+        return await self._call(
+            self._client.get_quotes,
+            instruments,
+            timeout=timeout,
+            include_raw=include_raw,
         )
 
     async def place_order(
@@ -138,20 +179,141 @@ class AsyncQmtClient:
             timeout=timeout,
         )
 
+    async def place_reverse_repo(
+        self,
+        order: ReverseRepoRequest,
+        wait_for: str = "LOCAL_ACK",
+        timeout: float = 10.0,
+    ) -> OrderReceipt:
+        """异步提交国债逆回购委托。
+
+        参数、返回值和异常语义与 :meth:`QmtClient.place_reverse_repo`
+        相同；等待Bridge响应时不会阻塞调用方事件循环。
+        """
+        return await self._call(
+            self._client.place_reverse_repo,
+            order,
+            wait_for=wait_for,
+            timeout=timeout,
+        )
+
+    async def subscribe_new_issue(
+        self,
+        order: NewIssueSubscriptionRequest,
+        wait_for: str = "LOCAL_ACK",
+        timeout: float = 10.0,
+    ) -> OrderReceipt:
+        """异步提交新股或新债申购委托。
+
+        参数、返回值和异常语义与 :meth:`QmtClient.subscribe_new_issue`
+        相同；发行价仍由QMT当日发行数据确定。
+        """
+        return await self._call(
+            self._client.subscribe_new_issue,
+            order,
+            wait_for=wait_for,
+            timeout=timeout,
+        )
+
+    async def list_new_issues(
+        self, issue_type: str = "ALL", timeout: float = 5.0
+    ) -> Dict[str, Any]:
+        """异步查询新股新债发行数据；返回值同同步客户端。"""
+        return await self._call(
+            self._client.list_new_issues,
+            issue_type,
+            timeout=timeout,
+        )
+
+    async def get_new_issue_quota(
+        self, account_id: str, timeout: float = 5.0
+    ) -> Dict[str, Any]:
+        """异步查询账户申购额度；返回值同同步客户端。"""
+        return await self._call(
+            self._client.get_new_issue_quota,
+            account_id,
+            timeout=timeout,
+        )
+
     async def get_order(
-        self, client_order_id: str, timeout: float = 5.0
+        self,
+        client_order_id: str,
+        timeout: float = 5.0,
+        include_raw: bool = False,
     ) -> Dict[str, Any]:
         """异步查询一笔适配器委托；返回值同 ``QmtClient.get_order``。"""
         return await self._call(
-            self._client.get_order, client_order_id, timeout=timeout
+            self._client.get_order,
+            client_order_id,
+            timeout=timeout,
+            include_raw=include_raw,
         )
 
     async def list_orders(
-        self, account_id: Optional[str] = None, timeout: float = 5.0
+        self,
+        account_id: Optional[str] = None,
+        timeout: float = 5.0,
+        include_raw: bool = False,
     ) -> Dict[str, Any]:
         """异步列出适配器委托；返回值同 ``QmtClient.list_orders``。"""
         return await self._call(
-            self._client.list_orders, account_id=account_id, timeout=timeout
+            self._client.list_orders,
+            account_id=account_id,
+            timeout=timeout,
+            include_raw=include_raw,
+        )
+
+    async def list_trades(
+        self,
+        account_id: str,
+        scope: str = "ADAPTER",
+        client_order_id: Optional[str] = None,
+        include_raw: bool = False,
+        timeout: float = 5.0,
+    ) -> Dict[str, Any]:
+        """异步查询当日成交；范围、过滤和返回值同同步客户端。"""
+        return await self._call(
+            self._client.list_trades,
+            account_id,
+            scope=scope,
+            client_order_id=client_order_id,
+            include_raw=include_raw,
+            timeout=timeout,
+        )
+
+    async def wait_order(
+        self,
+        client_order_id: str,
+        statuses: Optional[Iterable[str]] = None,
+        timeout: float = 30.0,
+        include_raw: bool = False,
+    ) -> Dict[str, Any]:
+        """异步等待一笔委托状态变化，不阻塞调用方事件循环。"""
+        return await self._call(
+            self._client.wait_order,
+            client_order_id,
+            statuses=statuses,
+            timeout=timeout,
+            include_raw=include_raw,
+        )
+
+    async def wait_orders(
+        self,
+        client_order_ids: Iterable[str],
+        statuses: Optional[Iterable[str]] = None,
+        timeout: float = 30.0,
+        include_raw: bool = False,
+    ) -> Dict[str, Any]:
+        """异步等待一批委托全部进入目标状态。
+
+        等待占用当前客户端的单条持久连接；应在整批下单完成后调用。
+        """
+        return await self._call(
+            self._client.wait_orders,
+            client_order_ids,
+            statuses=statuses,
+            timeout=timeout,
+            include_raw=include_raw,
         )
 
     async def cancel_order(

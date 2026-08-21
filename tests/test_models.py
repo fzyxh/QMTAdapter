@@ -1,6 +1,12 @@
 import unittest
 
-from qmt_adapter import AlgoOrderRequest, OrderRequest, ValidationError
+from qmt_adapter import (
+    AlgoOrderRequest,
+    NewIssueSubscriptionRequest,
+    OrderRequest,
+    ReverseRepoRequest,
+    ValidationError,
+)
 
 
 class OrderRequestTests(unittest.TestCase):
@@ -94,7 +100,7 @@ class OrderRequestTests(unittest.TestCase):
         invalid_cases = (
             ("600000.SH", "MARKET_SZ_INSTBUSI_RESTCANCEL"),
             ("000001.SZ", "MARKET_SH_CONVERT_5_CANCEL"),
-            ("430047.BJ", "MARKET_SZ_FULL_OR_CANCEL"),
+            ("920047.BJ", "MARKET_SZ_FULL_OR_CANCEL"),
         )
         for instrument, price_type in invalid_cases:
             with self.subTest(instrument=instrument, price_type=price_type):
@@ -119,6 +125,83 @@ class OrderRequestTests(unittest.TestCase):
                         price_type="MARKET_MINE_PRICE_FIRST",
                         limit_price=value,
                     ).to_payload()
+
+    def test_beijing_buy_accepts_one_share_increment_after_minimum(self):
+        payload = OrderRequest(
+            account_id="SIM001",
+            instrument="920047.BJ",
+            side="BUY",
+            quantity=101,
+            price_type="LIMIT",
+            limit_price="10.25",
+        ).to_payload()
+
+        self.assertEqual(payload["quantity"], 101)
+
+    def test_beijing_buy_rejects_below_minimum_and_above_maximum(self):
+        for quantity in (99, 1000001):
+            with self.subTest(quantity=quantity):
+                with self.assertRaises(ValidationError):
+                    OrderRequest(
+                        account_id="SIM001",
+                        instrument="920047.BJ",
+                        side="BUY",
+                        quantity=quantity,
+                        price_type="LIMIT",
+                        limit_price="10.25",
+                    ).to_payload()
+
+
+class ReverseRepoRequestTests(unittest.TestCase):
+    def test_amount_is_converted_to_qmt_thousand_yuan_units(self):
+        payload = ReverseRepoRequest(
+            account_id="SIM001",
+            instrument="204001.sh",
+            amount=1000,
+            annual_rate="1.8250",
+            client_order_id="REPO-1",
+        ).to_payload()
+
+        self.assertEqual(payload["order_kind"], "REVERSE_REPO")
+        self.assertEqual(payload["quantity"], 10)
+        self.assertEqual(payload["amount"], 1000)
+        self.assertEqual(payload["limit_price"], "1.8250")
+
+    def test_amount_must_be_a_thousand_yuan_multiple(self):
+        for amount in (100, 1050):
+            with self.subTest(amount=amount):
+                with self.assertRaises(ValidationError):
+                    ReverseRepoRequest(
+                        account_id="SIM001",
+                        instrument="204001.SH",
+                        amount=amount,
+                        annual_rate="1.8",
+                    ).to_payload()
+
+
+class NewIssueSubscriptionRequestTests(unittest.TestCase):
+    def test_stock_subscription_payload(self):
+        payload = NewIssueSubscriptionRequest(
+            account_id="SIM001",
+            instrument="730001.sh",
+            issue_type="stock",
+            quantity=1000,
+            client_order_id="IPO-1",
+        ).to_payload()
+
+        self.assertEqual(payload["order_kind"], "NEW_ISSUE_SUBSCRIPTION")
+        self.assertEqual(payload["instrument"], "730001.SH")
+        self.assertEqual(payload["issue_type"], "STOCK")
+        self.assertIsNone(payload["limit_price"])
+
+    def test_invalid_issue_type_is_rejected(self):
+        with self.assertRaises(ValidationError):
+            NewIssueSubscriptionRequest(
+                account_id="SIM001",
+                instrument="730001.SH",
+                issue_type="FUND",
+                quantity=1000,
+            ).to_payload()
 
 
 class AlgoOrderRequestTests(unittest.TestCase):
@@ -165,6 +248,15 @@ class AlgoOrderRequestTests(unittest.TestCase):
         ).to_payload()
 
         self.assertEqual(payload["algorithm"], "TWAP")
+
+    def test_beijing_algorithm_is_rejected_until_planner_supports_its_rules(self):
+        with self.assertRaises(ValidationError):
+            AlgoOrderRequest(
+                account_id="SIM001",
+                instrument="920047.BJ",
+                side="BUY",
+                quantity=100,
+            ).to_payload()
 
 if __name__ == "__main__":
     unittest.main()

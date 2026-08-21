@@ -65,6 +65,8 @@ class OrderStoreMigrationTests(unittest.TestCase):
                 }
                 row = store.get_order("CLIENT-OLD-0001")
                 self.assertIn("payload_hash", columns)
+                self.assertIn("order_kind", columns)
+                self.assertIn("metadata_json", columns)
                 tables = {
                     item[0]
                     for item in store.conn.execute(
@@ -73,7 +75,9 @@ class OrderStoreMigrationTests(unittest.TestCase):
                 }
                 self.assertIn("algo_orders", tables)
                 self.assertIn("algo_children", tables)
+                self.assertIn("trades", tables)
                 self.assertEqual(len(row["payload_hash"]), 64)
+                self.assertEqual(row["order_kind"], "STOCK")
                 self.assertEqual(
                     row["payload_hash"],
                     bridge._order_payload_hash(

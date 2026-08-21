@@ -6,8 +6,20 @@ import asyncio
 import unittest
 import uuid
 
-from qmt_adapter import AlgoOrderRequest, AsyncQmtClient, OrderRequest
-from tests.test_named_pipe_e2e import ACCOUNT_ID, BridgeHarness, FakeQmtApi
+from qmt_adapter import (
+    AlgoOrderRequest,
+    AsyncQmtClient,
+    NewIssueSubscriptionRequest,
+    OrderRequest,
+    ReverseRepoRequest,
+)
+from qmt_side import qmt_adapter_qmt as bridge
+from tests.test_named_pipe_e2e import (
+    ACCOUNT_ID,
+    BridgeHarness,
+    FakeQmtApi,
+    FakeTrade,
+)
 
 
 @unittest.skipUnless(os.name == "nt", "Windows named pipes are required")
@@ -53,6 +65,15 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             positions = await client.list_positions(ACCOUNT_ID)
             self.assertEqual(positions["items"][0]["instrument"], "600000.SH")
 
+            quote = await client.get_quote(
+                "600000.SH", include_raw=True, timeout=5
+            )
+            quotes = await client.get_quotes(
+                ["601919.SH", "600000.SH"], include_raw=True, timeout=5
+            )
+            self.assertEqual(quote["raw"]["full_tick"]["lastPrice"], 10.0)
+            self.assertEqual(quotes["count"], 2)
+
             receipt = await client.place_order(
                 OrderRequest(
                     account_id=ACCOUNT_ID,
@@ -67,6 +88,73 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
                 timeout=5.0,
             )
             self.assertEqual(receipt.qmt_order_id, "QMT-ORDER-0001")
+
+    async def test_async_new_issue_and_reverse_repo_interfaces(self):
+        async with AsyncQmtClient(config_path=self.config_path) as client:
+            issues = await client.list_new_issues("STOCK", timeout=5)
+            quota = await client.get_new_issue_quota(ACCOUNT_ID, timeout=5)
+            repo = await client.place_reverse_repo(
+                ReverseRepoRequest(
+                    account_id=ACCOUNT_ID,
+                    instrument="204001.SH",
+                    amount=10000,
+                    annual_rate="1.8",
+                    client_order_id="ASYNC-REPO-0001",
+                ),
+                wait_for="BROKER_ID",
+                timeout=5,
+            )
+            subscription = await client.subscribe_new_issue(
+                NewIssueSubscriptionRequest(
+                    account_id=ACCOUNT_ID,
+                    instrument="754001.SH",
+                    issue_type="BOND",
+                    quantity=10,
+                    client_order_id="ASYNC-BOND-0001",
+                ),
+                wait_for="BROKER_ID",
+                timeout=5,
+            )
+
+        self.assertEqual(issues["count"], 1)
+        self.assertEqual(quota["limits"]["SH"], 10000)
+        self.assertTrue(repo.qmt_order_id)
+        self.assertTrue(subscription.qmt_order_id)
+        self.assertEqual(len(self.fake_api.passorder_calls), 2)
+
+    async def test_async_wait_and_trade_query(self):
+        order = OrderRequest(
+            account_id=ACCOUNT_ID,
+            instrument="600000.SH",
+            side="BUY",
+            quantity=100,
+            price_type="LIMIT",
+            limit_price="10.25",
+            client_order_id="ASYNC-WAIT-0001",
+        )
+        async with AsyncQmtClient(config_path=self.config_path) as client:
+            await client.place_order(order, wait_for="BROKER_ID", timeout=5)
+            wait_task = asyncio.create_task(
+                client.wait_order(order.client_order_id, timeout=2)
+            )
+            await asyncio.sleep(0.05)
+            trade = FakeTrade(
+                self.fake_api.orders[0], "ASYNC-TRADE-0001", 10.2, 100
+            )
+            self.fake_api.trades.append(trade)
+            bridge.deal_callback(None, trade)
+            current = await wait_task
+            trades = await client.list_trades(
+                ACCOUNT_ID,
+                scope="ADAPTER",
+                client_order_id=order.client_order_id,
+                timeout=5,
+            )
+
+        self.assertEqual(current["order_status"], "FILLED")
+        self.assertEqual(current["filled_quantity"], 100)
+        self.assertEqual(trades["count"], 1)
+        self.assertEqual(trades["items"][0]["trade_id"], "ASYNC-TRADE-0001")
 
     async def test_fifty_serialized_orders_scheduled_every_fifty_ms(self):
         async with AsyncQmtClient(

@@ -17,6 +17,7 @@ ERROR_BROKEN_PIPE = 109
 ERROR_SEM_TIMEOUT = 121
 ERROR_PIPE_BUSY = 231
 ERROR_NO_DATA = 232
+ERROR_PIPE_NOT_CONNECTED = 233
 ERROR_FILE_NOT_FOUND = 2
 MAX_MESSAGE_SIZE = 1024 * 1024
 
@@ -29,6 +30,7 @@ class NamedPipeConnection:
         self._handle_lock = threading.Lock()
         self._request_lock = threading.Lock()
         self._events = queue.Queue()
+        self._active_incoming = None
         self._closed = threading.Event()
         self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         self._declare_api()
@@ -57,15 +59,6 @@ class NamedPipeConnection:
         k32.ReadFile.restype = wintypes.BOOL
         k32.WriteFile.argtypes = k32.ReadFile.argtypes
         k32.WriteFile.restype = wintypes.BOOL
-        k32.PeekNamedPipe.argtypes = [
-            wintypes.HANDLE,
-            wintypes.LPVOID,
-            wintypes.DWORD,
-            ctypes.POINTER(wintypes.DWORD),
-            ctypes.POINTER(wintypes.DWORD),
-            ctypes.POINTER(wintypes.DWORD),
-        ]
-        k32.PeekNamedPipe.restype = wintypes.BOOL
         k32.CloseHandle.argtypes = [wintypes.HANDLE]
         k32.CloseHandle.restype = wintypes.BOOL
         if hasattr(k32, "CancelIoEx"):
@@ -88,6 +81,7 @@ class NamedPipeConnection:
                     ERROR_FILE_NOT_FOUND,
                     ERROR_SEM_TIMEOUT,
                     ERROR_PIPE_BUSY,
+                    ERROR_PIPE_NOT_CONNECTED,
                 ):
                     time.sleep(min(0.005, remaining))
                     continue
@@ -107,20 +101,25 @@ class NamedPipeConnection:
                     ERROR_FILE_NOT_FOUND,
                     ERROR_SEM_TIMEOUT,
                     ERROR_PIPE_BUSY,
+                    ERROR_PIPE_NOT_CONNECTED,
                 ):
                     time.sleep(min(0.005, remaining))
                     continue
                 raise ctypes.WinError(error_code)
+        self._closed.clear()
         with self._handle_lock:
             self._handle = handle
-        self._closed.clear()
         return self
 
     def close(self):
         self._closed.set()
         with self._handle_lock:
             handle = self._handle
+            incoming = self._active_incoming
             self._handle = None
+            self._active_incoming = None
+        if incoming is not None:
+            incoming.put(ConnectionClosed())
         if handle is not None:
             if hasattr(self._kernel32, "CancelIoEx"):
                 self._kernel32.CancelIoEx(handle, None)
@@ -134,19 +133,56 @@ class NamedPipeConnection:
         key = message.get(correlation_field) or message.get("message_id")
         deadline = time.monotonic() + float(timeout)
         with self._request_lock:
-            self.send(message)
-            while True:
-                response = self._read_message(deadline, key)
-                if response.get("type") == "event":
-                    self._events.put(response)
-                    continue
-                response_key = response.get("request_id") or response.get("message_id")
-                if response_key != key:
-                    raise ConnectionClosed(
-                        "unexpected response id: expected %s, got %s"
-                        % (key, response_key)
-                    )
-                return response
+            incoming = queue.Queue()
+            reader_thread = None
+            try:
+                # The pipe handle uses synchronous I/O, so finish the write before
+                # starting a blocking reader.  Queue.get provides an event-driven
+                # timeout without repeatedly polling PeekNamedPipe.
+                self.send(message)
+                handle = self._get_handle()
+                reader_thread = threading.Thread(
+                    target=self._read_response,
+                    args=(handle, incoming),
+                    name="qmt-adapter-pipe-reader",
+                )
+                reader_thread.daemon = True
+                with self._handle_lock:
+                    if self._handle != handle:
+                        raise ConnectionClosed()
+                    self._active_incoming = incoming
+                reader_thread.start()
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise RequestTimeout(request_id=key)
+                    try:
+                        response = incoming.get(timeout=remaining)
+                    except queue.Empty:
+                        raise RequestTimeout(request_id=key)
+                    if isinstance(response, BaseException):
+                        if isinstance(response, (ConnectionClosed, OSError)):
+                            raise response
+                        raise ConnectionClosed(
+                            "named pipe reader failed: %s" % response
+                        )
+                    response_key = response.get("request_id") or response.get("message_id")
+                    if response_key != key:
+                        raise ConnectionClosed(
+                            "unexpected response id: expected %s, got %s"
+                            % (key, response_key)
+                        )
+                    return response
+            except (RequestTimeout, ConnectionClosed, OSError):
+                # A timed-out request can still produce a late response.  The
+                # stream can no longer be correlated safely, so force a fresh
+                # handshake before the caller performs any follow-up query.
+                self.close()
+                raise
+            finally:
+                with self._handle_lock:
+                    if self._active_incoming is incoming:
+                        self._active_incoming = None
 
     def send(self, message):
         encoded = json.dumps(
@@ -168,36 +204,34 @@ class NamedPipeConnection:
             raise ConnectionClosed()
         return handle
 
-    def _read_message(self, deadline, request_id):
-        handle = self._get_handle()
-        header = self._read_exact(handle, 4, deadline, request_id)
+    def _read_response(self, handle, incoming):
+        try:
+            while True:
+                message = self._read_message(handle)
+                if message.get("type") == "event":
+                    self._events.put(message)
+                else:
+                    incoming.put(message)
+                    return
+        except Exception as exc:
+            incoming.put(exc)
+
+    def _read_message(self, handle):
+        header = self._read_exact(handle, 4)
         size = struct.unpack(">I", header)[0]
         if size <= 0 or size > self.max_message_size:
             raise ConnectionClosed("invalid named-pipe frame size: %s" % size)
-        payload = self._read_exact(handle, size, deadline, request_id)
+        payload = self._read_exact(handle, size)
         return json.loads(payload.decode("utf-8"))
 
-    def _read_exact(self, handle, size, deadline, request_id):
+    def _read_exact(self, handle, size):
         chunks = []
         remaining = size
         while remaining:
-            available = wintypes.DWORD()
-            ok = self._kernel32.PeekNamedPipe(
-                handle, None, 0, None, ctypes.byref(available), None
-            )
-            if not ok:
-                raise ctypes.WinError(ctypes.get_last_error())
-            if not available.value:
-                if self._closed.wait(0.001):
-                    raise ConnectionClosed()
-                if time.monotonic() >= deadline:
-                    raise RequestTimeout(request_id=request_id)
-                continue
-            read_size = min(remaining, available.value)
-            buffer = ctypes.create_string_buffer(read_size)
+            buffer = ctypes.create_string_buffer(remaining)
             received = wintypes.DWORD()
             ok = self._kernel32.ReadFile(
-                handle, buffer, read_size, ctypes.byref(received), None
+                handle, buffer, remaining, ctypes.byref(received), None
             )
             if not ok:
                 raise ctypes.WinError(ctypes.get_last_error())

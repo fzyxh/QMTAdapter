@@ -11,8 +11,10 @@ from .models import (
     AlgoOrderReceipt,
     AlgoOrderRequest,
     BOOK_LIQUIDITY_WEIGHTED_DEFAULTS,
+    NewIssueSubscriptionRequest,
     OrderReceipt,
     OrderRequest,
+    ReverseRepoRequest,
     STOCK_EXECUTION_ALGORITHMS,
 )
 from .version import __version__
@@ -22,6 +24,8 @@ __all__ = [
     "AsyncQmtClient",
     "OrderRequest",
     "OrderReceipt",
+    "ReverseRepoRequest",
+    "NewIssueSubscriptionRequest",
     "AlgoOrderRequest",
     "AlgoOrderReceipt",
     "STOCK_EXECUTION_ALGORITHMS",

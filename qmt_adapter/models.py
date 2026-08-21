@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Mapping, Optional, Union
+import re
 import uuid
 
 from .exceptions import ValidationError
@@ -8,6 +9,27 @@ from .exceptions import ValidationError
 
 ACCOUNT_TYPES = {"STOCK"}
 STOCK_SIDES = {"BUY", "SELL"}
+NEW_ISSUE_TYPES = {"STOCK", "BOND"}
+REVERSE_REPO_INSTRUMENTS = {
+    "204001.SH",
+    "204002.SH",
+    "204003.SH",
+    "204004.SH",
+    "204007.SH",
+    "204014.SH",
+    "204028.SH",
+    "204091.SH",
+    "204182.SH",
+    "131800.SZ",
+    "131801.SZ",
+    "131802.SZ",
+    "131803.SZ",
+    "131805.SZ",
+    "131806.SZ",
+    "131809.SZ",
+    "131810.SZ",
+    "131811.SZ",
+}
 STOCK_PRICE_TYPES = {
     "ASK5",  # prType=0：读取卖五价后，按该价格限价申报
     "ASK4",  # prType=1：读取卖四价后，按该价格限价申报
@@ -85,7 +107,8 @@ class OrderRequest:
         account_id: 配置白名单中的股票资金账号。
         instrument: ``代码.市场`` 格式，例如 ``601919.SH``。
         side: ``BUY`` 或 ``SELL``。
-        quantity: 委托股数；买入必须为100股的整数倍。
+        quantity: 委托股数；沪深买入必须为100股整数倍，北交所买入
+            不少于100股且可按1股递增。
         price_type: 统一价格模式，默认 ``LATEST``。
         limit_price: ``LIMIT`` 模式的限价；原生市价申报中作为保护限价，
             不传时使用 ``0``，即由QMT按对应市场规则处理。
@@ -138,14 +161,23 @@ class OrderRequest:
             raise ValidationError("quantity must be an integer")
         if self.quantity <= 0:
             raise ValidationError("quantity must be greater than zero")
+        market = instrument.rsplit(".", 1)[-1]
+        if market == "BJ":
+            if self.quantity > 1_000_000:
+                raise ValidationError(
+                    "Beijing Stock Exchange quantity must not exceed 1000000"
+                )
+            if side == "BUY" and self.quantity < 100:
+                raise ValidationError(
+                    "Beijing Stock Exchange buy quantity must be at least 100"
+                )
         if quantity_type != "SHARES":
-            raise ValidationError("v1 stock orders only support SHARES")
+            raise ValidationError("stock orders only support SHARES")
         if business_type != "CASH":
-            raise ValidationError("v1 only supports CASH stock orders")
+            raise ValidationError("only CASH stock orders are supported")
         if price_type not in STOCK_PRICE_TYPES:
             raise ValidationError("unsupported price_type: %s" % price_type)
         allowed_markets = STOCK_NATIVE_MARKET_PRICE_TYPES.get(price_type)
-        market = instrument.rsplit(".", 1)[-1]
         if allowed_markets is not None and market not in allowed_markets:
             raise ValidationError(
                 "%s is not supported for market %s" % (price_type, market)
@@ -187,6 +219,151 @@ class OrderRequest:
             "quantity": self.quantity,
             "price_type": price_type,
             "limit_price": normalized_price,
+            "remark": str(self.remark or ""),
+        }
+
+
+@dataclass(frozen=True)
+class ReverseRepoRequest:
+    """交易所国债逆回购委托请求。
+
+    Args:
+        account_id: 配置白名单中的股票资金账号。
+        instrument: 逆回购代码，必须使用 ``代码.市场`` 格式，例如
+            ``204001.SH`` 或 ``131810.SZ``。
+        amount: 申报金额，单位为人民币元；必须为1000元的整数倍。
+        annual_rate: 年化收益率，直接作为 QMT 限价参数传入。
+        remark: 用户委托备注。
+        account_type: 当前只能为 ``STOCK``。
+        client_order_id: 逻辑委托唯一ID；同一ID和相同参数重试不会重复下单。
+    """
+
+    account_id: str
+    instrument: str
+    amount: int
+    annual_rate: PriceValue
+    remark: str = ""
+    account_type: str = "STOCK"
+    client_order_id: str = field(default_factory=new_id)
+
+    def to_payload(self) -> Dict[str, Any]:
+        """验证请求并转换为统一 ``order.place`` 协议负载。
+
+        Returns:
+            Bridge 可直接处理的逆回购负载；其中 ``quantity`` 是QMT使用的
+            张数（每张对应100元标准券），``amount`` 保留人民币金额。
+
+        Raises:
+            ValidationError: 账号、代码、金额或年化收益率不合法。
+        """
+        client_order_id = str(self.client_order_id or "").strip()
+        account_id = str(self.account_id or "").strip()
+        account_type = str(self.account_type or "").upper()
+        instrument = str(self.instrument or "").strip().upper()
+        if not client_order_id:
+            raise ValidationError("client_order_id is required")
+        if not account_id:
+            raise ValidationError("account_id is required")
+        if account_type not in ACCOUNT_TYPES:
+            raise ValidationError("unsupported account_type: %s" % account_type)
+        if instrument not in REVERSE_REPO_INSTRUMENTS:
+            raise ValidationError("unsupported reverse repo instrument: %s" % instrument)
+        if not isinstance(self.amount, int) or isinstance(self.amount, bool):
+            raise ValidationError("amount must be an integer number of yuan")
+        if self.amount <= 0 or self.amount % 1000 != 0:
+            raise ValidationError("amount must be a positive multiple of 1000 yuan")
+        try:
+            annual_rate = Decimal(str(self.annual_rate))
+        except (InvalidOperation, TypeError, ValueError):
+            raise ValidationError("annual_rate must be positive")
+        if not annual_rate.is_finite() or annual_rate <= 0:
+            raise ValidationError("annual_rate must be positive")
+        return {
+            "order_kind": "REVERSE_REPO",
+            "client_order_id": client_order_id,
+            "account_id": account_id,
+            "account_type": account_type,
+            "instrument": instrument,
+            "side": "SELL",
+            "business_type": "REVERSE_REPO",
+            "position_effect": "DEFAULT",
+            "quantity_type": "REPO_UNITS",
+            "quantity": self.amount // 100,
+            "amount": self.amount,
+            "price_type": "LIMIT",
+            "limit_price": _decimal_text(self.annual_rate),
+            "remark": str(self.remark or ""),
+        }
+
+
+@dataclass(frozen=True)
+class NewIssueSubscriptionRequest:
+    """新股或新债申购请求。
+
+    发行价由 QMT 当日 ``get_ipo_data`` 结果解析，调用方无需自行填写，
+    从而避免申购代码与发行价不一致。
+
+    Args:
+        account_id: 配置白名单中的股票资金账号。
+        instrument: 申购代码，使用 ``代码.市场`` 格式。
+        issue_type: ``STOCK`` 表示新股，``BOND`` 表示新债。
+        quantity: 申购数量，单位为申购单位；Bridge 会按QMT返回的当日
+            最小/最大申购数量进行范围校验。
+        remark: 用户委托备注。
+        account_type: 当前只能为 ``STOCK``。
+        client_order_id: 逻辑委托唯一ID；同一ID和相同参数重试不会重复申购。
+    """
+
+    account_id: str
+    instrument: str
+    issue_type: str
+    quantity: int
+    remark: str = ""
+    account_type: str = "STOCK"
+    client_order_id: str = field(default_factory=new_id)
+
+    def to_payload(self) -> Dict[str, Any]:
+        """验证请求并转换为统一 ``order.place`` 协议负载。
+
+        Returns:
+            Bridge 可处理的新股/新债申购负载。
+
+        Raises:
+            ValidationError: 账号、代码、申购类型或数量不合法。
+        """
+        client_order_id = str(self.client_order_id or "").strip()
+        account_id = str(self.account_id or "").strip()
+        account_type = str(self.account_type or "").upper()
+        instrument = str(self.instrument or "").strip().upper()
+        issue_type = str(self.issue_type or "").upper()
+        if not client_order_id:
+            raise ValidationError("client_order_id is required")
+        if not account_id:
+            raise ValidationError("account_id is required")
+        if account_type not in ACCOUNT_TYPES:
+            raise ValidationError("unsupported account_type: %s" % account_type)
+        if not instrument or not re.match(r"^[0-9]{6}\.(SH|SZ|BJ)$", instrument):
+            raise ValidationError("instrument must use code.market format")
+        if issue_type not in NEW_ISSUE_TYPES:
+            raise ValidationError("issue_type must be STOCK or BOND")
+        if not isinstance(self.quantity, int) or isinstance(self.quantity, bool):
+            raise ValidationError("quantity must be an integer")
+        if self.quantity <= 0:
+            raise ValidationError("quantity must be greater than zero")
+        return {
+            "order_kind": "NEW_ISSUE_SUBSCRIPTION",
+            "client_order_id": client_order_id,
+            "account_id": account_id,
+            "account_type": account_type,
+            "instrument": instrument,
+            "side": "BUY",
+            "business_type": "NEW_ISSUE_SUBSCRIPTION",
+            "position_effect": "DEFAULT",
+            "quantity_type": "SUBSCRIPTION_UNITS",
+            "quantity": self.quantity,
+            "issue_type": issue_type,
+            "price_type": "LIMIT",
+            "limit_price": None,
             "remark": str(self.remark or ""),
         }
 
@@ -270,6 +447,10 @@ class AlgoOrderRequest:
             raise ValidationError("account_id is required")
         if not instrument or "." not in instrument:
             raise ValidationError("instrument must use code.market format")
+        if instrument.endswith(".BJ"):
+            raise ValidationError(
+                "algorithm orders do not support Beijing Stock Exchange yet"
+            )
         if side not in STOCK_SIDES:
             raise ValidationError("side must be BUY or SELL")
         if algorithm not in STOCK_EXECUTION_ALGORITHMS:

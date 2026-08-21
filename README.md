@@ -8,6 +8,7 @@
 
 ## 已成功测试客户端
 
+- 东北证券NET专业版v2.1.19.0
 - 东北证券NET专业版v1.0.0.38788
 - 平安证券量盈QMT策略交易平台v2.1.17.0
 
@@ -15,10 +16,17 @@
 
 - 股票账户查询；
 - 股票持仓查询；
+- 单只及批量证券行情查询，可选返回QMT原始行情；
 - 普通现金账户股票买入和卖出；
+- 北交所普通股票委托（买入不少于100股，之后可按1股递增）；
 - 按指定时间间隔串行批量下单；
-- 沪深交易所原生股票市价申报；
+- 沪深北交易所原生股票市价申报（按各市场支持的申报类型校验）；
+- 沪深交易所国债逆回购；
+- 当日新股、新债发行信息及账户申购额度查询；
+- 新股、新债申购；
 - 委托查询和撤单；
+- 当日成交查询，可选择仅查询本Adapter委托或查询账户全部成交；
+- 由QMT委托/成交回报驱动的单笔和批量委托状态等待；
 - 按盘口流动性拆分并按固定间隔提交大额股票委托，支持预览、提交、查询和撤单。
 
 ## 文件说明
@@ -26,8 +34,12 @@
 - `qmt_side/qmt_adapter_qmt.py`：由部署命令更新到固定目录的大 QMT 端完整脚本。
 - `qmt_adapter/`：外部同步客户端和 asyncio 客户端，均不依赖或导入 QMT 模块。
 - `scripts/query_account.py`：只读的账户和持仓验证脚本。
-- `scripts/place_stock_order.py`：带安全检查的模拟账户下单脚本；完成只读验证前不要使用。
+- `scripts/place_stock_order.py`：需要显式确认字符串的单笔真实下单脚本；它不会判断
+  当前账号是否为模拟账户，完成只读验证前不要使用。
 - `scripts/stress_test_calls.py`：只读的同步/异步调用耗时对比脚本。
+- `scripts/stress_test_orders.py`：会真实连续提交50笔委托的压力测试脚本，不是单元测试。
+- `scripts/qmt_l2_probe_qmt.py`：独立的只读大QMT L2能力探针，不属于Adapter运行组件。
+- `docs/`：完整函数调用说明和算法委托设计文档。
 - 默认部署根目录：`C:\QMTAdapter`，不依赖券商软件的安装目录。
 
 ## 安装与部署
@@ -83,8 +95,9 @@ C:\QMTAdapter\
 .\.venv\Scripts\python.exe .\scripts\query_account.py --account-id YOUR_ACCOUNT_ID
 ```
 
-返回结果有意保留 `raw` 原始对象，供首次实机检查 QMT 字段使用。v1 规范化字段只使用
-QMT 手册明确列出的 `m_dAvailable`、`m_strInstrumentID` 和 `m_nVolume`。
+脚本返回Bridge状态、账户资金和标准化持仓。账户项目包含QMT原始字段；持仓默认
+只返回标准字段，需要排查QMT原始持仓对象时可直接调用
+`client.list_positions(account_id, include_raw=True)`。
 
 ## 交易验证
 
@@ -147,6 +160,50 @@ with QmtClient() as client:
         timeout=10.0,
     )
 ```
+
+查询当日新股新债、账户申购额度并申购：
+
+```python
+from qmt_adapter import NewIssueSubscriptionRequest, QmtClient
+
+
+with QmtClient() as client:
+    issues = client.list_new_issues("ALL")
+    quota = client.get_new_issue_quota("YOUR_ACCOUNT_ID")
+    receipt = client.subscribe_new_issue(
+        NewIssueSubscriptionRequest(
+            account_id="YOUR_ACCOUNT_ID",
+            instrument="申购代码.SH",
+            issue_type="STOCK",  # 新债使用 BOND
+            quantity=1000,
+            remark="ipo-example",
+        ),
+        wait_for="BROKER_ID",
+    )
+```
+
+逆回购按人民币金额填写，必须为1000元整数倍；Bridge 会按每张100元标准券
+转换成 QMT 使用的张数，因此1000元对应 `volume=10`：
+
+```python
+from qmt_adapter import QmtClient, ReverseRepoRequest
+
+
+with QmtClient() as client:
+    receipt = client.place_reverse_repo(
+        ReverseRepoRequest(
+            account_id="YOUR_ACCOUNT_ID",
+            instrument="204001.SH",
+            amount=10000,
+            annual_rate="1.80",
+            remark="repo-example",
+        ),
+        wait_for="BROKER_ID",
+    )
+```
+
+申购价由 QMT 当日发行数据确定；接口不会自动选择标的或按额度满额申购。
+逆回购和申购均复用普通委托的 `client_order_id`、查询、撤单和幂等规则。
 
 ## Asyncio 客户端
 

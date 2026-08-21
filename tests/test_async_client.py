@@ -60,7 +60,17 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("environment", health)
 
             account = await client.get_account(ACCOUNT_ID)
-            self.assertEqual(account["items"][0]["available_cash"], 20000000.0)
+            account_with_raw = await client.get_account(
+                ACCOUNT_ID, include_raw=True
+            )
+            self.assertEqual(
+                account["items"][0]["available_cash"], "20000000.000"
+            )
+            self.assertNotIn("raw", account["items"][0])
+            self.assertEqual(
+                account_with_raw["items"][0]["raw"]["m_dStockValue"],
+                8800.125000000002,
+            )
 
             positions = await client.list_positions(ACCOUNT_ID)
             self.assertEqual(positions["items"][0]["instrument"], "600000.SH")

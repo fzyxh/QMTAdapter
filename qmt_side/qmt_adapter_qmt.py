@@ -711,13 +711,26 @@ def _serialize_qmt_object(obj):
     return result
 
 
-def _normalize_account(raw, configured_account_id):
-    return {
+def _normalize_account(raw, configured_account_id, include_raw=False):
+    result = {
         "account_id": raw.get("m_strAccountID", configured_account_id),
         "account_type": "STOCK",
-        "available_cash": raw.get("m_dAvailable"),
-        "raw": raw,
+        "total_asset": _optional_three_decimal_text(raw.get("m_dBalance")),
+        "available_cash": _optional_three_decimal_text(raw.get("m_dAvailable")),
+        "stock_market_value": _optional_three_decimal_text(
+            raw.get("m_dStockValue")
+        ),
+        "withdrawable_cash": _optional_three_decimal_text(
+            raw.get("m_dFetchBalance")
+        ),
+        "frozen_cash": _optional_three_decimal_text(raw.get("m_dFrozenCash")),
+        "position_profit": _optional_three_decimal_text(
+            raw.get("m_dPositionProfit")
+        ),
     }
+    if include_raw:
+        result["raw"] = raw
+    return result
 
 
 def _normalize_position(raw, configured_account_id, include_raw=False):
@@ -2365,13 +2378,16 @@ class BridgeRuntime(object):
 
     def query_account(self, payload):
         account_id = self._require_account(payload)
+        include_raw = self._include_raw(payload)
         objects = self._qmt_function("get_trade_detail_data")(
             account_id, "STOCK", "ACCOUNT"
         )
         items = []
         for obj in objects or []:
             raw = _serialize_qmt_object(obj)
-            items.append(_normalize_account(raw, account_id))
+            items.append(
+                _normalize_account(raw, account_id, include_raw=include_raw)
+            )
         return {
             "account_id": account_id,
             "account_type": "STOCK",

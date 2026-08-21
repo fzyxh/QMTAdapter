@@ -1,0 +1,67 @@
+name: 发布版本
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: 构建发布包
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 核对 Tag 与包版本
+        shell: pwsh
+        run: |
+          $tagVersion = "${{ github.ref_name }}".Substring(1)
+          $packageVersion = & python -c "from qmt_adapter import __version__; print(__version__)"
+          if ($packageVersion -ne $tagVersion) {
+            throw "Tag ${{ github.ref_name }} 与包版本 $packageVersion 不一致"
+          }
+
+      - name: 安装构建工具
+        run: python -m pip install --upgrade build
+
+      - name: 构建 wheel 和源码包
+        run: python -m build
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-dist
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: 创建 GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: 下载构建产物
+        uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          path: dist
+
+      - name: 创建 Release 并附加安装包
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "${{ github.ref_name }}" dist/*
+          --repo "${{ github.repository }}"
+          --verify-tag
+          --generate-notes
+          --title "${{ github.ref_name }}"

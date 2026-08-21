@@ -1,6 +1,6 @@
 # QMT Adapter 部署与函数调用说明
 
-本文档对应QMTAdapter `0.6.0`、命名管道协议6，说明大 QMT 端脚本的部署方式，
+本文档对应QMTAdapter `0.6.1`、命名管道协议6，说明大 QMT 端脚本的部署方式，
 以及外部封装库的同步、异步函数调用方法。
 
 ## 1. 当前支持范围
@@ -307,7 +307,11 @@ result = client.health(timeout=5.0)
 ### 5.4 get_account
 
 ```python
-result = client.get_account("YOUR_ACCOUNT_ID", timeout=5.0)
+result = client.get_account(
+    "YOUR_ACCOUNT_ID",
+    timeout=5.0,
+    include_raw=False,
+)
 ```
 
 返回结构：
@@ -320,8 +324,12 @@ result = client.get_account("YOUR_ACCOUNT_ID", timeout=5.0)
         {
             "account_id": "YOUR_ACCOUNT_ID",
             "account_type": "STOCK",
-            "available_cash": 1000000.0,
-            "raw": {...},
+            "total_asset": "1260000.000",
+            "available_cash": "1000000.000",
+            "stock_market_value": "250000.000",
+            "withdrawable_cash": "990000.000",
+            "frozen_cash": "10000.000",
+            "position_profit": "6000.000",
         }
     ],
     "count": 1,
@@ -329,7 +337,20 @@ result = client.get_account("YOUR_ACCOUNT_ID", timeout=5.0)
 }
 ```
 
-`available_cash` 来自 QMT 字段 `m_dAvailable`；其他未标准化账户字段保留在 `raw` 中。
+标准字段与大 QMT 原始字段的对应关系：
+
+| 标准字段 | 含义 | 大 QMT 原始字段 |
+|---|---|---|
+| `total_asset` | 总资产 | `m_dBalance` |
+| `available_cash` | 可用金额 | `m_dAvailable` |
+| `stock_market_value` | 股票市值 | `m_dStockValue` |
+| `withdrawable_cash` | 可取金额 | `m_dFetchBalance` |
+| `frozen_cash` | 冻结金额 | `m_dFrozenCash` |
+| `position_profit` | 持仓总盈亏 | `m_dPositionProfit` |
+
+上述金额字段均固定输出三位小数字符串。默认不返回 QMT 原始
+字段；调试时可设置 `include_raw=True`，此时每个账户项目会额外
+包含未做精度处理的 `raw`。
 
 ### 5.5 list_positions
 
@@ -357,6 +378,10 @@ result = client.list_positions(
     "position_profit": "440.000",
 }
 ```
+
+其中 `total_quantity` 是当前持有股数，`available_quantity` 是当前
+可用股数，`frozen_quantity` 是冻结股数。当天买入、挂出卖单或其他
+冻结情况下，持有股数与可用股数可能不同。
 
 字段分别来自大 QMT 持仓对象的 `m_nVolume`、`m_nCanUseVolume`、
 `m_nFrozenVolume`、`m_dOpenPrice`、`m_dLastPrice`、`m_dMarketValue` 和
@@ -905,7 +930,9 @@ receipt.raw
 ```python
 async with AsyncQmtClient(config_path=CONFIG_PATH) as client:
     health = await client.health()
-    account = await client.get_account("YOUR_ACCOUNT_ID")
+    account = await client.get_account(
+        "YOUR_ACCOUNT_ID", include_raw=False
+    )
     positions = await client.list_positions("YOUR_ACCOUNT_ID")
 ```
 
@@ -916,7 +943,7 @@ async with AsyncQmtClient(config_path=CONFIG_PATH) as client:
 | `await connect(timeout)` | `connect(timeout)` |
 | `await close()` | `close()` |
 | `await health(timeout)` | `health(timeout)` |
-| `await get_account(account_id, timeout)` | `get_account(...)` |
+| `await get_account(account_id, timeout, include_raw)` | `get_account(...)` |
 | `await list_positions(account_id, timeout, include_raw)` | `list_positions(...)` |
 | `await get_quote(instrument, timeout, include_raw)` | `get_quote(...)` |
 | `await get_quotes(instruments, timeout, include_raw)` | `get_quotes(...)` |

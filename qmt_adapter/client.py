@@ -213,20 +213,31 @@ class QmtClient:
         return self._request("system.health", {}, timeout=timeout)
 
     def get_account(
-        self, account_id: str, timeout: float = 5.0
+        self,
+        account_id: str,
+        timeout: float = 5.0,
+        include_raw: bool = False,
     ) -> Dict[str, Any]:
         """查询一个已配置股票账户的资金信息。
 
         Args:
             account_id: ``bridge_config.json`` 白名单中的资金账号。
             timeout: 等待响应的最长秒数。
+            include_raw: 是否附带QMT原始账户字段；默认关闭。
 
         Returns:
-            账户查询字典。标准字段包括 ``available_cash``，QMT 原始字段
-            保存在每个项目的 ``raw`` 中。
+            账户查询字典。每项包含总资产、可用资金、股票市值、可取资金、
+            冻结资金和持仓总盈亏。标准金额固定输出三位小数字符串；仅当
+            ``include_raw=True`` 时包含 ``raw``。
         """
+        include_raw = _validated_include_raw(include_raw)
         return self._request(
-            "account.get", {"account_id": str(account_id)}, timeout=timeout
+            "account.get",
+            {
+                "account_id": str(account_id),
+                "include_raw": include_raw,
+            },
+            timeout=timeout,
         )
 
     def list_positions(
@@ -243,9 +254,10 @@ class QmtClient:
             include_raw: 是否为每项附带QMT原始持仓字段；默认关闭。
 
         Returns:
-            持仓查询字典。每项包含证券代码、总持仓、可用、冻结、成本价、
-            当前价、市值和持仓盈亏。仅当 ``include_raw=True`` 时包含
-            ``raw``。
+            持仓查询字典。每项的 ``total_quantity`` 是持有股数，
+            ``available_quantity`` 是当前可用股数，``frozen_quantity`` 是
+            冻结股数；另含证券代码、成本价、当前价、市值和持仓盈亏。
+            仅当 ``include_raw=True`` 时包含 ``raw``。
         """
         include_raw = _validated_include_raw(include_raw)
         return self._request(

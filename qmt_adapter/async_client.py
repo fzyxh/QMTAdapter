@@ -93,11 +93,17 @@ class AsyncQmtClient:
         return await self._call(self._client.health, timeout=timeout)
 
     async def get_account(
-        self, account_id: str, timeout: float = 5.0
+        self,
+        account_id: str,
+        timeout: float = 5.0,
+        include_raw: bool = False,
     ) -> Dict[str, Any]:
         """异步查询股票账户资金；参数和返回值同 ``QmtClient.get_account``。"""
         return await self._call(
-            self._client.get_account, account_id, timeout=timeout
+            self._client.get_account,
+            account_id,
+            timeout=timeout,
+            include_raw=include_raw,
         )
 
     async def list_positions(

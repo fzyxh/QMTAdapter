@@ -25,7 +25,12 @@ ACCOUNT_ID = "SIM-STOCK-001"
 
 class FakeAccount(object):
     m_strAccountID = ACCOUNT_ID
+    m_dBalance = 20008800.1250000001
     m_dAvailable = 20000000.0
+    m_dStockValue = 8800.125000000002
+    m_dFetchBalance = 19999000.5
+    m_dFrozenCash = 1000.25
+    m_dPositionProfit = 600.1250000000001
 
 
 class FakePosition(object):
@@ -351,8 +356,24 @@ class NamedPipeEndToEndTests(unittest.TestCase):
             health = client.health()
             self.assertNotIn("environment", health)
             account = client.get_account(ACCOUNT_ID)
+            account_with_raw = client.get_account(
+                ACCOUNT_ID, include_raw=True
+            )
             self.assertEqual(account["count"], 1)
-            self.assertEqual(account["items"][0]["available_cash"], 20000000.0)
+            account_item = account["items"][0]
+            self.assertEqual(account_item["total_asset"], "20008800.125")
+            self.assertEqual(account_item["available_cash"], "20000000.000")
+            self.assertEqual(account_item["stock_market_value"], "8800.125")
+            self.assertEqual(account_item["withdrawable_cash"], "19999000.500")
+            self.assertEqual(account_item["frozen_cash"], "1000.250")
+            self.assertEqual(account_item["position_profit"], "600.125")
+            self.assertNotIn("raw", account_item)
+            self.assertEqual(
+                account_with_raw["items"][0]["raw"]["m_dBalance"],
+                20008800.1250000001,
+            )
+            with self.assertRaises(ValidationError):
+                client.get_account(ACCOUNT_ID, include_raw="yes")
 
             positions = client.list_positions(ACCOUNT_ID)
             positions_with_raw = client.list_positions(

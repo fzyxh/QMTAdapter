@@ -33,6 +33,20 @@
 
 ### 1. 安装外部 Python 库
 
+以下两种方式二选一。
+
+#### 方式一：从 GitHub Latest Release 安装
+
+在外部策略项目目录中创建虚拟环境，然后执行一条命令自动获取并安装最新 Release 的 wheel：
+
+```powershell
+python -m venv .venv
+$version = (Invoke-RestMethod "https://api.github.com/repos/fzyxh/QMTAdapter/releases/latest").tag_name.TrimStart("v")
+.\.venv\Scripts\python.exe -m pip install "https://github.com/fzyxh/QMTAdapter/releases/latest/download/qmt_adapter-$version-py3-none-any.whl"
+```
+
+#### 方式二：从源码安装
+
 克隆仓库，在仓库根目录创建虚拟环境并安装：
 
 ```powershell
@@ -42,8 +56,7 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e .
 ```
 
-`qmt_adapter` 安装在该虚拟环境中。外部策略通过它调用大 QMT，不需要导入 QMT
-Python 模块。
+两种方式都会将 `qmt_adapter` 安装到该虚拟环境，并在 Windows 下生成 `.\.venv\Scripts\qmt-adapter.exe`。外部策略通过它调用大 QMT，不需要导入 QMT Python 模块。
 
 ### 2. 生成配置和 QMT 端脚本
 
@@ -66,9 +79,7 @@ C:\QMTAdapter\
     └── bridge.db-shm
 ```
 
-部署目录固定为 `C:\QMTAdapter`，与券商软件安装目录无关。配置文件和随机鉴权令牌
-在首次部署时生成；SQLite 数据库在 QMT 策略首次启动时创建。单条协议消息默认
-上限为5 MiB。
+部署目录固定为 `C:\QMTAdapter`，与券商软件安装目录无关。配置文件和随机鉴权令牌在首次部署时生成；SQLite 数据库在 QMT 策略首次启动时创建。单条协议消息默认上限为5 MiB。
 
 ### 3. 在大 QMT 创建并启动策略
 
@@ -83,8 +94,7 @@ C:\QMTAdapter\
 3. 打开“模型交易”，点击“新建策略交易”，策略类型选择刚才创建的策略。
 4. 账户类型选择“股票账号”，资金账号选择部署时填写的同一账号。
 5. 主图代码可填写 `000300`，运行周期选择“日线”。主图不决定实际交易标的。
-6. 创建后将运行模式切换为“实盘”并启动策略。这里的“实盘”是 QMT 的策略运行
-   模式，不代表所选资金账号一定是真实账户。
+6. 创建后将运行模式切换为“实盘”并启动策略。这里的“实盘”是 QMT 的策略运行模式，不代表所选资金账号一定是真实账户。
 
    ![在模型交易中使用实盘运行模式启动策略](assets/readme/qmt-trading-mode.png)
 
@@ -98,14 +108,13 @@ QMT Adapter bridge is ready: \\.\pipe\qmt_adapter
 
 ### 4. 验证账户和持仓
 
-保持 QMT 策略运行，在仓库根目录执行：
+保持 QMT 策略运行，直接通过已安装的 Python 包查询：
 
 ```powershell
-.\.venv\Scripts\python.exe .\scripts\query_account.py --account-id YOUR_ACCOUNT_ID
+.\.venv\Scripts\python.exe -c "from qmt_adapter import QmtClient; c = QmtClient().connect(); print(c.health()); print(c.get_account('YOUR_ACCOUNT_ID')); print(c.list_positions('YOUR_ACCOUNT_ID')); c.close()"
 ```
 
-能够返回 Bridge 状态、账户资金和持仓即表示部署成功。其他辅助脚本的用途和运行
-方式见 [`scripts/README.md`](scripts/README.md)。
+能够返回 Bridge 状态、账户资金和持仓即表示部署成功。从源码安装时，其他辅助脚本的用途和运行方式见 [`scripts/README.md`](scripts/README.md)。
 
 ### 5. 升级
 

@@ -132,7 +132,7 @@ SQLite 启用 WAL 后，运行期间可能在同一目录生成 `bridge.db-wal` 
 |---|---|---|
 | QMT 短加载器 | `C:\QMTAdapter\qmt_adapter_loader.py` | 部署命令更新 |
 | QMT Bridge | `C:\QMTAdapter\runtime\qmt_adapter_qmt.py` | 部署命令更新 |
-| JSON 配置 | `C:\QMTAdapter\config\bridge_config.json` | 首次部署时创建；升级时只删除已废弃的 `environment` 字段 |
+| JSON 配置 | `C:\QMTAdapter\config\bridge_config.json` | 首次部署时创建；后续部署保留用户配置 |
 | SQLite 数据库 | `C:\QMTAdapter\data\bridge.db` | QMT Bridge 首次启动时创建 |
 | SQLite WAL/SHM | `C:\QMTAdapter\data\bridge.db-wal`、`bridge.db-shm` | SQLite 按运行状态创建或删除 |
 
@@ -141,7 +141,7 @@ SQLite 启用 WAL 后，运行期间可能在同一目录生成 `bridge.db-wal` 
 ```json
 {
   "version": 1,
-  "pipe_name": "\\\\.\\pipe\\qmt_adapter_v1",
+  "pipe_name": "\\\\.\\pipe\\qmt_adapter",
   "auth_token": "由部署命令生成的64位十六进制字符串",
   "db_path": "C:\\QMTAdapter\\data\\bridge.db",
   "accounts": [
@@ -154,7 +154,7 @@ SQLite 启用 WAL 后，运行期间可能在同一目录生成 `bridge.db-wal` 
   "reconcile_interval_seconds": 5.0,
   "max_commands_per_tick": 20,
   "max_pending_commands": 1000,
-  "max_message_size": 1048576,
+  "max_message_size": 5242880,
   "qmt_remark_max_bytes": 64
 }
 ```
@@ -172,26 +172,25 @@ SQLite 启用 WAL 后，运行期间可能在同一目录生成 `bridge.db-wal` 
 | `reconcile_interval_seconds` | 委托回调遗漏或重启恢复时的对账周期 |
 | `max_commands_per_tick` | 每个 QMT 定时器周期最多处理的命令数 |
 | `max_pending_commands` | QMT 主线程待处理命令队列上限 |
-| `max_message_size` | 单个管道消息最大字节数 |
+| `max_message_size` | 单个管道消息最大字节数，默认5 MiB；响应超限时返回 `RESPONSE_TOO_LARGE` |
 | `qmt_remark_max_bytes` | 传入 QMT 的委托备注最大字节数 |
 
-配置中的 `version: 1` 是配置文件格式版本，默认管道名末尾的
-`qmt_adapter_v1` 是为兼容既有部署而保留的固定标识；它们都不是Python包版本或
-命名管道协议版本。包版本由 `qmt_adapter.__version__` 返回，当前协议版本为6。
+配置中的 `version: 1` 是配置文件格式版本，不是Python包版本或命名管道协议版本。
+包版本由 `qmt_adapter.__version__` 返回，当前协议版本为6。
 
 ### 3.3 创建并运行 QMT 策略
 
-1. 在大 QMT 的“模型交易”中创建 Python 策略。
-2. 将 `C:\QMTAdapter\qmt_adapter_loader.py` 的完整内容放入策略代码。
+1. 在大 QMT 的“模型研究”中创建 Python 策略。
+2. 将 `C:\QMTAdapter\qmt_adapter_loader.py` 的完整内容放入策略代码并保存。
    加载器只包含 ASCII 字符并声明为 GBK，避免复制时发生编码转换问题。
-3. 账户类型选择“股票账号”。
-4. 资金账号选择配置文件中同一个账号。
+3. 打开“模型交易”，新建策略交易并选择刚才创建的策略。
+4. 账户类型选择“股票账号”，资金账号选择配置文件中同一个账号。
 5. 主图代码可以使用 `000300`，运行周期使用“日线”。主图只用于启动策略运行环境，不参与适配器交易标的选择。
-6. 需要实际调用下单、撤单函数时，在模型交易中使用交易运行模式。
+6. 将运行模式切换为“实盘”并启动策略。这里的“实盘”是策略运行模式，不表示资金账号一定是真实账户。
 7. 启动后确认日志出现：
 
 ```text
-QMT Adapter bridge is ready: \\.\pipe\qmt_adapter_v1
+QMT Adapter bridge is ready: \\.\pipe\qmt_adapter
 ```
 
 短加载器只在策略启动时读取和编译一次
@@ -254,6 +253,8 @@ with QmtClient(config_path=CONFIG_PATH, client_id="my-strategy") as client:
 ```
 
 离开 `with` 代码块时自动关闭命名管道连接。
+每条命名管道连接只在建立时握手一次；同一客户端后续调用不会重复握手。
+对已经连接的客户端重复调用 `connect()` 会直接返回客户端自身。
 
 也可以手动管理：
 
@@ -1011,6 +1012,10 @@ except QmtAdapterError as exc:
 | `ConnectionClosed` | 命名管道连接已经关闭 |
 | `QmtAdapterError` | 上述适配器异常的基类 |
 
+当Bridge生成的UTF-8 JSON响应超过 `max_message_size` 时，连接保持可用，并返回
+`RemoteError(code="RESPONSE_TOO_LARGE")`；异常 `data` 中包含当前上限和响应实际
+编码字节数。客户端待发送请求超过上限时会在写入管道前直接抛出 `ValueError`。
+
 重要规则：下单请求一旦跨过 `passorder` 调用边界，连接断开、超时或
 `COMMAND_UNCERTAIN` 都不能证明委托没有提交。Bridge 不会自动重下不确定命令。
 先查询原 `client_order_id`；若重试下单，只能使用原 ID 和完全相同的委托参数。
@@ -1026,6 +1031,7 @@ except QmtAdapterError as exc:
 - 旧版 `orders` 表会在 QMT Bridge 启动时自动增加并回填 `payload_hash`；
 - 当前管道服务只允许一个活动客户端连接；
 - 单个同步或异步客户端也只允许一条请求在途；
+- 单条UTF-8 JSON消息默认上限为5 MiB，响应超限返回结构化错误且不关闭连接；
 - 正常断开后，服务端会重新创建管道并接受下一次连接；
 - QMT账户、持仓、普通行情、成交、发行数据、申购额度、普通下单、逆回购、
   申购、算法下单和撤单命令在QMT主线程的定时器中执行；

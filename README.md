@@ -16,10 +16,10 @@
 
 - 股票账户查询；
 - 股票持仓查询；
-- 单只及批量证券行情查询，可选返回QMT原始行情；
+- 单只及批量证券行情查询（可选返回QMT原始行情）；
 - 普通现金账户股票买入和卖出；
 - 北交所普通股票委托（买入不少于100股，之后可按1股递增）；
-- 按指定时间间隔串行批量下单；
+- 指定时间间隔串行批量下单；
 - 沪深北交易所原生股票市价申报（按各市场支持的申报类型校验）；
 - 沪深交易所国债逆回购；
 - 当日新股、新债发行信息及账户申购额度查询；
@@ -29,34 +29,31 @@
 - 由QMT委托/成交回报驱动的单笔和批量委托状态等待；
 - 按盘口流动性拆分并按固定间隔提交大额股票委托，支持预览、提交、查询和撤单。
 
-## 文件说明
-
-- `qmt_side/qmt_adapter_qmt.py`：由部署命令更新到固定目录的大 QMT 端完整脚本。
-- `qmt_adapter/`：外部同步客户端和 asyncio 客户端，均不依赖或导入 QMT 模块。
-- `scripts/query_account.py`：只读的账户和持仓验证脚本。
-- `scripts/place_stock_order.py`：需要显式确认字符串的单笔真实下单脚本；它不会判断
-  当前账号是否为模拟账户，完成只读验证前不要使用。
-- `scripts/stress_test_calls.py`：只读的同步/异步调用耗时对比脚本。
-- `scripts/stress_test_orders.py`：会真实连续提交50笔委托的压力测试脚本，不是单元测试。
-- `scripts/qmt_l2_probe_qmt.py`：独立的只读大QMT L2能力探针，不属于Adapter运行组件。
-- `docs/`：完整函数调用说明和算法委托设计文档。
-- 默认部署根目录：`C:\QMTAdapter`，不依赖券商软件的安装目录。
-
 ## 安装与部署
 
-当前仓库可以作为 Python 包安装到虚拟环境：
+### 1. 安装外部 Python 库
+
+克隆仓库，在仓库根目录创建虚拟环境并安装：
 
 ```powershell
+git clone https://github.com/fzyxh/QMTAdapter.git
+Set-Location QMTAdapter
+python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e .
 ```
 
-首次部署时提供股票资金账号：
+`qmt_adapter` 安装在该虚拟环境中。外部策略通过它调用大 QMT，不需要导入 QMT
+Python 模块。
+
+### 2. 生成配置和 QMT 端脚本
+
+首次部署时传入股票资金账号：
 
 ```powershell
 .\.venv\Scripts\qmt-adapter.exe deploy --account-id YOUR_ACCOUNT_ID
 ```
 
-命令会创建：
+部署及 QMT 策略首次启动后使用以下目录：
 
 ```text
 C:\QMTAdapter\
@@ -69,35 +66,57 @@ C:\QMTAdapter\
     └── bridge.db-shm
 ```
 
-以上均为与券商软件安装目录无关的绝对路径。部署命令首次创建
-`C:\QMTAdapter\config\bridge_config.json` 并生成随机鉴权令牌；配置中的
-`db_path` 固定为 `C:\QMTAdapter\data\bridge.db`。数据库不会由部署命令预先
-创建，而是在 QMT Bridge 第一次启动时创建。启用 WAL 后，SQLite 运行期间还可能
-生成同目录的 `bridge.db-wal` 和 `bridge.db-shm`。
+部署目录固定为 `C:\QMTAdapter`，与券商软件安装目录无关。配置文件和随机鉴权令牌
+在首次部署时生成；SQLite 数据库在 QMT 策略首次启动时创建。单条协议消息默认
+上限为5 MiB。
 
-第一次使用时，在大 QMT“模型交易”中新建一个 Python 策略，把
-`C:\QMTAdapter\qmt_adapter_loader.py` 的完整内容复制进去。该加载器只在模型
-启动时读取并执行一次外部 Bridge 脚本；之后 QMT 直接调用已经加载的函数，
-不会在行情回调、查询或下单时重复读取文件。
+### 3. 在大 QMT 创建并启动策略
 
-升级时再次执行 `qmt-adapter deploy`。命令只更新
-`C:\QMTAdapter\runtime\qmt_adapter_qmt.py` 和加载器，并从旧配置中删除已经废弃的
-`environment` 字段；账号、鉴权令牌、数据库路径以及 `data` 目录中的文件均保持
-不变。更新后停止并重新启动 QMT 策略，使其加载新代码。
+1. 打开大 QMT 的“模型研究”，新建 Python 策略。
 
-## 第一步：验证账户和持仓
+   ![在大 QMT 中创建 QMT_ADAPTER_LOADER 策略](assets/readme/qmt-strategy-list.png)
 
-1. 确认 `C:\QMTAdapter\config\bridge_config.json` 中的账号正确。
-2. 在 QMT 模型交易中启动已经复制短加载器的 Python 策略。
-3. 在本仓库目录中执行：
+2. 将 `C:\QMTAdapter\qmt_adapter_loader.py` 的完整内容复制到策略代码中并保存。
+
+   ![将短加载器复制到大 QMT 策略编辑器](assets/readme/qmt-loader-editor.png)
+
+3. 打开“模型交易”，点击“新建策略交易”，策略类型选择刚才创建的策略。
+4. 账户类型选择“股票账号”，资金账号选择部署时填写的同一账号。
+5. 主图代码可填写 `000300`，运行周期选择“日线”。主图不决定实际交易标的。
+6. 创建后将运行模式切换为“实盘”并启动策略。这里的“实盘”是 QMT 的策略运行
+   模式，不代表所选资金账号一定是真实账户。
+
+   ![在模型交易中使用实盘运行模式启动策略](assets/readme/qmt-trading-mode.png)
+
+7. 确认 QMT 日志出现：
+
+```text
+QMT Adapter bridge is ready: \\.\pipe\qmt_adapter
+```
+
+短加载器只在策略启动时读取一次完整 Bridge，不会在每次查询或下单时重复加载。
+
+### 4. 验证账户和持仓
+
+保持 QMT 策略运行，在仓库根目录执行：
 
 ```powershell
 .\.venv\Scripts\python.exe .\scripts\query_account.py --account-id YOUR_ACCOUNT_ID
 ```
 
-脚本返回Bridge状态、账户资金和标准化持仓。账户项目包含QMT原始字段；持仓默认
-只返回标准字段，需要排查QMT原始持仓对象时可直接调用
-`client.list_positions(account_id, include_raw=True)`。
+能够返回 Bridge 状态、账户资金和持仓即表示部署成功。其他辅助脚本的用途和运行
+方式见 [`scripts/README.md`](scripts/README.md)。
+
+### 5. 升级
+
+安装新版代码后执行：
+
+```powershell
+.\.venv\Scripts\qmt-adapter.exe deploy
+```
+
+该命令更新加载器和 Bridge，不覆盖账号、鉴权令牌及数据库。完成后停止并重新启动
+QMT 策略，使新代码生效。
 
 ## 交易验证
 
@@ -233,10 +252,4 @@ async def main():
 
 
 asyncio.run(main())
-```
-
-只读调用耗时对比：
-
-```powershell
-.\.venv\Scripts\python.exe -u .\scripts\stress_test_calls.py --mode both --command account --count 50 --interval-ms 50
 ```

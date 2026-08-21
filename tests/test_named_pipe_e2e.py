@@ -265,6 +265,7 @@ class BridgeHarness(object):
         self.stop_event = threading.Event()
         self.thread = None
         self.error = None
+        self.runtime = None
 
     def start(self):
         bridge.get_trade_detail_data = self.fake_api.get_trade_detail_data
@@ -284,6 +285,7 @@ class BridgeHarness(object):
         runtime = None
         try:
             runtime = bridge.BridgeRuntime(self.config)
+            self.runtime = runtime
             bridge._RUNTIME = runtime
             runtime.start()
             self.ready.set()
@@ -296,6 +298,7 @@ class BridgeHarness(object):
         finally:
             if runtime is not None:
                 runtime.stop()
+            self.runtime = None
             bridge._RUNTIME = None
 
     def stop(self):
@@ -344,6 +347,7 @@ class NamedPipeEndToEndTests(unittest.TestCase):
         with QmtClient(
             config_path=self.config_path, client_id="named-pipe-e2e"
         ) as client:
+            self.assertIs(client.connect(), client)
             health = client.health()
             self.assertNotIn("environment", health)
             account = client.get_account(ACCOUNT_ID)
@@ -398,6 +402,26 @@ class NamedPipeEndToEndTests(unittest.TestCase):
             self.assertTrue(cancelled["cancel_requested"])
             self.assertEqual(cancelled["order_status"], "CANCEL_PENDING")
             self.assertEqual(len(self.fake_api.cancel_calls), 1)
+
+    def test_oversized_response_is_structured_and_connection_remains_usable(self):
+        with QmtClient(
+            config_path=self.config_path, client_id="oversized-response-e2e"
+        ) as client:
+            self.harness.runtime.pipe.max_message_size = 900
+            client.connection.max_message_size = 900
+            FakePosition.m_strLargePayload = "x" * 2000
+            try:
+                with self.assertRaises(RemoteError) as caught:
+                    client.list_positions(ACCOUNT_ID, include_raw=True)
+            finally:
+                del FakePosition.m_strLargePayload
+
+            self.assertEqual(caught.exception.code, "RESPONSE_TOO_LARGE")
+            self.assertEqual(
+                caught.exception.data["max_message_size"], 900
+            )
+            self.assertGreater(caught.exception.data["encoded_size"], 900)
+            self.assertEqual(client.health()["status"], "OK")
 
     def test_single_and_batch_quote_raw_collection(self):
         with QmtClient(config_path=self.config_path) as client:

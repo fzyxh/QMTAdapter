@@ -32,7 +32,8 @@ CONFIG_PATH = globals().get("QMT_ADAPTER_CONFIG_PATH") or os.environ.get(
 )
 
 PROTOCOL_VERSION = 6
-MAX_MESSAGE_SIZE = 1024 * 1024
+# UTF-8 JSON正文上限，不包含4字节帧长度前缀。
+MAX_MESSAGE_SIZE = 5 * 1024 * 1024
 STRATEGY_NAME = "QMT_ADAPTER_V1"
 _RUNTIME = None
 
@@ -1295,11 +1296,37 @@ class PipeServer(object):
             return False
 
     def _send_direct(self, handle, message):
+        """发送一帧消息；响应过大时改发可关联的结构化错误。"""
         encoded = json.dumps(
             message, ensure_ascii=False, separators=(",", ":")
         ).encode("utf-8")
         if len(encoded) > self.max_message_size:
-            raise BridgeError("PROTOCOL_ERROR", "response is too large")
+            if message.get("type") != "response":
+                raise BridgeError("PROTOCOL_ERROR", "outbound message is too large")
+            encoded_size = len(encoded)
+            message = {
+                "v": PROTOCOL_VERSION,
+                "type": "response",
+                "request_id": message.get("request_id"),
+                "ok": False,
+                "code": "RESPONSE_TOO_LARGE",
+                "result": None,
+                "error": {
+                    "message": "response exceeds max_message_size",
+                    "data": {
+                        "max_message_size": self.max_message_size,
+                        "encoded_size": encoded_size,
+                    },
+                },
+                "server_time": _utc_now_text(),
+            }
+            encoded = json.dumps(
+                message, ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
+            if len(encoded) > self.max_message_size:
+                raise BridgeError(
+                    "PROTOCOL_ERROR", "response-too-large error does not fit"
+                )
         frame = struct.pack(">I", len(encoded)) + encoded
         with self.write_lock:
             self._write_all(handle, frame)
@@ -1895,7 +1922,7 @@ class BridgeRuntime(object):
         )
         self.pipe = PipeServer(
             self,
-            config.get("pipe_name", r"\\.\pipe\qmt_adapter_v1"),
+            config.get("pipe_name", r"\\.\pipe\qmt_adapter"),
             config["auth_token"],
             int(config.get("max_message_size", MAX_MESSAGE_SIZE)),
         )

@@ -19,6 +19,7 @@ from .protocol import (
     ERROR_BROKEN_PIPE,
     ERROR_NO_DATA,
     ERROR_PIPE_NOT_CONNECTED,
+    MAX_MESSAGE_SIZE,
     NamedPipeConnection,
 )
 from .version import __version__
@@ -113,7 +114,7 @@ class QmtClient:
         self.client_id = client_id
         self.connection = NamedPipeConnection(
             self.config["pipe_name"],
-            int(self.config.get("max_message_size", 1024 * 1024)),
+            int(self.config.get("max_message_size", MAX_MESSAGE_SIZE)),
         )
         self.hello: Optional[Dict[str, Any]] = None
 
@@ -124,13 +125,18 @@ class QmtClient:
             timeout: 等待命名管道和握手响应的最长秒数。
 
         Returns:
-            当前客户端自身，因此可使用 ``QmtClient(...).connect()``。
+            当前客户端自身，因此可使用 ``QmtClient(...).connect()``。已经完成
+            握手时重复调用会直接返回，不会再次发送 ``hello``。
 
         Raises:
             RequestTimeout: 在指定时间内无法完成连接。
             RemoteError: Bridge 拒绝鉴权或协议版本不匹配。
             OSError: Windows 命名管道连接失败。
         """
+        if self.connection.is_connected and self.hello is not None:
+            return self
+        if self.connection.is_connected:
+            self.connection.close()
         deadline = time.monotonic() + float(timeout)
         while True:
             remaining = deadline - time.monotonic()
@@ -183,6 +189,7 @@ class QmtClient:
         self.connection.close()
 
     def __enter__(self) -> "QmtClient":
+        """进入上下文时连接Bridge并返回当前客户端。"""
         return self.connect()
 
     def __exit__(
@@ -191,6 +198,7 @@ class QmtClient:
         exc_value: Optional[BaseException],
         traceback: Optional[TracebackType],
     ) -> None:
+        """离开上下文时关闭命名管道连接。"""
         self.close()
 
     def health(self, timeout: float = 5.0) -> Dict[str, Any]:

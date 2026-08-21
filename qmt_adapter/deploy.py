@@ -8,6 +8,8 @@ import secrets
 import tempfile
 from typing import Any, Dict, Iterable, Optional, Union
 
+from .protocol import MAX_MESSAGE_SIZE
+
 
 PathValue = Union[str, os.PathLike]
 
@@ -16,6 +18,9 @@ RUNTIME_RELATIVE_PATH = Path("runtime") / "qmt_adapter_qmt.py"
 CONFIG_RELATIVE_PATH = Path("config") / "bridge_config.json"
 DATABASE_RELATIVE_PATH = Path("data") / "bridge.db"
 LOADER_RELATIVE_PATH = Path("qmt_adapter_loader.py")
+DEFAULT_PIPE_NAME = r"\\.\pipe\qmt_adapter"
+LEGACY_DEFAULT_PIPE_NAME = r"\\.\pipe\qmt_adapter_v1"
+LEGACY_MAX_MESSAGE_SIZE = 1024 * 1024
 
 
 def _atomic_write(path: Path, content: bytes) -> None:
@@ -91,7 +96,7 @@ def _initial_config(account_ids: Iterable[str], db_path: Path) -> Dict[str, Any]
         )
     return {
         "version": 1,
-        "pipe_name": r"\\.\pipe\qmt_adapter_v1",
+        "pipe_name": DEFAULT_PIPE_NAME,
         "auth_token": secrets.token_hex(32),
         "db_path": str(db_path),
         "accounts": normalized_accounts,
@@ -99,16 +104,26 @@ def _initial_config(account_ids: Iterable[str], db_path: Path) -> Dict[str, Any]
         "reconcile_interval_seconds": 5.0,
         "max_commands_per_tick": 20,
         "max_pending_commands": 1000,
-        "max_message_size": 1048576,
+        "max_message_size": MAX_MESSAGE_SIZE,
         "qmt_remark_max_bytes": 64,
     }
 
 
-def _remove_obsolete_environment(config_path: Path) -> None:
+def _migrate_existing_config(config_path: Path) -> None:
+    """迁移项目旧默认值，同时保留用户明确设置的自定义值。"""
     config = json.loads(config_path.read_text(encoding="ascii"))
-    if "environment" not in config:
+    changed = False
+    if "environment" in config:
+        del config["environment"]
+        changed = True
+    if config.get("pipe_name") == LEGACY_DEFAULT_PIPE_NAME:
+        config["pipe_name"] = DEFAULT_PIPE_NAME
+        changed = True
+    if config.get("max_message_size") in (None, LEGACY_MAX_MESSAGE_SIZE):
+        config["max_message_size"] = MAX_MESSAGE_SIZE
+        changed = True
+    if not changed:
         return
-    del config["environment"]
     encoded_config = (json.dumps(config, ensure_ascii=True, indent=2) + "\n").encode(
         "ascii"
     )
@@ -123,7 +138,8 @@ def deploy(
 
     The bridge and loader are replaced atomically on every call. Existing
     account, authentication, database settings and SQLite data are preserved.
-    The obsolete ``environment`` setting is removed from an existing config.
+    Legacy default pipe and message-size settings are migrated; custom values
+    are not overwritten. The obsolete ``environment`` setting is removed.
 
     Args:
         root: Absolute deployment directory. Defaults to ``C:\\QMTAdapter``.
@@ -162,7 +178,7 @@ def deploy(
         _atomic_write(config_path, encoded_config)
         config_created = True
     else:
-        _remove_obsolete_environment(config_path)
+        _migrate_existing_config(config_path)
 
     return {
         "root": install_root,

@@ -76,6 +76,7 @@ class AsyncQmtClient:
             self._executor.shutdown(wait=True)
 
     async def __aenter__(self) -> "AsyncQmtClient":
+        """进入异步上下文时连接Bridge并返回当前客户端。"""
         return await self.connect()
 
     async def __aexit__(
@@ -84,6 +85,7 @@ class AsyncQmtClient:
         exc_value: Optional[BaseException],
         traceback: Optional[TracebackType],
     ) -> None:
+        """离开异步上下文时关闭连接和内部工作线程。"""
         await self.close()
 
     async def health(self, timeout: float = 5.0) -> Dict[str, Any]:

@@ -4,7 +4,8 @@ import runpy
 import tempfile
 import unittest
 
-from qmt_adapter.deploy import deploy
+from qmt_adapter.deploy import DEFAULT_PIPE_NAME, deploy
+from qmt_adapter.protocol import MAX_MESSAGE_SIZE
 
 
 class DeployTests(unittest.TestCase):
@@ -35,6 +36,8 @@ class DeployTests(unittest.TestCase):
             config = json.loads(result["config_path"].read_text(encoding="ascii"))
             self.assertNotIn("environment", config)
             self.assertEqual(config["accounts"][0]["account_id"], "SIM001")
+            self.assertEqual(config["pipe_name"], DEFAULT_PIPE_NAME)
+            self.assertEqual(config["max_message_size"], MAX_MESSAGE_SIZE)
             self.assertEqual(len(config["auth_token"]), 64)
             int(config["auth_token"], 16)
 
@@ -55,12 +58,14 @@ class DeployTests(unittest.TestCase):
             )
             self.assertNotEqual(second["bridge_path"].read_bytes(), b"old-bridge")
 
-    def test_redeploy_removes_obsolete_environment_only(self):
+    def test_redeploy_migrates_legacy_defaults_and_removes_environment(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "QMTAdapter"
             first = deploy(root=root, account_ids=["SIM001"])
             config = json.loads(first["config_path"].read_text(encoding="ascii"))
             config["environment"] = "SIMULATION"
+            config["pipe_name"] = r"\\.\pipe\qmt_adapter_v1"
+            config["max_message_size"] = 1024 * 1024
             first["config_path"].write_text(
                 json.dumps(config, ensure_ascii=True, indent=2) + "\n",
                 encoding="ascii",
@@ -71,8 +76,30 @@ class DeployTests(unittest.TestCase):
             updated = json.loads(second["config_path"].read_text(encoding="ascii"))
             self.assertFalse(second["config_created"])
             self.assertNotIn("environment", updated)
+            self.assertEqual(updated["pipe_name"], DEFAULT_PIPE_NAME)
+            self.assertEqual(updated["max_message_size"], MAX_MESSAGE_SIZE)
             self.assertEqual(updated["accounts"], config["accounts"])
             self.assertEqual(updated["auth_token"], config["auth_token"])
+
+    def test_redeploy_preserves_custom_pipe_and_message_size(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "QMTAdapter"
+            first = deploy(root=root, account_ids=["SIM001"])
+            config = json.loads(first["config_path"].read_text(encoding="ascii"))
+            config["pipe_name"] = r"\\.\pipe\custom_qmt_adapter"
+            config["max_message_size"] = 2 * 1024 * 1024
+            first["config_path"].write_text(
+                json.dumps(config, ensure_ascii=True, indent=2) + "\n",
+                encoding="ascii",
+            )
+
+            deploy(root=root)
+
+            updated = json.loads(first["config_path"].read_text(encoding="ascii"))
+            self.assertEqual(updated["pipe_name"], config["pipe_name"])
+            self.assertEqual(
+                updated["max_message_size"], config["max_message_size"]
+            )
 
     def test_first_deploy_requires_account_id(self):
         with tempfile.TemporaryDirectory() as temp_dir:

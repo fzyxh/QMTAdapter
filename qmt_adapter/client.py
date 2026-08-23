@@ -256,8 +256,8 @@ class QmtClient:
         Returns:
             持仓查询字典。每项的 ``total_quantity`` 是持有股数，
             ``available_quantity`` 是当前可用股数，``frozen_quantity`` 是
-            冻结股数；另含证券代码、成本价、当前价、市值和持仓盈亏。
-            仅当 ``include_raw=True`` 时包含 ``raw``。
+            冻结股数；另含证券代码、证券名称、成本价、当前价、市值和持仓
+            盈亏。仅当 ``include_raw=True`` 时包含 ``raw``。
         """
         include_raw = _validated_include_raw(include_raw)
         return self._request(

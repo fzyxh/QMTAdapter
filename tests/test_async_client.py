@@ -12,6 +12,7 @@ from qmt_adapter import (
     NewIssueSubscriptionRequest,
     OrderRequest,
     ReverseRepoRequest,
+    __version__,
 )
 from qmt_side import qmt_adapter_qmt as bridge
 from tests.test_named_pipe_e2e import (
@@ -29,7 +30,7 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         base = Path(self.temp_dir.name)
         self.config_path = base / "bridge_config.json"
         self.config = {
-            "version": 1,
+            "version": __version__,
             "pipe_name": r"\\.\pipe\qmt_adapter_async_test_%s" % uuid.uuid4().hex,
             "auth_token": uuid.uuid4().hex + uuid.uuid4().hex,
             "db_path": str(base / "bridge.db"),
@@ -74,6 +75,7 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
 
             positions = await client.list_positions(ACCOUNT_ID)
             self.assertEqual(positions["items"][0]["instrument"], "600000.SH")
+            self.assertEqual(positions["items"][0]["instrument_name"], "浦发银行")
 
             quote = await client.get_quote(
                 "600000.SH", include_raw=True, timeout=5

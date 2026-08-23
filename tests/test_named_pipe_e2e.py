@@ -16,6 +16,7 @@ from qmt_adapter import (
     ReverseRepoRequest,
     RequestTimeout,
     ValidationError,
+    __version__,
 )
 from qmt_side import qmt_adapter_qmt as bridge
 
@@ -35,6 +36,7 @@ class FakeAccount(object):
 
 class FakePosition(object):
     m_strInstrumentID = "600000.SH"
+    m_strInstrumentName = "浦发银行"
     m_nVolume = 800
     m_nCanUseVolume = 800
     m_nFrozenVolume = 0
@@ -323,7 +325,7 @@ class NamedPipeEndToEndTests(unittest.TestCase):
         base = Path(self.temp_dir.name)
         self.config_path = base / "bridge_config.json"
         self.config = {
-            "version": 1,
+            "version": __version__,
             "pipe_name": r"\\.\pipe\qmt_adapter_test_%s" % uuid.uuid4().hex,
             "auth_token": uuid.uuid4().hex + uuid.uuid4().hex,
             "db_path": str(base / "bridge.db"),
@@ -381,6 +383,7 @@ class NamedPipeEndToEndTests(unittest.TestCase):
             )
             self.assertEqual(positions["count"], 1)
             self.assertEqual(positions["items"][0]["instrument"], "600000.SH")
+            self.assertEqual(positions["items"][0]["instrument_name"], "浦发银行")
             self.assertEqual(positions["items"][0]["total_quantity"], 800)
             self.assertEqual(positions["items"][0]["available_quantity"], 800)
             self.assertEqual(positions["items"][0]["frozen_quantity"], 0)
@@ -395,6 +398,10 @@ class NamedPipeEndToEndTests(unittest.TestCase):
             self.assertEqual(
                 positions_with_raw["items"][0]["raw"]["m_dMarketValue"],
                 8800.125000000002,
+            )
+            self.assertEqual(
+                positions_with_raw["items"][0]["raw"]["m_strInstrumentName"],
+                "浦发银行",
             )
 
             order = OrderRequest(

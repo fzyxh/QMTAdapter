@@ -1,6 +1,6 @@
 # QMT Adapter 部署与函数调用说明
 
-本文档对应QMTAdapter `0.6.3`、命名管道协议6，说明大 QMT 端脚本的部署方式，
+本文档对应QMTAdapter `0.6.4`、命名管道协议6，说明大 QMT 端脚本的部署方式，
 以及外部封装库的同步、异步函数调用方法。
 
 ## 1. 当前支持范围
@@ -140,7 +140,7 @@ SQLite 启用 WAL 后，运行期间可能在同一目录生成 `bridge.db-wal` 
 
 ```json
 {
-  "version": 1,
+  "version": "0.6.4",
   "pipe_name": "\\\\.\\pipe\\qmt_adapter",
   "auth_token": "由部署命令生成的64位十六进制字符串",
   "db_path": "C:\\QMTAdapter\\data\\bridge.db",
@@ -163,7 +163,7 @@ SQLite 启用 WAL 后，运行期间可能在同一目录生成 `bridge.db-wal` 
 
 | 字段 | 说明 |
 |---|---|
-| `version` | 当前固定为 `1` |
+| `version` | 当前部署的 `qmt-adapter` 包版本；每次执行部署命令时自动更新 |
 | `pipe_name` | 本机 Windows 命名管道名称，外部库必须使用相同配置 |
 | `auth_token` | 部署时随机生成的连接鉴权令牌，外部库和 QMT 端读取同一配置 |
 | `db_path` | QMT 端委托持久化 SQLite 文件路径 |
@@ -175,8 +175,8 @@ SQLite 启用 WAL 后，运行期间可能在同一目录生成 `bridge.db-wal` 
 | `max_message_size` | 单个管道消息最大字节数，默认5 MiB；响应超限时返回 `RESPONSE_TOO_LARGE` |
 | `qmt_remark_max_bytes` | 传入 QMT 的委托备注最大字节数 |
 
-配置中的 `version: 1` 是配置文件格式版本，不是Python包版本或命名管道协议版本。
-包版本由 `qmt_adapter.__version__` 返回，当前协议版本为6。
+配置中的 `version` 与 `qmt_adapter.__version__` 一致，表示写入当前 QMT
+部署目录的包版本；它不是命名管道协议版本，当前协议版本为6。
 
 ### 3.3 创建并运行 QMT 策略
 
@@ -216,8 +216,9 @@ QMT 自动调用以下入口，不需要外部程序直接调用：
 .\.venv\Scripts\qmt-adapter.exe deploy
 ```
 
-部署命令会原子替换完整 Bridge 和加载器，但不会覆盖
-`C:\QMTAdapter\config` 与 `C:\QMTAdapter\data` 下的配置、数据库或 WAL 文件。
+部署命令会原子替换完整 Bridge 和加载器，并把配置中的 `version` 更新为
+当前包版本；其余用户配置以及 `C:\QMTAdapter\data` 下的数据库或 WAL 文件
+保持不变。
 随后停止并重新启动 QMT 策略即可加载新代码，不需要再次把完整 Bridge 复制进 QMT。
 
 ## 4. 外部库使用准备
@@ -369,6 +370,7 @@ result = client.list_positions(
     "account_id": "YOUR_ACCOUNT_ID",
     "account_type": "STOCK",
     "instrument": "601919.SH",
+    "instrument_name": "中远海控",
     "total_quantity": 1000,
     "available_quantity": 800,
     "frozen_quantity": 200,
@@ -383,7 +385,8 @@ result = client.list_positions(
 可用股数，`frozen_quantity` 是冻结股数。当天买入、挂出卖单或其他
 冻结情况下，持有股数与可用股数可能不同。
 
-字段分别来自大 QMT 持仓对象的 `m_nVolume`、`m_nCanUseVolume`、
+`instrument_name` 来自大 QMT 持仓对象的 `m_strInstrumentName`；QMT 未返回
+名称时该字段为 `null`。其余字段分别来自 `m_nVolume`、`m_nCanUseVolume`、
 `m_nFrozenVolume`、`m_dOpenPrice`、`m_dLastPrice`、`m_dMarketValue` 和
 `m_dPositionProfit`。默认不返回 QMT 原始对象；调试时可设置
 `include_raw=True`。四个规范化小数字段统一使用四舍五入并固定输出三位

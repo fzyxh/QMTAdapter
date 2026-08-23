@@ -9,6 +9,7 @@ import tempfile
 from typing import Any, Dict, Iterable, Optional, Union
 
 from .protocol import MAX_MESSAGE_SIZE
+from .version import __version__
 
 
 PathValue = Union[str, os.PathLike]
@@ -95,7 +96,7 @@ def _initial_config(account_ids: Iterable[str], db_path: Path) -> Dict[str, Any]
             "--account-id is required when bridge_config.json does not exist"
         )
     return {
-        "version": 1,
+        "version": __version__,
         "pipe_name": DEFAULT_PIPE_NAME,
         "auth_token": secrets.token_hex(32),
         "db_path": str(db_path),
@@ -110,9 +111,12 @@ def _initial_config(account_ids: Iterable[str], db_path: Path) -> Dict[str, Any]
 
 
 def _migrate_existing_config(config_path: Path) -> None:
-    """迁移项目旧默认值，同时保留用户明确设置的自定义值。"""
+    """更新部署版本并迁移旧默认值，保留用户明确设置的配置。"""
     config = json.loads(config_path.read_text(encoding="ascii"))
     changed = False
+    if config.get("version") != __version__:
+        config["version"] = __version__
+        changed = True
     if "environment" in config:
         del config["environment"]
         changed = True
@@ -138,6 +142,7 @@ def deploy(
 
     The bridge and loader are replaced atomically on every call. Existing
     account, authentication, database settings and SQLite data are preserved.
+    The configuration's ``version`` is updated to the deployed package version.
     Legacy default pipe and message-size settings are migrated; custom values
     are not overwritten. The obsolete ``environment`` setting is removed.
 

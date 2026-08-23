@@ -1,6 +1,6 @@
 {
-  "version": 1,
-  "pipe_name": "\\\\.\\pipe\\qmt_adapter_v1",
+  "version": "0.6.4",
+  "pipe_name": "\\\\.\\pipe\\qmt_adapter",
   "auth_token": "replace-with-a-random-64-character-hex-token",
   "db_path": "C:\\QMTAdapter\\data\\bridge.db",
   "accounts": [
@@ -13,6 +13,6 @@
   "reconcile_interval_seconds": 5.0,
   "max_commands_per_tick": 20,
   "max_pending_commands": 1000,
-  "max_message_size": 1048576,
+  "max_message_size": 5242880,
   "qmt_remark_max_bytes": 64
 }

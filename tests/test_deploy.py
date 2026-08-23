@@ -6,6 +6,7 @@ import unittest
 
 from qmt_adapter.deploy import DEFAULT_PIPE_NAME, deploy
 from qmt_adapter.protocol import MAX_MESSAGE_SIZE
+from qmt_adapter.version import __version__
 
 
 class DeployTests(unittest.TestCase):
@@ -35,24 +36,39 @@ class DeployTests(unittest.TestCase):
 
             config = json.loads(result["config_path"].read_text(encoding="ascii"))
             self.assertNotIn("environment", config)
+            self.assertEqual(config["version"], __version__)
             self.assertEqual(config["accounts"][0]["account_id"], "SIM001")
             self.assertEqual(config["pipe_name"], DEFAULT_PIPE_NAME)
             self.assertEqual(config["max_message_size"], MAX_MESSAGE_SIZE)
             self.assertEqual(len(config["auth_token"]), 64)
             int(config["auth_token"], 16)
 
-    def test_redeploy_preserves_config_and_database(self):
+    def test_redeploy_updates_version_and_preserves_config_and_database(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "QMTAdapter"
             first = deploy(root=root, account_ids=["SIM001"])
-            original_config = first["config_path"].read_bytes()
+            original_config = json.loads(
+                first["config_path"].read_text(encoding="ascii")
+            )
+            original_config["version"] = "0.1.0"
+            first["config_path"].write_text(
+                json.dumps(original_config, ensure_ascii=True, indent=2) + "\n",
+                encoding="ascii",
+            )
             first["database_path"].write_bytes(b"database-sentinel")
             first["bridge_path"].write_bytes(b"old-bridge")
 
             second = deploy(root=root, account_ids=["IGNORED"])
 
             self.assertFalse(second["config_created"])
-            self.assertEqual(second["config_path"].read_bytes(), original_config)
+            updated_config = json.loads(
+                second["config_path"].read_text(encoding="ascii")
+            )
+            self.assertEqual(updated_config["version"], __version__)
+            self.assertEqual(
+                {key: value for key, value in updated_config.items() if key != "version"},
+                {key: value for key, value in original_config.items() if key != "version"},
+            )
             self.assertEqual(
                 second["database_path"].read_bytes(), b"database-sentinel"
             )
@@ -63,6 +79,7 @@ class DeployTests(unittest.TestCase):
             root = Path(temp_dir) / "QMTAdapter"
             first = deploy(root=root, account_ids=["SIM001"])
             config = json.loads(first["config_path"].read_text(encoding="ascii"))
+            config["version"] = 1
             config["environment"] = "SIMULATION"
             config["pipe_name"] = r"\\.\pipe\qmt_adapter_v1"
             config["max_message_size"] = 1024 * 1024
@@ -75,6 +92,7 @@ class DeployTests(unittest.TestCase):
 
             updated = json.loads(second["config_path"].read_text(encoding="ascii"))
             self.assertFalse(second["config_created"])
+            self.assertEqual(updated["version"], __version__)
             self.assertNotIn("environment", updated)
             self.assertEqual(updated["pipe_name"], DEFAULT_PIPE_NAME)
             self.assertEqual(updated["max_message_size"], MAX_MESSAGE_SIZE)

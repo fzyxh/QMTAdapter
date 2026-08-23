@@ -45,7 +45,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if result["config_created"]:
         print("Config created: %s" % result["config_path"])
     else:
-        print("Config preserved: %s" % result["config_path"])
+        print("Config updated: %s" % result["config_path"])
     print(
         "Database is created by QMT on first bridge startup: %s"
         % result["database_path"]

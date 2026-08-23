@@ -738,6 +738,9 @@ def _normalize_position(raw, configured_account_id, include_raw=False):
         "account_id": configured_account_id,
         "account_type": "STOCK",
         "instrument": _normalized_instrument(raw),
+        "instrument_name": (
+            str(raw.get("m_strInstrumentName") or "").strip() or None
+        ),
         "total_quantity": _raw_integer(raw, "m_nVolume"),
         "available_quantity": _raw_integer(raw, "m_nCanUseVolume"),
         "frozen_quantity": _raw_integer(raw, "m_nFrozenVolume"),

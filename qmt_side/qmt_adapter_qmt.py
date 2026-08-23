@@ -1101,6 +1101,11 @@ class PipeServer(object):
     PIPE_READMODE_BYTE = 0x00000000
     PIPE_WAIT = 0x00000000
     PIPE_REJECT_REMOTE_CLIENTS = 0x00000008
+    GENERIC_READ = 0x80000000
+    GENERIC_WRITE = 0x40000000
+    OPEN_EXISTING = 3
+    START_TIMEOUT_SECONDS = 5.0
+    STOP_TIMEOUT_SECONDS = 5.0
     ERROR_BROKEN_PIPE = 109
     ERROR_NO_DATA = 232
     ERROR_PIPE_CONNECTED = 535
@@ -1118,6 +1123,8 @@ class PipeServer(object):
         self.current_connection_id = 0
         self.authenticated_connection_id = None
         self.server_thread = None
+        self.startup_event = threading.Event()
+        self.startup_error = None
         self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         self._declare_api()
 
@@ -1134,6 +1141,16 @@ class PipeServer(object):
             wintypes.LPVOID,
         ]
         k32.CreateNamedPipeW.restype = wintypes.HANDLE
+        k32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        k32.CreateFileW.restype = wintypes.HANDLE
         k32.ConnectNamedPipe.argtypes = [wintypes.HANDLE, wintypes.LPVOID]
         k32.ConnectNamedPipe.restype = wintypes.BOOL
         k32.DisconnectNamedPipe.argtypes = [wintypes.HANDLE]
@@ -1169,9 +1186,35 @@ class PipeServer(object):
         )
         self.server_thread.daemon = True
         self.server_thread.start()
+        if not self.startup_event.wait(self.START_TIMEOUT_SECONDS):
+            self.stop()
+            raise BridgeError(
+                "PIPE_START_TIMEOUT", "named pipe server did not become ready"
+            )
+        if self.startup_error is not None:
+            thread = self.server_thread
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(self.STOP_TIMEOUT_SECONDS)
+            self.server_thread = None
+            raise BridgeError("PIPE_START_FAILED", self.startup_error)
 
     def stop(self):
         self.stop_event.set()
+        thread = self.server_thread
+        if thread is None:
+            return
+        if thread.is_alive():
+            wake_handle = self.kernel32.CreateFileW(
+                self.pipe_name,
+                self.GENERIC_READ | self.GENERIC_WRITE,
+                0,
+                None,
+                self.OPEN_EXISTING,
+                0,
+                None,
+            )
+            if wake_handle != self.INVALID_HANDLE_VALUE:
+                self.kernel32.CloseHandle(wake_handle)
         with self.handle_lock:
             handle = self.current_handle
             self.current_handle = None
@@ -1181,6 +1224,13 @@ class PipeServer(object):
                 self.kernel32.CancelIoEx(handle, None)
             self.kernel32.DisconnectNamedPipe(handle)
             self.kernel32.CloseHandle(handle)
+        if thread is not threading.current_thread():
+            thread.join(self.STOP_TIMEOUT_SECONDS)
+            if thread.is_alive():
+                raise BridgeError(
+                    "PIPE_STOP_TIMEOUT", "named pipe server thread did not stop"
+                )
+        self.server_thread = None
 
     def _server_loop(self):
         while not self.stop_event.is_set():
@@ -1198,15 +1248,21 @@ class PipeServer(object):
                 None,
             )
             if handle == self.INVALID_HANDLE_VALUE:
-                self.runtime.set_error(
-                    "CreateNamedPipeW failed: %s" % ctypes.WinError(ctypes.get_last_error())
+                error = "CreateNamedPipeW failed: %s" % ctypes.WinError(
+                    ctypes.get_last_error()
                 )
+                if not self.startup_event.is_set():
+                    self.startup_error = error
+                    self.startup_event.set()
+                self.runtime.set_error(error)
                 return
             with self.handle_lock:
                 self.current_connection_id += 1
                 connection_id = self.current_connection_id
                 self.current_handle = handle
                 self.authenticated_connection_id = None
+            if not self.startup_event.is_set():
+                self.startup_event.set()
             try:
                 connected = self.kernel32.ConnectNamedPipe(handle, None)
                 if not connected and ctypes.get_last_error() != self.ERROR_PIPE_CONNECTED:

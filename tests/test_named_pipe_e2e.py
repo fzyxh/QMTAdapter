@@ -843,7 +843,15 @@ class NamedPipeEndToEndTests(unittest.TestCase):
             for index in range(3)
         ]
 
+        client_call_times = []
         with QmtClient(config_path=self.config_path) as client:
+            original_place_order = client.place_order
+
+            def timed_place_order(*args, **kwargs):
+                client_call_times.append(time.monotonic())
+                return original_place_order(*args, **kwargs)
+
+            client.place_order = timed_place_order
             receipts = client.place_orders(
                 orders,
                 interval_ms=50,
@@ -859,8 +867,8 @@ class NamedPipeEndToEndTests(unittest.TestCase):
         gaps = [
             later - earlier
             for earlier, later in zip(
-                self.fake_api.passorder_call_times,
-                self.fake_api.passorder_call_times[1:],
+                client_call_times,
+                client_call_times[1:],
             )
         ]
         self.assertTrue(all(gap >= 0.04 for gap in gaps), gaps)
@@ -1056,7 +1064,9 @@ class NamedPipeEndToEndTests(unittest.TestCase):
         with QmtClient(config_path=self.config_path) as client:
             first = client.place_order(order, wait_for="BROKER_ID", timeout=5)
 
+        pipe_thread = self.harness.runtime.pipe.server_thread
         self.harness.stop()
+        self.assertFalse(pipe_thread.is_alive())
         self.harness = BridgeHarness(self.config, self.fake_api)
         self.harness.start()
 
@@ -1066,6 +1076,17 @@ class NamedPipeEndToEndTests(unittest.TestCase):
         self.assertEqual(first.qmt_order_id, replay.qmt_order_id)
         self.assertTrue(replay.idempotent_replay)
         self.assertEqual(len(self.fake_api.passorder_calls), 1)
+
+    def test_duplicate_bridge_start_reports_pipe_binding_error(self):
+        duplicate = BridgeHarness(self.config, self.fake_api)
+
+        with self.assertRaises(bridge.BridgeError) as caught:
+            duplicate.start()
+
+        duplicate.thread.join(5)
+        self.assertFalse(duplicate.thread.is_alive())
+        self.assertEqual(caught.exception.code, "PIPE_START_FAILED")
+        self.assertIn("CreateNamedPipeW failed", str(caught.exception))
 
     def test_uncertain_order_is_not_resubmitted(self):
         self.fake_api.raise_passorder = True

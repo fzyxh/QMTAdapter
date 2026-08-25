@@ -1,6 +1,6 @@
 # QMT Adapter 部署与函数调用说明
 
-本文档对应QMTAdapter `0.6.4`、命名管道协议6，说明大 QMT 端脚本的部署方式，
+本文档对应QMTAdapter `0.6.5`、命名管道协议6，说明大 QMT 端脚本的部署方式，
 以及外部封装库的同步、异步函数调用方法。
 
 ## 1. 当前支持范围
@@ -140,7 +140,7 @@ SQLite 启用 WAL 后，运行期间可能在同一目录生成 `bridge.db-wal` 
 
 ```json
 {
-  "version": "0.6.4",
+  "version": "0.6.5",
   "pipe_name": "\\\\.\\pipe\\qmt_adapter",
   "auth_token": "由部署命令生成的64位十六进制字符串",
   "db_path": "C:\\QMTAdapter\\data\\bridge.db",
@@ -299,10 +299,12 @@ result = client.health(timeout=5.0)
 
 | 字段 | 说明 |
 |---|---|
-| `status` | `OK` 或 `DEGRADED` |
+| `status` | `OK` 或 `DEGRADED`；只由管道、主循环、持久化和对账等基础设施错误决定 |
 | `configured_accounts` | 配置的账号白名单 |
 | `pending_commands` | 等待QMT主线程处理的命令数 |
-| `last_error` | Bridge最近一次错误 |
+| `last_error` | Bridge最近一次错误，包括请求处理错误和基础设施错误 |
+| `last_request_error` | 最近一次未预期的请求处理错误；不改变 `status` |
+| `health_error` | 最近一次影响整体健康状态的基础设施错误 |
 | `timer_interval_median_ms` | QMT命令定时器间隔中位数 |
 
 ### 5.4 get_account
@@ -390,7 +392,8 @@ result = client.list_positions(
 `m_nFrozenVolume`、`m_dOpenPrice`、`m_dLastPrice`、`m_dMarketValue` 和
 `m_dPositionProfit`。默认不返回 QMT 原始对象；调试时可设置
 `include_raw=True`。四个规范化小数字段统一使用四舍五入并固定输出三位
-小数；`raw` 中的 QMT 原始数值不执行该舍入。
+小数；非有限值或无法按三位小数表示的极大有限占位值返回 `null`，`raw`
+中的 QMT 原始数值不执行该舍入。
 
 ### 5.6 get_quote 和 get_quotes
 

@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
 import threading
 import time
@@ -44,6 +45,19 @@ class FakePosition(object):
     m_dLastPrice = 11.0
     m_dMarketValue = 8800.125000000002
     m_dPositionProfit = 600.1250000000001
+
+
+class FakeSentinelPosition(object):
+    m_strInstrumentID = "131990"
+    m_strExchangeID = "SZ"
+    m_strInstrumentName = "national-standard-bond"
+    m_nVolume = 4420
+    m_nCanUseVolume = 4420
+    m_nFrozenVolume = 0
+    m_dOpenPrice = 0.0
+    m_dLastPrice = sys.float_info.max
+    m_dMarketValue = float("inf")
+    m_dPositionProfit = 0.0
 
 
 class FakeOrder(object):
@@ -120,6 +134,8 @@ class FakeQmtApi(object):
     def __init__(self):
         self.orders = []
         self.trades = []
+        self.positions = [FakePosition()]
+        self.position_query_error = None
         self.passorder_calls = []
         self.passorder_call_times = []
         self.cancel_calls = []
@@ -189,7 +205,9 @@ class FakeQmtApi(object):
         if detail_type == "ACCOUNT":
             return [FakeAccount()]
         if detail_type == "POSITION":
-            return [FakePosition()]
+            if self.position_query_error is not None:
+                raise self.position_query_error
+            return list(self.positions)
         if detail_type == "ORDER":
             return list(self.orders) if self.return_orders_for_reconcile else []
         if detail_type == "DEAL":
@@ -450,6 +468,48 @@ class NamedPipeEndToEndTests(unittest.TestCase):
             )
             self.assertGreater(caught.exception.data["encoded_size"], 900)
             self.assertEqual(client.health()["status"], "OK")
+
+    def test_extreme_position_value_is_normalized_without_losing_raw_value(self):
+        self.fake_api.positions.append(FakeSentinelPosition())
+
+        with QmtClient(config_path=self.config_path) as client:
+            positions = client.list_positions(ACCOUNT_ID, include_raw=True)
+
+        sentinel = next(
+            item for item in positions["items"] if item["instrument"] == "131990.SZ"
+        )
+        self.assertIsNone(sentinel["current_price"])
+        self.assertIsNone(sentinel["market_value"])
+        self.assertEqual(sentinel["raw"]["m_dLastPrice"], sys.float_info.max)
+        self.assertIsNone(sentinel["raw"]["m_dMarketValue"])
+
+    def test_request_error_does_not_degrade_infrastructure_health(self):
+        self.fake_api.position_query_error = RuntimeError(
+            "simulated position conversion failure"
+        )
+
+        with QmtClient(config_path=self.config_path) as client:
+            with self.assertRaises(RemoteError) as caught:
+                client.list_positions(ACCOUNT_ID)
+
+            self.assertEqual(caught.exception.code, "INTERNAL_ERROR")
+            health = client.health()
+            self.assertEqual(health["status"], "OK")
+            self.assertIn("simulated position conversion failure", health["last_error"])
+            self.assertEqual(health["last_request_error"], health["last_error"])
+            self.assertEqual(health["health_error"], "")
+
+            self.harness.runtime.set_error("simulated infrastructure failure")
+            degraded = client.health()
+            self.assertEqual(degraded["status"], "DEGRADED")
+            self.assertEqual(
+                degraded["health_error"], "simulated infrastructure failure"
+            )
+            self.assertEqual(degraded["last_error"], degraded["health_error"])
+            self.assertIn(
+                "simulated position conversion failure",
+                degraded["last_request_error"],
+            )
 
     def test_single_and_batch_quote_raw_collection(self):
         with QmtClient(config_path=self.config_path) as client:

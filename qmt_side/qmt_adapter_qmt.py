@@ -830,9 +830,14 @@ def _optional_three_decimal_text(value):
     text = _optional_decimal_text(value)
     if text is None:
         return None
-    number = decimal.Decimal(text).quantize(
-        decimal.Decimal("0.001"), rounding=decimal.ROUND_HALF_UP
-    )
+    try:
+        number = decimal.Decimal(text).quantize(
+            decimal.Decimal("0.001"), rounding=decimal.ROUND_HALF_UP
+        )
+    except decimal.DecimalException:
+        return None
+    if not number.is_finite():
+        return None
     return format(number, ".3f")
 
 
@@ -1977,6 +1982,8 @@ class BridgeRuntime(object):
         self.pending_broker_lock = threading.Lock()
         self.connected = False
         self.last_error = ""
+        self.last_request_error = ""
+        self.health_error = ""
         self.last_reconcile = 0.0
         self.last_algo_scan = 0.0
         self.algo_cancel_attempts = {}
@@ -2028,7 +2035,13 @@ class BridgeRuntime(object):
 
     def set_error(self, value):
         self.last_error = str(value)
+        self.health_error = self.last_error
         print("QMT Adapter: %s" % self.last_error)
+
+    def set_request_error(self, value):
+        self.last_error = str(value)
+        self.last_request_error = self.last_error
+        print("QMT Adapter request error: %s" % self.last_request_error)
 
     def hello_response(self, message):
         return {
@@ -2345,7 +2358,7 @@ class BridgeRuntime(object):
                 "code": "INTERNAL_ERROR",
                 "message": "%s: %s" % (type(exc).__name__, exc),
             }
-            self.set_error(traceback.format_exc())
+            self.set_request_error(traceback.format_exc())
             return self._error_response(message, "INTERNAL_ERROR", error["message"])
 
     def _dispatch(self, command, payload, request_id, context_info):
@@ -2401,11 +2414,13 @@ class BridgeRuntime(object):
             tick_min_ms = None
             tick_max_ms = None
         return {
-            "status": "OK" if not self.last_error else "DEGRADED",
+            "status": "OK" if not self.health_error else "DEGRADED",
             "connected": self.connected,
             "configured_accounts": list(self.accounts.values()),
             "pending_commands": self.inbound.qsize(),
             "last_error": self.last_error,
+            "last_request_error": self.last_request_error,
+            "health_error": self.health_error,
             "started_at": self.started_at,
             "timer_tick_count": tick_count,
             "timer_interval_median_ms": tick_median_ms,

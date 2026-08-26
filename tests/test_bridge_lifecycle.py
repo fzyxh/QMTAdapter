@@ -56,12 +56,25 @@ class BridgeLifecycleTests(unittest.TestCase):
             setattr(builtins, bridge._RUNTIME_SLOT, self.original_slot)
 
     def _patched_init(self, context, runtime_class=FakeRuntime):
+        output = io.StringIO()
         with patch.object(bridge, "BridgeRuntime", runtime_class), patch.object(
             bridge,
             "_load_config",
-            return_value={"pipe_name": "audit", "timer_period": "10nMilliSecond"},
-        ), redirect_stdout(io.StringIO()):
+            return_value={
+                "pipe_name": "audit",
+                "timer_period": "10nMilliSecond",
+                "version": "9.8.7",
+            },
+        ), redirect_stdout(output):
             bridge.init(context)
+        return output.getvalue()
+
+    def test_successful_start_logs_deployed_version(self):
+        output = self._patched_init(WorkingContext())
+
+        self.assertIn(
+            "QMT Adapter bridge [v9.8.7] is ready: audit", output
+        )
 
     def test_set_account_failure_cleans_runtime_and_allows_retry(self):
         class FailingContext(WorkingContext):

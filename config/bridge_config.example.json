@@ -1,5 +1,5 @@
 {
-  "version": "0.6.5",
+  "version": "0.7.0",
   "pipe_name": "\\\\.\\pipe\\qmt_adapter",
   "auth_token": "replace-with-a-random-64-character-hex-token",
   "db_path": "C:\\QMTAdapter\\data\\bridge.db",

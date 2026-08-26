@@ -17,6 +17,8 @@
 - 股票账户查询；
 - 股票持仓查询；
 - 单只及批量证券行情查询（可选返回QMT原始行情）；
+- 大QMT板块成分、股票/ETF/转债等证券的批量合约详情及历史日线查询；
+- 历史日线提供不随查询起点变化的每日累计复权因子；
 - 普通现金账户股票买入和卖出；
 - 北交所普通股票委托（买入不少于100股，之后可按1股递增）；
 - 指定时间间隔串行批量下单；
@@ -132,7 +134,7 @@ C:\QMTAdapter\
 7. 确认 QMT 日志出现：
 
 ```text
-QMT Adapter bridge is ready: \\.\pipe\qmt_adapter
+QMT Adapter bridge [vx.x.x] is ready: \\.\pipe\qmt_adapter
 ```
 
 短加载器只在策略启动时读取一次完整 Bridge，不会在每次查询或下单时重复加载。
@@ -146,6 +148,35 @@ QMT Adapter bridge is ready: \\.\pipe\qmt_adapter
 ```
 
 能够返回 Bridge 状态、账户资金和持仓即表示部署成功。从源码安装时，其他辅助脚本的用途和运行方式见 [`scripts/README.md`](scripts/README.md)。
+
+历史日线通过大QMT模型上下文读取，不需要在外部Python中导入 `xtquant`。长时间范围
+请拆成较小证券批次，避免超过单条5 MiB消息上限：
+
+```python
+from qmt_adapter import QmtClient
+
+
+with QmtClient() as client:
+    instruments = client.list_sector_instruments("沪深A股")["items"]
+    history = client.get_daily_history(
+        instruments[:10],
+        start_time="20260101",
+        end_time="20260821",
+        subscribe=True,
+        timeout=60.0,
+        include_raw=False,
+    )
+```
+
+`subscribe=False` 时，`get_daily_history()` 只读取大QMT本地已有历史数据；
+设置为 `True` 时由大QMT按自身规则订阅并尝试补充请求的数据。实测订阅可以补充
+最近多日日线，但不保证补齐任意长区间；需要完整的长区间数据时，应先在大QMT
+客户端完成对应日线下载。
+
+`get_daily_history()` 固定返回全部标准日线字段；设置 `include_raw=True` 才会
+额外附带QMT未复权原始列。标准字段中的 `adjustment_factor` 是截至对应交易日的
+完整历史累计复权因子，不随查询起点变化，最多保留六位小数；调用方不需要选择
+或处理辅助行情列。
 
 ### 5. 升级
 

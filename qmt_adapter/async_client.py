@@ -148,6 +148,56 @@ class AsyncQmtClient:
             include_raw=include_raw,
         )
 
+    async def list_sector_instruments(
+        self,
+        sector_name: str,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """异步查询板块成分；参数和返回值同同步客户端同名方法。"""
+        return await self._call(
+            self._client.list_sector_instruments,
+            sector_name,
+            timeout=timeout,
+        )
+
+    async def get_instrument_details(
+        self,
+        instruments: Iterable[str],
+        timeout: float = 10.0,
+        include_raw: bool = False,
+    ) -> Dict[str, Any]:
+        """异步批量查询合约信息；参数和返回值同同步客户端同名方法。"""
+        return await self._call(
+            self._client.get_instrument_details,
+            instruments,
+            timeout=timeout,
+            include_raw=include_raw,
+        )
+
+    async def get_daily_history(
+        self,
+        instruments: Iterable[str],
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+        count: int = -1,
+        fill_data: bool = False,
+        subscribe: bool = False,
+        timeout: float = 30.0,
+        include_raw: bool = False,
+    ) -> Dict[str, Any]:
+        """异步读取历史日线；参数和返回值同同步客户端同名方法。"""
+        return await self._call(
+            self._client.get_daily_history,
+            instruments,
+            start_time=start_time,
+            end_time=end_time,
+            count=count,
+            fill_data=fill_data,
+            subscribe=subscribe,
+            timeout=timeout,
+            include_raw=include_raw,
+        )
+
     async def place_order(
         self,
         order: OrderRequest,

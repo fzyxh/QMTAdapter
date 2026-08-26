@@ -39,6 +39,45 @@ _RUNTIME = None
 
 ALGORITHM_BOOK_LIQUIDITY_WEIGHTED = "BOOK_LIQUIDITY_WEIGHTED"
 RESERVED_EXECUTION_ALGORITHMS = ("TWAP", "VWAP")
+DAILY_HISTORY_FIELD_MAP = {
+    "open_price": "open",
+    "high_price": "high",
+    "low_price": "low",
+    "close_price": "close",
+    "volume_lots": "volume",
+    "turnover_amount": "amount",
+    "settlement_price": "settelementPrice",
+    "open_interest": "openInterest",
+    "previous_close": "preClose",
+    "suspension_status": "suspendFlag",
+}
+DAILY_HISTORY_STANDARD_FIELDS = (
+    "adjustment_factor",
+    "open_price",
+    "high_price",
+    "low_price",
+    "close_price",
+    "volume_lots",
+    "turnover_amount",
+    "settlement_price",
+    "open_interest",
+    "previous_close",
+    "suspension_status",
+)
+DAILY_HISTORY_DECIMAL_FIELDS = {
+    "open_price",
+    "high_price",
+    "low_price",
+    "close_price",
+    "turnover_amount",
+    "settlement_price",
+    "previous_close",
+}
+DAILY_HISTORY_INTEGER_FIELDS = {
+    "volume_lots",
+    "open_interest",
+    "suspension_status",
+}
 ALGO_TERMINAL_STATUSES = ("FILLED", "CANCELED", "FAILED")
 ORDER_TERMINAL_STATUSES = ("FILLED", "CANCELED", "REJECTED")
 ORDER_STATUSES = (
@@ -693,7 +732,307 @@ def _safe_value(value, depth=0):
             str(key): _safe_value(item, depth + 1)
             for key, item in value.items()
         }
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            converted = item()
+            if converted is not value:
+                return _safe_value(converted, depth + 1)
+        except Exception:
+            pass
+    isoformat = getattr(value, "isoformat", None)
+    if callable(isoformat):
+        try:
+            return str(isoformat())
+        except Exception:
+            pass
     return repr(value)
+
+
+def _sequence_values(value, name):
+    tolist = getattr(value, "tolist", None)
+    if callable(tolist):
+        try:
+            result = tolist()
+        except Exception as exc:
+            raise BridgeError(
+                "QMT_DATA_ERROR", "cannot read %s: %s" % (name, exc)
+            )
+    else:
+        try:
+            result = list(value)
+        except Exception as exc:
+            raise BridgeError(
+                "QMT_DATA_ERROR", "cannot read %s: %s" % (name, exc)
+            )
+    if isinstance(result, list):
+        return result
+    try:
+        return list(result)
+    except Exception:
+        raise BridgeError("QMT_DATA_ERROR", "%s is not a sequence" % name)
+
+
+def _normalize_daily_timestamp(value):
+    text = str(_safe_value(value) or "").strip()
+    if re.match(r"^[0-9]{8}$", text):
+        try:
+            return datetime.datetime.strptime(text, "%Y%m%d").date().isoformat()
+        except Exception:
+            pass
+    if re.match(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}", text):
+        try:
+            return datetime.datetime.strptime(text[:10], "%Y-%m-%d").date().isoformat()
+        except Exception:
+            pass
+    raise BridgeError("QMT_DATA_ERROR", "invalid daily history timestamp: %s" % text)
+
+
+def _history_integer(value, field, instrument):
+    safe = _safe_value(value)
+    if safe in (None, ""):
+        return None
+    try:
+        number = decimal.Decimal(str(safe))
+        integer = int(number)
+    except Exception:
+        raise BridgeError(
+            "QMT_DATA_ERROR",
+            "invalid integer history value for %s/%s" % (instrument, field),
+        )
+    if not number.is_finite() or number != integer:
+        raise BridgeError(
+            "QMT_DATA_ERROR",
+            "non-integral history value for %s/%s" % (instrument, field),
+        )
+    return integer
+
+
+def _normalize_history_value(value, field, instrument):
+    if field in DAILY_HISTORY_DECIMAL_FIELDS:
+        safe = _safe_value(value)
+        if safe in (None, ""):
+            return None
+        normalized = _optional_three_decimal_text(safe)
+        if normalized is None:
+            raise BridgeError(
+                "QMT_DATA_ERROR",
+                "invalid decimal history value for %s/%s" % (instrument, field),
+            )
+        return normalized
+    if field in DAILY_HISTORY_INTEGER_FIELDS:
+        return _history_integer(value, field, instrument)
+    raise BridgeError("QMT_DATA_ERROR", "unsupported daily history field: %s" % field)
+
+
+def _history_adjustment_factors(
+    raw_frame, back_ratio_frame, raw_timestamps, instrument
+):
+    """Derive full-history cumulative factors from QMT back-ratio prices."""
+    row_count = len(raw_timestamps)
+    if row_count == 0:
+        return []
+    if back_ratio_frame is None:
+        raise BridgeError(
+            "QMT_DATA_ERROR",
+            "QMT omitted back-ratio history required for adjustment_factor: %s"
+            % instrument,
+        )
+    columns_value = getattr(back_ratio_frame, "columns", None)
+    index_value = getattr(back_ratio_frame, "index", None)
+    if columns_value is None or index_value is None:
+        raise BridgeError(
+            "QMT_DATA_ERROR",
+            "back-ratio history is not a DataFrame-like object: %s" % instrument,
+        )
+    columns = set(
+        str(value)
+        for value in _sequence_values(columns_value, "back-ratio columns")
+    )
+    if "close" not in columns:
+        raise BridgeError(
+            "QMT_DATA_ERROR",
+            "QMT omitted back-ratio close required for adjustment_factor: %s"
+            % instrument,
+        )
+    adjusted_timestamps = [
+        _normalize_daily_timestamp(value)
+        for value in _sequence_values(index_value, "back-ratio history index")
+    ]
+    if adjusted_timestamps != raw_timestamps:
+        raise BridgeError(
+            "QMT_DATA_ERROR",
+            "raw and back-ratio history timestamps do not match: %s" % instrument,
+        )
+    try:
+        cumulative_factor = back_ratio_frame["close"].div(raw_frame["close"])
+    except Exception as exc:
+        raise BridgeError(
+            "QMT_DATA_ERROR",
+            "cannot calculate adjustment_factor for %s: %s" % (instrument, exc),
+        )
+    values = _sequence_values(
+        cumulative_factor, "history field adjustment_factor"
+    )
+    if len(values) != row_count:
+        raise BridgeError(
+            "QMT_DATA_ERROR",
+            "historical field length mismatch for %s: adjustment_factor"
+            % instrument,
+        )
+    normalized = []
+    for value in values:
+        text = _optional_six_decimal_text(_safe_value(value))
+        if text is None or decimal.Decimal(text) <= 0:
+            raise BridgeError(
+                "QMT_DATA_ERROR",
+                "invalid raw/back-ratio close data for %s/adjustment_factor"
+                % instrument,
+            )
+        normalized.append(text)
+    return normalized
+
+
+def _serialize_history_frame(
+    frame, back_ratio_frame, fields, instrument, include_raw=False
+):
+    if frame is None:
+        return {
+            "instrument": instrument,
+            "timestamps": [],
+            "data": dict((field, []) for field in fields),
+            "count": 0,
+        }
+    columns_value = getattr(frame, "columns", None)
+    index_value = getattr(frame, "index", None)
+    if columns_value is None or index_value is None:
+        raise BridgeError(
+            "QMT_DATA_ERROR",
+            "historical data is not a DataFrame-like object: %s" % instrument,
+        )
+    column_names = [
+        str(value) for value in _sequence_values(columns_value, "columns")
+    ]
+    columns = set(column_names)
+    raw_timestamps = _sequence_values(index_value, "history index")
+    timestamps = [_normalize_daily_timestamp(value) for value in raw_timestamps]
+    row_count = len(timestamps)
+    data = {}
+    for field in fields:
+        if field == "adjustment_factor":
+            if "close" not in columns:
+                if row_count:
+                    raise BridgeError(
+                        "QMT_DATA_ERROR",
+                        "QMT omitted raw close required for adjustment_factor: %s"
+                        % instrument,
+                    )
+                data[field] = []
+                continue
+            data[field] = _history_adjustment_factors(
+                frame, back_ratio_frame, timestamps, instrument
+            )
+            continue
+        qmt_field = DAILY_HISTORY_FIELD_MAP[field]
+        if qmt_field not in columns:
+            if row_count:
+                raise BridgeError(
+                    "QMT_DATA_ERROR",
+                    "QMT omitted requested daily history field %s for %s"
+                    % (field, instrument),
+                )
+            data[field] = []
+            continue
+        try:
+            series = frame[qmt_field]
+        except Exception as exc:
+            raise BridgeError(
+                "QMT_DATA_ERROR",
+                "cannot read historical field %s for %s: %s"
+                % (field, instrument, exc),
+            )
+        values = [
+            _normalize_history_value(value, field, instrument)
+            for value in _sequence_values(series, "history field %s" % field)
+        ]
+        if len(values) != row_count:
+            raise BridgeError(
+                "QMT_DATA_ERROR",
+                "historical field length mismatch for %s: %s" % (instrument, field),
+            )
+        data[field] = values
+    result = {
+        "instrument": instrument,
+        "timestamps": timestamps,
+        "data": data,
+        "count": row_count,
+    }
+    if include_raw:
+        raw_data = {}
+        for column in column_names:
+            try:
+                series = frame[column]
+            except Exception as exc:
+                raise BridgeError(
+                    "QMT_DATA_ERROR",
+                    "cannot read raw historical field %s for %s: %s"
+                    % (column, instrument, exc),
+                )
+            values = [
+                _safe_value(value)
+                for value in _sequence_values(
+                    series, "raw history field %s" % column
+                )
+            ]
+            if len(values) != row_count:
+                raise BridgeError(
+                    "QMT_DATA_ERROR",
+                    "raw historical field length mismatch for %s: %s"
+                    % (instrument, column),
+                )
+            raw_data[column] = values
+        result["raw"] = {
+            "timestamps": [_safe_value(value) for value in raw_timestamps],
+            "data": raw_data,
+        }
+    return result
+
+
+def _optional_share_count(value):
+    safe = _safe_value(value)
+    if safe in (None, ""):
+        return None
+    try:
+        number = decimal.Decimal(str(safe))
+        integer = int(number)
+    except Exception:
+        return None
+    if not number.is_finite() or number < 0 or number != integer:
+        return None
+    return integer
+
+
+def _optional_listing_date(value):
+    text = str(_safe_value(value) or "").strip()
+    if not re.match(r"^[0-9]{8}$", text) or text == "00000000":
+        return None
+    try:
+        return datetime.datetime.strptime(text, "%Y%m%d").date().isoformat()
+    except Exception:
+        return None
+
+
+def _normalize_instrument_detail(detail, instrument, include_raw=False):
+    result = {
+        "instrument": instrument,
+        "instrument_name": str(detail.get("InstrumentName") or "").strip() or None,
+        "float_shares": _optional_share_count(detail.get("FloatVolume")),
+        "total_shares": _optional_share_count(detail.get("TotalVolume")),
+        "listing_date": _optional_listing_date(detail.get("OpenDate")),
+    }
+    if include_raw:
+        result["raw"] = _safe_value(detail)
+    return result
 
 
 def _serialize_qmt_object(obj):
@@ -839,6 +1178,17 @@ def _optional_three_decimal_text(value):
     if not number.is_finite():
         return None
     return format(number, ".3f")
+
+
+def _optional_six_decimal_text(value):
+    """Return a canonical decimal string rounded to at most six places."""
+    text = _optional_decimal_text(value)
+    if text is None:
+        return None
+    number = decimal.Decimal(text).quantize(
+        decimal.Decimal("0.000001"), rounding=decimal.ROUND_HALF_UP
+    )
+    return _canonical_price(number)
 
 
 def _positive_three_decimal_text(value):
@@ -2060,6 +2410,9 @@ class BridgeRuntime(object):
                     "position.list",
                     "quote.get",
                     "quote.list",
+                    "sector.instruments.list",
+                    "instrument.detail.list",
+                    "market.history.daily.get",
                     "new_issue.list",
                     "new_issue.quota.get",
                     "order.place",
@@ -2372,6 +2725,12 @@ class BridgeRuntime(object):
             return self.query_quote(payload, context_info)
         if command == "quote.list":
             return self.query_quotes(payload, context_info)
+        if command == "sector.instruments.list":
+            return self.query_sector_instruments(payload, context_info)
+        if command == "instrument.detail.list":
+            return self.query_instrument_details(payload, context_info)
+        if command == "market.history.daily.get":
+            return self.query_daily_history(payload, context_info)
         if command == "new_issue.list":
             return self.query_new_issues(payload)
         if command == "new_issue.quota.get":
@@ -2566,6 +2925,180 @@ class BridgeRuntime(object):
             normalized, include_raw, context_info
         )
         return {"items": items, "count": len(items), "as_of": as_of}
+
+    def _payload_instruments(self, payload):
+        instruments = payload.get("instruments")
+        if not isinstance(instruments, list) or not instruments:
+            raise BridgeError(
+                "INVALID_ARGUMENT", "instruments must be a non-empty array"
+            )
+        normalized = []
+        seen = set()
+        for value in instruments:
+            instrument = str(value or "").strip().upper()
+            if not re.match(r"^[0-9]{6}\.(SH|SZ|BJ)$", instrument):
+                raise BridgeError(
+                    "INVALID_ARGUMENT", "invalid instrument code: %s" % instrument
+                )
+            if instrument in seen:
+                raise BridgeError(
+                    "INVALID_ARGUMENT", "duplicate instrument: %s" % instrument
+                )
+            seen.add(instrument)
+            normalized.append(instrument)
+        return normalized
+
+    def query_sector_instruments(self, payload, context_info):
+        self._require_latest_bar(context_info)
+        sector_name = str(payload.get("sector_name", "") or "").strip()
+        if not sector_name:
+            raise BridgeError("INVALID_ARGUMENT", "sector_name is required")
+        getter = getattr(context_info, "get_stock_list_in_sector", None)
+        if not callable(getter):
+            raise BridgeError(
+                "QMT_API_MISSING",
+                "ContextInfo.get_stock_list_in_sector is unavailable",
+            )
+        values = getter(sector_name)
+        if values is None:
+            values = []
+        if not isinstance(values, (list, tuple)):
+            raise BridgeError(
+                "QMT_DATA_ERROR",
+                "ContextInfo.get_stock_list_in_sector did not return a list",
+            )
+        items = []
+        seen = set()
+        for value in values:
+            instrument = str(value or "").strip().upper()
+            if instrument and instrument not in seen:
+                seen.add(instrument)
+                items.append(instrument)
+        return {
+            "sector_name": sector_name,
+            "items": items,
+            "count": len(items),
+            "as_of": _utc_now_text(),
+        }
+
+    def query_instrument_details(self, payload, context_info):
+        self._require_latest_bar(context_info)
+        instruments = self._payload_instruments(payload)
+        include_raw = self._include_raw(payload)
+        getter = getattr(context_info, "get_instrument_detail", None)
+        if not callable(getter):
+            raise BridgeError(
+                "QMT_API_MISSING", "ContextInfo.get_instrument_detail is unavailable"
+            )
+        items = []
+        for instrument in instruments:
+            detail = getter(instrument)
+            if detail is None:
+                detail = {}
+            if not isinstance(detail, dict):
+                raise BridgeError(
+                    "QMT_DATA_ERROR",
+                    "ContextInfo.get_instrument_detail did not return an object: %s"
+                    % instrument,
+                )
+            items.append(
+                _normalize_instrument_detail(
+                    detail, instrument, include_raw=include_raw
+                )
+            )
+        return {"items": items, "count": len(items), "as_of": _utc_now_text()}
+
+    def query_daily_history(self, payload, context_info):
+        self._require_latest_bar(context_info)
+        instruments = self._payload_instruments(payload)
+        normalized_fields = list(DAILY_HISTORY_STANDARD_FIELDS)
+        start_time = str(payload.get("start_time", "") or "").strip()
+        end_time = str(payload.get("end_time", "") or "").strip()
+        for name, value in (("start_time", start_time), ("end_time", end_time)):
+            if value and not re.match(r"^[0-9]{8}$", value):
+                raise BridgeError(
+                    "INVALID_ARGUMENT", "%s must be empty or YYYYMMDD" % name
+                )
+        if start_time and end_time and start_time > end_time:
+            raise BridgeError(
+                "INVALID_ARGUMENT", "start_time must not be later than end_time"
+            )
+        count = payload.get("count", -1)
+        if isinstance(count, bool) or not isinstance(count, int):
+            raise BridgeError("INVALID_ARGUMENT", "count must be an integer")
+        if count == 0 or count < -1:
+            raise BridgeError(
+                "INVALID_ARGUMENT", "count must be -1 or a positive integer"
+            )
+        fill_data = payload.get("fill_data", False)
+        subscribe = payload.get("subscribe", False)
+        if not isinstance(fill_data, bool):
+            raise BridgeError("INVALID_ARGUMENT", "fill_data must be a boolean")
+        if not isinstance(subscribe, bool):
+            raise BridgeError("INVALID_ARGUMENT", "subscribe must be a boolean")
+        include_raw = self._include_raw(payload)
+        getter = getattr(context_info, "get_market_data_ex", None)
+        if not callable(getter):
+            raise BridgeError(
+                "QMT_API_MISSING", "ContextInfo.get_market_data_ex is unavailable"
+            )
+        raw_fields = [
+            DAILY_HISTORY_FIELD_MAP[field]
+            for field in normalized_fields
+            if field in DAILY_HISTORY_FIELD_MAP
+        ]
+        raw_fields = list(dict.fromkeys(raw_fields))
+        raw = getter(
+            raw_fields,
+            instruments,
+            "1d",
+            start_time,
+            end_time,
+            count,
+            "none",
+            fill_data,
+            subscribe,
+        )
+        if not isinstance(raw, dict):
+            raise BridgeError(
+                "QMT_DATA_ERROR",
+                "ContextInfo.get_market_data_ex did not return a mapping",
+            )
+        back_ratio = getter(
+            ["close"],
+            instruments,
+            "1d",
+            start_time,
+            end_time,
+            count,
+            "back_ratio",
+            fill_data,
+            False,
+        )
+        if not isinstance(back_ratio, dict):
+            raise BridgeError(
+                "QMT_DATA_ERROR",
+                "ContextInfo.get_market_data_ex did not return a back-ratio mapping",
+            )
+        items = []
+        row_count = 0
+        for instrument in instruments:
+            item = _serialize_history_frame(
+                raw.get(instrument),
+                back_ratio.get(instrument),
+                normalized_fields,
+                instrument,
+                include_raw=include_raw,
+            )
+            items.append(item)
+            row_count += item["count"]
+        return {
+            "period": "1d",
+            "items": items,
+            "count": len(items),
+            "row_count": row_count,
+            "as_of": _utc_now_text(),
+        }
 
     def query_trades(self, payload):
         account_id = self._require_account(payload)
@@ -4182,6 +4715,10 @@ class BridgeRuntime(object):
 def _load_config():
     with open(CONFIG_PATH, "r") as handle:
         config = json.load(handle)
+    version = str(config.get("version", "") or "").strip()
+    if not version:
+        raise BridgeError("INVALID_CONFIG", "version is required")
+    config["version"] = version
     if not config.get("auth_token"):
         raise BridgeError("INVALID_CONFIG", "auth_token is required")
     if not config.get("db_path"):
@@ -4213,7 +4750,10 @@ def init(ContextInfo):
             "SH",
         )
         setattr(builtins, _RUNTIME_SLOT, runtime)
-        print("QMT Adapter bridge is ready: %s" % config.get("pipe_name"))
+        print(
+            "QMT Adapter bridge [v%s] is ready: %s"
+            % (config["version"], config.get("pipe_name"))
+        )
     except Exception as exc:
         if _RUNTIME is runtime:
             _RUNTIME = None

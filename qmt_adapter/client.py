@@ -69,6 +69,13 @@ def _normalized_instruments(instruments: Iterable[str]) -> List[str]:
     return result
 
 
+def _validated_daily_date(value: Optional[str], name: str) -> str:
+    normalized = str(value or "").strip()
+    if normalized and not re.match(r"^[0-9]{8}$", normalized):
+        raise ValidationError("%s must be empty or YYYYMMDD" % name)
+    return normalized
+
+
 def _normalized_wait_statuses(statuses: Optional[Iterable[str]]) -> List[str]:
     if statuses is None:
         return sorted(TERMINAL_ORDER_STATUSES)
@@ -320,6 +327,105 @@ class QmtClient:
         return self._request(
             "quote.list",
             {"instruments": normalized, "include_raw": include_raw},
+            timeout=timeout,
+        )
+
+    def list_sector_instruments(
+        self,
+        sector_name: str,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """查询大QMT板块中的证券代码。
+
+        Args:
+            sector_name: 大QMT客户端中的板块名称，例如 ``沪深A股``。
+            timeout: 等待大QMT返回板块成分的最长秒数。
+
+        Returns:
+            ``{"sector_name": ..., "items": [...], "count": N}``。证券代码
+            保留大QMT返回顺序并去重。
+        """
+        normalized = str(sector_name or "").strip()
+        if not normalized:
+            raise ValidationError("sector_name must not be empty")
+        if len(normalized) > 128:
+            raise ValidationError("sector_name must contain at most 128 characters")
+        return self._request(
+            "sector.instruments.list",
+            {"sector_name": normalized},
+            timeout=timeout,
+        )
+
+    def get_instrument_details(
+        self,
+        instruments: Iterable[str],
+        timeout: float = 10.0,
+        include_raw: bool = False,
+    ) -> Dict[str, Any]:
+        """批量查询沪深北证券名称、股本和上市日期。
+
+        返回项目包含 ``instrument_name``、``float_shares``、
+        ``total_shares`` 和 ``listing_date``；设置 ``include_raw=True`` 时还会
+        返回大QMT ``get_instrument_detail`` 的完整原始字典。名称查询适用于
+        大QMT能够识别的股票、ETF、可转债和逆回购等标的；无法识别的代码对应
+        详情字段为 ``None``。
+        """
+        normalized = _normalized_instruments(instruments)
+        include_raw = _validated_include_raw(include_raw)
+        return self._request(
+            "instrument.detail.list",
+            {"instruments": normalized, "include_raw": include_raw},
+            timeout=timeout,
+        )
+
+    def get_daily_history(
+        self,
+        instruments: Iterable[str],
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+        count: int = -1,
+        fill_data: bool = False,
+        subscribe: bool = False,
+        timeout: float = 30.0,
+        include_raw: bool = False,
+    ) -> Dict[str, Any]:
+        """从大QMT模型上下文读取一批证券的历史日线。
+
+        ``subscribe=False`` 时只读取大QMT本地已有历史数据；设置为 ``True``
+        时由大QMT按自身规则订阅并尝试补充请求数据，但不保证补齐任意长区间。
+        为避免超过命名管道单帧上限，长时间范围应由调用方拆成较小证券批次。
+
+        返回 ``items`` 中每项固定包含全部标准字段，使用紧凑列式结构：
+        ``timestamps`` 是索引时间，``data`` 按字段保存等长数组。价格和成交额
+        固定输出三位小数字符串，数量与状态输出整数。``adjustment_factor``
+        是截至对应交易日的完整历史累计复权因子，不随查询起点变化，最多输出
+        六位小数。``include_raw=True`` 时额外返回QMT未复权原始列。
+        """
+        normalized_instruments = _normalized_instruments(instruments)
+        normalized_start = _validated_daily_date(start_time, "start_time")
+        normalized_end = _validated_daily_date(end_time, "end_time")
+        if normalized_start and normalized_end and normalized_start > normalized_end:
+            raise ValidationError("start_time must not be later than end_time")
+        if isinstance(count, bool) or not isinstance(count, int):
+            raise ValidationError("count must be an integer")
+        if count == 0 or count < -1:
+            raise ValidationError("count must be -1 or a positive integer")
+        if not isinstance(fill_data, bool):
+            raise ValidationError("fill_data must be a boolean")
+        if not isinstance(subscribe, bool):
+            raise ValidationError("subscribe must be a boolean")
+        include_raw = _validated_include_raw(include_raw)
+        return self._request(
+            "market.history.daily.get",
+            {
+                "instruments": normalized_instruments,
+                "start_time": normalized_start,
+                "end_time": normalized_end,
+                "count": count,
+                "fill_data": fill_data,
+                "subscribe": subscribe,
+                "include_raw": include_raw,
+            },
             timeout=timeout,
         )
 

@@ -83,8 +83,21 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             quotes = await client.get_quotes(
                 ["601919.SH", "600000.SH"], include_raw=True, timeout=5
             )
+            sector = await client.list_sector_instruments("沪深A股", timeout=5)
+            details = await client.get_instrument_details(
+                ["600000.SH"], timeout=5
+            )
+            history = await client.get_daily_history(
+                ["600000.SH"],
+                start_time="20260820",
+                end_time="20260821",
+                timeout=5,
+            )
             self.assertEqual(quote["raw"]["full_tick"]["lastPrice"], 10.0)
             self.assertEqual(quotes["count"], 2)
+            self.assertEqual(sector["count"], 2)
+            self.assertEqual(details["items"][0]["total_shares"], 1000000000)
+            self.assertEqual(history["row_count"], 2)
 
             receipt = await client.place_order(
                 OrderRequest(

@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -102,6 +104,45 @@ class FakeTrade(object):
         self.m_strTradeTime = "14:30:00"
 
 
+class FakeSequence(list):
+    def tolist(self):
+        return list(self)
+
+    @property
+    def iloc(self):
+        return self
+
+    def shift(self, periods=1):
+        return FakeSequence([None] * periods + list(self[:-periods]))
+
+    def div(self, other):
+        return FakeSequence(
+            None if left is None else float(left) / float(right)
+            for left, right in zip(self, other)
+        )
+
+    def cumprod(self):
+        product = 1.0
+        result = []
+        for value in self:
+            if value is None:
+                result.append(None)
+            else:
+                product *= float(value)
+                result.append(product)
+        return FakeSequence(result)
+
+
+class FakeFrame(object):
+    def __init__(self, timestamps, data):
+        self.index = FakeSequence(timestamps)
+        self.columns = FakeSequence(data.keys())
+        self.data = dict(data)
+
+    def __getitem__(self, field):
+        return FakeSequence(self.data[field])
+
+
 class FakeContext(object):
     def __init__(self, fake_api):
         self.fake_api = fake_api
@@ -121,6 +162,9 @@ class FakeContext(object):
         self.fake_api.instrument_detail_calls.append(instrument)
         return {
             "InstrumentName": "fake-stock",
+            "FloatVolume": 800000000,
+            "TotalVolume": 1000000000,
+            "OpenDate": 19991110,
             "PreClose": 9.9,
             "UpStopPrice": 20.0,
             "DownStopPrice": 5.0,
@@ -128,6 +172,73 @@ class FakeContext(object):
             "InstrumentStatus": 0,
             "IsTrading": True,
         }
+
+    def get_stock_list_in_sector(self, sector_name):
+        self.fake_api.sector_calls.append(sector_name)
+        return ["600000.SH", "000001.SZ", "600000.SH"]
+
+    def get_market_data_ex(
+        self,
+        fields,
+        instruments,
+        period,
+        start_time,
+        end_time,
+        count,
+        dividend_type,
+        fill_data,
+        subscribe,
+    ):
+        self.fake_api.history_calls.append(
+            {
+                "fields": list(fields),
+                "instruments": list(instruments),
+                "period": period,
+                "start_time": start_time,
+                "end_time": end_time,
+                "count": count,
+                "dividend_type": dividend_type,
+                "fill_data": fill_data,
+                "subscribe": subscribe,
+            }
+        )
+        result = {}
+        base = {
+            "open": [9.8, 10.0],
+            "high": [10.1, 10.3],
+            "low": [9.7, 9.9],
+            "close": [10.0, 10.2],
+            "preClose": [9.8, 9.5],
+            "volume": [1000, 1200],
+            "amount": [1000000.0, 1224000.0],
+            "settelementPrice": [0.0, 0.0],
+            "openInterest": [0, 0],
+            "suspendFlag": [0, 0],
+        }
+        timestamps = ["20260820", "20260821"]
+        if dividend_type == "back_ratio":
+            base["close"] = [20.0, 21.473684210526315]
+        selected = [
+            index
+            for index, timestamp in enumerate(timestamps)
+            if (not start_time or timestamp >= start_time)
+            and (not end_time or timestamp <= end_time)
+        ]
+        if count > 0:
+            selected = selected[-count:]
+        for instrument in instruments:
+            result[instrument] = FakeFrame(
+                [timestamps[index] for index in selected],
+                dict(
+                    (
+                        field,
+                        [base[field][index] for index in selected],
+                    )
+                    for field in fields
+                    if field in base
+                ),
+            )
+        return result
 
 
 class FakeQmtApi(object):
@@ -142,6 +253,8 @@ class FakeQmtApi(object):
         self.cancel_callback_times = []
         self.full_tick_calls = []
         self.instrument_detail_calls = []
+        self.sector_calls = []
+        self.history_calls = []
         self.order_counter = 0
         self.raise_passorder = False
         self.emit_order_callback = True
@@ -563,6 +676,124 @@ class NamedPipeEndToEndTests(unittest.TestCase):
             with self.assertRaises(ValidationError):
                 client.get_quotes(["600000.SH", "600000.sh"], timeout=5)
         self.assertEqual(self.fake_api.full_tick_calls, [])
+
+    def test_sector_instrument_details_and_daily_history(self):
+        with QmtClient(config_path=self.config_path) as client:
+            sector = client.list_sector_instruments("沪深A股", timeout=5)
+            details = client.get_instrument_details(
+                ["600000.SH", "000001.SZ"], timeout=5, include_raw=True
+            )
+            history = client.get_daily_history(
+                ["600000.SH", "000001.SZ"],
+                start_time="20260820",
+                end_time="20260821",
+                fill_data=False,
+                subscribe=False,
+                timeout=5,
+            )
+
+        self.assertEqual(sector["items"], ["600000.SH", "000001.SZ"])
+        self.assertEqual(self.fake_api.sector_calls, ["沪深A股"])
+        self.assertEqual(details["count"], 2)
+        self.assertEqual(details["items"][0]["instrument_name"], "fake-stock")
+        self.assertEqual(details["items"][0]["float_shares"], 800000000)
+        self.assertEqual(details["items"][0]["total_shares"], 1000000000)
+        self.assertEqual(details["items"][0]["listing_date"], "1999-11-10")
+        self.assertEqual(details["items"][0]["raw"]["OpenDate"], 19991110)
+        self.assertEqual(history["period"], "1d")
+        self.assertEqual(history["row_count"], 4)
+        self.assertEqual(
+            history["items"][0]["timestamps"], ["2026-08-20", "2026-08-21"]
+        )
+        self.assertEqual(
+            history["items"][0]["data"]["close_price"], ["10.000", "10.200"]
+        )
+        self.assertEqual(
+            history["items"][0]["data"]["adjustment_factor"],
+            ["2", "2.105263"],
+        )
+        self.assertEqual(
+            set(history["items"][0]["data"]),
+            {
+                "adjustment_factor",
+                "open_price",
+                "high_price",
+                "low_price",
+                "close_price",
+                "volume_lots",
+                "turnover_amount",
+                "settlement_price",
+                "open_interest",
+                "previous_close",
+                "suspension_status",
+            },
+        )
+        self.assertNotIn("raw", history["items"][0])
+        self.assertEqual(
+            self.fake_api.history_calls[0]["fields"],
+            [
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "amount",
+                "settelementPrice",
+                "openInterest",
+                "preClose",
+                "suspendFlag",
+            ],
+        )
+        self.assertEqual(self.fake_api.history_calls[0]["dividend_type"], "none")
+        self.assertEqual(self.fake_api.history_calls[0]["subscribe"], False)
+        self.assertEqual(self.fake_api.history_calls[1]["fields"], ["close"])
+        self.assertEqual(
+            self.fake_api.history_calls[1]["dividend_type"], "back_ratio"
+        )
+        self.assertEqual(self.fake_api.history_calls[1]["subscribe"], False)
+
+    def test_daily_history_validates_dates_before_qmt_call(self):
+        with QmtClient(config_path=self.config_path) as client:
+            with self.assertRaises(ValidationError):
+                client.get_daily_history(
+                    ["600000.SH"],
+                    start_time="2026-08-20",
+                    end_time="20260821",
+                )
+        self.assertEqual(self.fake_api.history_calls, [])
+
+    def test_daily_history_can_include_unmodified_qmt_columns(self):
+        with QmtClient(config_path=self.config_path) as client:
+            history = client.get_daily_history(
+                ["600000.SH"], timeout=5, include_raw=True
+            )
+
+        self.assertEqual(
+            history["items"][0]["data"]["adjustment_factor"],
+            ["2", "2.105263"],
+        )
+        self.assertEqual(
+            history["items"][0]["raw"]["data"]["preClose"], [9.8, 9.5]
+        )
+        self.assertEqual(
+            history["items"][0]["raw"]["timestamps"],
+            ["20260820", "20260821"],
+        )
+
+    def test_daily_history_factor_does_not_reset_at_query_start(self):
+        with QmtClient(config_path=self.config_path) as client:
+            history = client.get_daily_history(
+                ["600000.SH"],
+                start_time="20260821",
+                end_time="20260821",
+                timeout=5,
+            )
+
+        self.assertEqual(history["items"][0]["timestamps"], ["2026-08-21"])
+        self.assertEqual(
+            history["items"][0]["data"]["adjustment_factor"],
+            ["2.105263"],
+        )
 
     def test_get_order_standard_fields_and_optional_raw(self):
         order = OrderRequest(
@@ -1147,8 +1378,9 @@ class NamedPipeEndToEndTests(unittest.TestCase):
     def test_duplicate_bridge_start_reports_pipe_binding_error(self):
         duplicate = BridgeHarness(self.config, self.fake_api)
 
-        with self.assertRaises(bridge.BridgeError) as caught:
-            duplicate.start()
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(bridge.BridgeError) as caught:
+                duplicate.start()
 
         duplicate.thread.join(5)
         self.assertFalse(duplicate.thread.is_alive())

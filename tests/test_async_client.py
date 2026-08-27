@@ -39,6 +39,7 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             "reconcile_interval_seconds": 1000000000000.0,
             "max_commands_per_tick": 20,
             "max_pending_commands": 100,
+            "max_clients": 8,
             "max_message_size": 1048576,
             "qmt_remark_max_bytes": 64,
         }

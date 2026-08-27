@@ -1,6 +1,6 @@
 # QMT Adapter 部署与函数调用说明
 
-本文档对应QMTAdapter `0.7.1`、命名管道协议6，说明大 QMT 端脚本的部署方式，
+本文档对应QMTAdapter `0.7.2`、命名管道协议6，说明大 QMT 端脚本的部署方式，
 以及外部封装库的同步、异步函数调用方法。
 
 ## 1. 当前支持范围
@@ -144,7 +144,7 @@ SQLite 启用 WAL 后，运行期间可能在同一目录生成 `bridge.db-wal` 
 
 ```json
 {
-  "version": "0.7.1",
+  "version": "0.7.2",
   "pipe_name": "\\\\.\\pipe\\qmt_adapter",
   "auth_token": "由部署命令生成的64位十六进制字符串",
   "db_path": "C:\\QMTAdapter\\data\\bridge.db",
@@ -158,6 +158,7 @@ SQLite 启用 WAL 后，运行期间可能在同一目录生成 `bridge.db-wal` 
   "reconcile_interval_seconds": 5.0,
   "max_commands_per_tick": 20,
   "max_pending_commands": 1000,
+  "max_clients": 8,
   "max_message_size": 5242880,
   "qmt_remark_max_bytes": 64
 }
@@ -176,6 +177,7 @@ SQLite 启用 WAL 后，运行期间可能在同一目录生成 `bridge.db-wal` 
 | `reconcile_interval_seconds` | 委托回调遗漏或重启恢复时的对账周期 |
 | `max_commands_per_tick` | 每个 QMT 定时器周期最多处理的命令数 |
 | `max_pending_commands` | QMT 主线程待处理命令队列上限 |
+| `max_clients` | 同时保持的外部客户端连接上限，默认8，允许范围1～255 |
 | `max_message_size` | 单个管道消息最大字节数，默认5 MiB；响应超限时返回 `RESPONSE_TOO_LARGE` |
 | `qmt_remark_max_bytes` | 传入 QMT 的委托备注最大字节数 |
 
@@ -260,6 +262,8 @@ with QmtClient(config_path=CONFIG_PATH, client_id="my-strategy") as client:
 离开 `with` 代码块时自动关闭命名管道连接。
 每条命名管道连接只在建立时握手一次；同一客户端后续调用不会重复握手。
 对已经连接的客户端重复调用 `connect()` 会直接返回客户端自身。
+多个策略进程应使用不同的 `client_id` 便于日志识别；它不参与
+`client_order_id` 的生成或幂等判断。默认生成的委托ID是全局UUID4。
 
 也可以手动管理：
 
@@ -285,6 +289,8 @@ client.hello
 ```python
 {
     "protocol_version": 6,
+    "connection_id": 1,
+    "max_clients": 8,
     "idempotency_mode": "CLIENT_ORDER_ID_ENFORCED",
     "accounts": [...],
     "commands": [...],
@@ -304,6 +310,9 @@ result = client.health(timeout=5.0)
 | 字段 | 说明 |
 |---|---|
 | `status` | `OK` 或 `DEGRADED`；只由管道、主循环、持久化和对账等基础设施错误决定 |
+| `connected` | 当前是否至少有一个已鉴权客户端连接 |
+| `active_client_count` | 当前已鉴权客户端连接数 |
+| `max_clients` | Bridge允许的客户端连接上限 |
 | `configured_accounts` | 配置的账号白名单 |
 | `pending_commands` | 等待QMT主线程处理的命令数 |
 | `last_error` | Bridge最近一次错误，包括请求处理错误和基础设施错误 |
@@ -1176,10 +1185,18 @@ except QmtAdapterError as exc:
 - SQLite 的写入只发生在 QMT Bridge 进程内；它用于持久化和幂等判断，不承担
   双向通信；
 - 旧版 `orders` 表会在 QMT Bridge 启动时自动增加并回填 `payload_hash`；
-- 当前管道服务只允许一个活动客户端连接；
-- 单个同步或异步客户端也只允许一条请求在途；
+- 当前管道服务默认允许8个活动客户端连接，可通过 `max_clients` 调整；
+- 单个同步或异步客户端只允许一条请求在途，不同客户端可以同时进入全局队列；
+- 达到 `max_clients` 后，新客户端会等待连接槽位，并遵守 `connect(timeout=...)`
+  指定的超时时间；
+- 所有需要调用QMT函数的命令仍由QMT主线程串行执行，多个客户端不会并行调用
+  `passorder`、`cancel` 或账户与行情函数；
+- 每个连接由独立线程执行管道读写，QMT主线程只向对应响应队列投递结果；单个
+  客户端断开或停止读取不会阻塞QMT主线程及其他客户端；
+- 所有客户端共享同一套委托持久化和幂等空间。`client_id` 不构成委托ID命名空间，
+  每笔新委托的 `client_order_id` 必须在所有客户端之间全局唯一；
 - 单条UTF-8 JSON消息默认上限为5 MiB，响应超限返回结构化错误且不关闭连接；
-- 正常断开后，服务端会重新创建管道并接受下一次连接；
+- 单个客户端断开只释放自己的管道实例，不影响其他活动客户端；
 - QMT账户、持仓、普通行情、板块成分、合约详情、历史K线、成交、发行数据、申购额度、普通下单、逆回购、
   申购、算法下单和撤单命令在QMT主线程的定时器中执行；
 - `system.health`、`order.get/list/wait` 和 `algo_order.get/list` 是本地持久化读取，

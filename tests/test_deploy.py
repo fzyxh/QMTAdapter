@@ -39,6 +39,7 @@ class DeployTests(unittest.TestCase):
             self.assertEqual(config["version"], __version__)
             self.assertEqual(config["accounts"][0]["account_id"], "SIM001")
             self.assertEqual(config["pipe_name"], DEFAULT_PIPE_NAME)
+            self.assertEqual(config["max_clients"], 8)
             self.assertEqual(config["max_message_size"], MAX_MESSAGE_SIZE)
             self.assertEqual(len(config["auth_token"]), 64)
             int(config["auth_token"], 16)
@@ -83,6 +84,7 @@ class DeployTests(unittest.TestCase):
             config["environment"] = "SIMULATION"
             config["pipe_name"] = r"\\.\pipe\qmt_adapter_v1"
             config["max_message_size"] = 1024 * 1024
+            del config["max_clients"]
             first["config_path"].write_text(
                 json.dumps(config, ensure_ascii=True, indent=2) + "\n",
                 encoding="ascii",
@@ -96,6 +98,7 @@ class DeployTests(unittest.TestCase):
             self.assertNotIn("environment", updated)
             self.assertEqual(updated["pipe_name"], DEFAULT_PIPE_NAME)
             self.assertEqual(updated["max_message_size"], MAX_MESSAGE_SIZE)
+            self.assertEqual(updated["max_clients"], 8)
             self.assertEqual(updated["accounts"], config["accounts"])
             self.assertEqual(updated["auth_token"], config["auth_token"])
 
@@ -105,6 +108,7 @@ class DeployTests(unittest.TestCase):
             first = deploy(root=root, account_ids=["SIM001"])
             config = json.loads(first["config_path"].read_text(encoding="ascii"))
             config["pipe_name"] = r"\\.\pipe\custom_qmt_adapter"
+            config["max_clients"] = 3
             config["max_message_size"] = 2 * 1024 * 1024
             first["config_path"].write_text(
                 json.dumps(config, ensure_ascii=True, indent=2) + "\n",
@@ -115,6 +119,7 @@ class DeployTests(unittest.TestCase):
 
             updated = json.loads(first["config_path"].read_text(encoding="ascii"))
             self.assertEqual(updated["pipe_name"], config["pipe_name"])
+            self.assertEqual(updated["max_clients"], 3)
             self.assertEqual(
                 updated["max_message_size"], config["max_message_size"]
             )

@@ -105,6 +105,7 @@ def _initial_config(account_ids: Iterable[str], db_path: Path) -> Dict[str, Any]
         "reconcile_interval_seconds": 5.0,
         "max_commands_per_tick": 20,
         "max_pending_commands": 1000,
+        "max_clients": 8,
         "max_message_size": MAX_MESSAGE_SIZE,
         "qmt_remark_max_bytes": 64,
     }
@@ -126,6 +127,9 @@ def _migrate_existing_config(config_path: Path) -> None:
     if config.get("max_message_size") in (None, LEGACY_MAX_MESSAGE_SIZE):
         config["max_message_size"] = MAX_MESSAGE_SIZE
         changed = True
+    if "max_clients" not in config:
+        config["max_clients"] = 8
+        changed = True
     if not changed:
         return
     encoded_config = (json.dumps(config, ensure_ascii=True, indent=2) + "\n").encode(
@@ -143,8 +147,10 @@ def deploy(
     The bridge and loader are replaced atomically on every call. Existing
     account, authentication, database settings and SQLite data are preserved.
     The configuration's ``version`` is updated to the deployed package version.
-    Legacy default pipe and message-size settings are migrated; custom values
-    are not overwritten. The obsolete ``environment`` setting is removed.
+    Legacy default pipe and message-size settings are migrated; existing
+    configurations receive the default multi-client limit when absent, while
+    custom values are preserved. The obsolete ``environment`` setting is
+    removed.
 
     Args:
         root: Absolute deployment directory. Defaults to ``C:\\QMTAdapter``.

@@ -493,6 +493,7 @@ class NamedPipeEndToEndTests(unittest.TestCase):
             "reconcile_interval_seconds": 1000000000000.0,
             "max_commands_per_tick": 20,
             "max_pending_commands": 100,
+            "max_clients": 4,
             "max_message_size": 1048576,
             "qmt_remark_max_bytes": 64,
         }
@@ -1378,16 +1379,93 @@ class NamedPipeEndToEndTests(unittest.TestCase):
         self.assertEqual(after_stale["raw"]["m_nOrderStatus"], 56)
         self.assertEqual(after_stale["raw"]["m_nVolumeTraded"], 100)
 
-    def test_second_client_honors_timeout_while_pipe_is_busy(self):
-        first = QmtClient(config_path=self.config_path).connect()
-        second = QmtClient(config_path=self.config_path)
+    def test_multiple_clients_connect_and_submit_qmt_requests(self):
+        first = QmtClient(
+            config_path=self.config_path, client_id="multi-client-a"
+        ).connect()
+        second = QmtClient(
+            config_path=self.config_path, client_id="multi-client-b"
+        ).connect()
+        barrier = threading.Barrier(3)
+        results = {}
+        errors = []
+
+        def query_account():
+            try:
+                barrier.wait()
+                results["account"] = first.get_account(ACCOUNT_ID, timeout=5)
+            except Exception as exc:
+                errors.append(exc)
+
+        def query_positions():
+            try:
+                barrier.wait()
+                results["positions"] = second.list_positions(
+                    ACCOUNT_ID, timeout=5
+                )
+            except Exception as exc:
+                errors.append(exc)
+
+        first_thread = threading.Thread(target=query_account)
+        second_thread = threading.Thread(target=query_positions)
         started = time.monotonic()
         try:
-            with self.assertRaises(RequestTimeout):
-                second.connect(timeout=0.15)
+            self.assertNotEqual(
+                first.hello["connection_id"], second.hello["connection_id"]
+            )
+            health = first.health()
+            self.assertEqual(health["active_client_count"], 2)
+            self.assertEqual(health["max_clients"], 4)
+            first_thread.start()
+            second_thread.start()
+            barrier.wait()
+            first_thread.join(5)
+            second_thread.join(5)
+            self.assertFalse(first_thread.is_alive())
+            self.assertFalse(second_thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(results["account"]["count"], 1)
+            self.assertEqual(results["positions"]["count"], 1)
+            second.close()
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                health = first.health()
+                if health["active_client_count"] == 1:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(health["active_client_count"], 1)
+            self.assertEqual(first.health()["status"], "OK")
         finally:
             second.close()
             first.close()
+        self.assertLess(time.monotonic() - started, 5.0)
+
+    def test_client_limit_honors_connection_timeout(self):
+        clients = [
+            QmtClient(
+                config_path=self.config_path,
+                client_id="limit-client-%s" % index,
+            ).connect()
+            for index in range(self.config["max_clients"])
+        ]
+        extra = QmtClient(config_path=self.config_path, client_id="limit-extra")
+        replacement = None
+        started = time.monotonic()
+        try:
+            with self.assertRaises(RequestTimeout):
+                extra.connect(timeout=0.15)
+            clients.pop().close()
+            replacement = QmtClient(
+                config_path=self.config_path,
+                client_id="limit-replacement",
+            ).connect(timeout=1.0)
+            self.assertTrue(replacement.connection.is_connected)
+        finally:
+            extra.close()
+            if replacement is not None:
+                replacement.close()
+            for client in clients:
+                client.close()
         self.assertGreaterEqual(time.monotonic() - started, 0.1)
 
     def test_native_market_price_types_are_forwarded_to_passorder(self):

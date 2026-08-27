@@ -91,6 +91,14 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
                 ["600000.SH"],
                 start_time="20260820",
                 end_time="20260821",
+                adjustment="front",
+                timeout=5,
+            )
+            bar_history = await client.get_bar_history(
+                ["932000.SH"],
+                period="60m",
+                start_time="20260820100000",
+                end_time="20260820120000",
                 timeout=5,
             )
             self.assertEqual(quote["raw"]["full_tick"]["lastPrice"], 10.0)
@@ -98,6 +106,9 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(sector["count"], 2)
             self.assertEqual(details["items"][0]["total_shares"], 1000000000)
             self.assertEqual(history["row_count"], 2)
+            self.assertEqual(history["adjustment"], "front")
+            self.assertEqual(bar_history["period"], "60m")
+            self.assertEqual(bar_history["row_count"], 2)
 
             receipt = await client.place_order(
                 OrderRequest(

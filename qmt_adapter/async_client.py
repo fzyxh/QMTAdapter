@@ -184,11 +184,39 @@ class AsyncQmtClient:
         subscribe: bool = False,
         timeout: float = 30.0,
         include_raw: bool = False,
+        adjustment: str = "none",
     ) -> Dict[str, Any]:
         """异步读取历史日线；参数和返回值同同步客户端同名方法。"""
         return await self._call(
             self._client.get_daily_history,
             instruments,
+            start_time=start_time,
+            end_time=end_time,
+            count=count,
+            fill_data=fill_data,
+            subscribe=subscribe,
+            timeout=timeout,
+            include_raw=include_raw,
+            adjustment=adjustment,
+        )
+
+    async def get_bar_history(
+        self,
+        instruments: Iterable[str],
+        period: str,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+        count: int = -1,
+        fill_data: bool = False,
+        subscribe: bool = False,
+        timeout: float = 30.0,
+        include_raw: bool = False,
+    ) -> Dict[str, Any]:
+        """异步读取标准化历史K线；参数和返回值同同步客户端同名方法。"""
+        return await self._call(
+            self._client.get_bar_history,
+            instruments,
+            period=period,
             start_time=start_time,
             end_time=end_time,
             count=count,

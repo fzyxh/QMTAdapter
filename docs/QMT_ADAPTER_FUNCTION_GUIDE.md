@@ -1,6 +1,6 @@
 # QMT Adapter 部署与函数调用说明
 
-本文档对应QMTAdapter `0.7.0`、命名管道协议6，说明大 QMT 端脚本的部署方式，
+本文档对应QMTAdapter `0.7.1`、命名管道协议6，说明大 QMT 端脚本的部署方式，
 以及外部封装库的同步、异步函数调用方法。
 
 ## 1. 当前支持范围
@@ -10,8 +10,8 @@
 - 查询股票资金账户；
 - 查询股票持仓；
 - 查询单只或一批证券的最新普通行情，可选返回QMT原始字段；
-- 查询大QMT板块成分、股票/ETF/转债等证券的批量合约详情和历史日线；
-- 返回不随查询起点变化的每日累计复权因子；
+- 查询大QMT板块成分、股票/ETF/转债等证券的批量合约详情和多周期历史K线；
+- 历史日线返回不随查询起点变化的每日累计复权因子；
 - 普通股票买入、卖出；
 - 北交所普通股票委托；
 - 沪深交易所国债逆回购；
@@ -51,7 +51,7 @@ qmt_side/qmt_adapter_qmt.py
 - 调用 `ContextInfo.get_full_tick` 和 `get_instrument_detail` 完成普通行情查询，
   并读取算法下单所需的当前五档盘口、涨跌停价和最小价位；
 - 调用 `ContextInfo.get_stock_list_in_sector`、`get_instrument_detail` 和
-  `get_market_data_ex` 完成板块成分、合约详情与历史日线查询；
+  `get_market_data_ex` 完成板块成分、合约详情与多周期历史K线查询；
 - 调用 `passorder` 提交股票、逆回购和新股新债申购委托；
 - 调用 `can_cancel_order` 和 `cancel` 撤单；
 - 接收 QMT 的 `order_callback` 委托回报；
@@ -144,7 +144,7 @@ SQLite 启用 WAL 后，运行期间可能在同一目录生成 `bridge.db-wal` 
 
 ```json
 {
-  "version": "0.7.0",
+  "version": "0.7.1",
   "pipe_name": "\\\\.\\pipe\\qmt_adapter",
   "auth_token": "由部署命令生成的64位十六进制字符串",
   "db_path": "C:\\QMTAdapter\\data\\bridge.db",
@@ -488,7 +488,7 @@ raw 中的原始浮点数、空值、状态字段和盘口数组不做舍入或�
 年化收益率百分数，而不是人民币价格；例如 `"0.870"` 表示年化 `0.870%`。
 逆回购原始涨跌停字段可能是无意义占位值，标准接口会在上下限无效时返回 `None`。
 
-### 5.7 list_sector_instruments、get_instrument_details 和 get_daily_history
+### 5.7 list_sector_instruments、get_instrument_details、get_bar_history 和 get_daily_history
 
 ```python
 sector = client.list_sector_instruments("沪深A股", timeout=10.0)
@@ -500,14 +500,23 @@ details = client.get_instrument_details(
     include_raw=False,
 )
 
-history = client.get_daily_history(
-    instruments[:10],
-    start_time="20260101",
-    end_time="20260821",
+history = client.get_bar_history(
+    ["932000.SH"],
+    period="60m",
+    start_time="20260825",
+    end_time="20260827",
     count=-1,
     fill_data=False,
-    subscribe=True,
+    subscribe=False,
     timeout=60.0,
+    include_raw=False,
+)
+
+adjusted_daily = client.get_daily_history(
+    ["601919.SH"],
+    start_time="20260101",
+    end_time="20260827",
+    adjustment="front_ratio",
     include_raw=False,
 )
 ```
@@ -520,37 +529,52 @@ history = client.get_daily_history(
 逆回购等沪深北标的；失效、退市或无法识别的代码保留在结果中，详情字段返回
 `None`。股本字段对非股票标的的含义和可用性以大QMT原始合约信息为准。
 
-`get_daily_history` 固定读取 `1d` 周期，返回紧凑列式结构：
+`get_bar_history` 读取指定K线周期，返回紧凑列式结构：
 
 ```python
 {
-    "period": "1d",
+    "period": "60m",
+    "adjustment": "none",
     "items": [
         {
-            "instrument": "600000.SH",
-            "timestamps": ["2026-08-20", "2026-08-21"],
+            "instrument": "932000.SH",
+            "timestamps": ["2026-08-27T10:30:00"],
             "data": {
-                "adjustment_factor": ["3.779349", "3.807097"],
-                "open_price": ["10.000", "10.100"],
-                "close_price": ["10.100", "10.200"],
+                "open_price": ["3089.170"],
+                "close_price": ["3113.205"],
             },
-            "count": 2,
+            "count": 1,
         }
     ],
     "count": 1,
-    "row_count": 2,
+    "row_count": 1,
     "as_of": "UTC时间",
 }
 ```
 
-接口固定返回 `open_price`、`high_price`、`low_price`、`close_price`、
+接口支持 `1m`、`3m`、`5m`、`10m`、`15m`、`30m`、`60m`、
+`2h`～`4h`、`1d`、`2d`～`5d`、`1w`、`1mon`、`1q`、`1hy` 和
+`1y`；输入 `1h` 会规范为 `60m`，120分钟线使用 `2h`。历史合成周期要求本地
+已有对应基础周期数据：分钟和小时合成周期依赖 `1m` 或 `5m`，日以上合成周期
+依赖 `1d`。
+
+所有周期固定返回 `open_price`、`high_price`、`low_price`、`close_price`、
 `volume_lots`、`turnover_amount`、`settlement_price`、`open_interest`、
-`previous_close`、`suspension_status` 和 `adjustment_factor`。价格和成交额固定
-输出三位小数字符串，数量与状态输出整数。调用方不能选择标准字段，也不能改变
-复权方式；大QMT内部通过等比后复权 `close` 与未复权 `close` 的序列除法直接
-计算 `adjustment_factor`，不需要逐日累乘。该值是截至对应交易日的完整历史
-累计复权因子，不以查询范围首日为基准，也不会随查询起点变化，最多保留六位
-小数。
+`previous_close` 和 `suspension_status`。价格和成交额固定输出三位小数字符串，
+数量与状态输出整数。开高低收始终使用大QMT `dividend_type="none"` 的不复权
+数据。
+
+只有 `period="1d"` 时额外返回 `adjustment_factor`。大QMT内部通过等比后复权
+`close` 与未复权 `close` 的序列除法直接计算该值，不需要逐日累乘。它是截至
+对应交易日的完整历史累计复权因子，不以查询范围首日为基准，也不会随查询起点
+变化，最多保留六位小数。其他周期不查询后复权行情，也不返回该字段。
+
+`get_daily_history()` 保留为 `get_bar_history(period="1d")` 的兼容快捷接口，
+并继续限制起止时间为 `YYYYMMDD`。其 `adjustment` 参数默认是 `none`，也可为
+`front`、`back`、`front_ratio` 或 `back_ratio`。复权方式只改变标准价格字段；
+`adjustment_factor` 始终由同区间的 `back_ratio close / none close` 计算，定义
+不会随返回价格的复权方式变化。通用接口的起止时间可以使用 `YYYYMMDD` 或
+`YYYYMMDDHHMMSS`，并固定返回不复权价格。
 
 `include_raw=False` 时每个项目只包含固定标准字段；设置为 `True` 时额外包含
 `raw`，其中 `timestamps` 和 `data` 保留QMT DataFrame的原始索引、字段名称及
@@ -558,12 +582,17 @@ history = client.get_daily_history(
 
 大QMT遗漏有数据行的请求字段，或者计算复权因子时遇到缺失、非有限值或非正价格，
 接口返回 `QMT_DATA_ERROR`，不会静默填充或跳过。
+当合成周期缺少基础数据时，大QMT可能返回一条时间为1970年且全部数值为零的
+无数据占位行；Bridge会识别并转换为空结果，不会把它作为真实K线返回。
 
 `subscribe=False` 时只读取大QMT本地已有数据；设置为 `True` 时由大QMT按自身
 规则订阅并尝试补充请求的数据。实测订阅可以补充最近多日日线，但不保证补齐
-任意长区间。首次读取多年数据或补较长缺口时，应先在大QMT客户端完成对应日线
-下载。长时间范围应按少量证券拆批；单条UTF-8 JSON响应仍受默认5 MiB上限约束，
-超限会返回 `RESPONSE_TOO_LARGE`。
+任意长区间。首次读取多年数据或补较长缺口时，应先在大QMT客户端完成对应基础
+周期下载，再使用 `subscribe=False` 读取本地数据。`start_time` 只限定请求范围，
+不保证券商行情服务器实际提供完整区间；服务器权限或数据留存不足时，接口返回
+实际可用的部分区间或空结果，不会用日线等其他周期推算缺失的分钟K线。长时间
+范围应按少量证券拆批；单条UTF-8 JSON响应仍受默认5 MiB上限约束，超限会返回
+`RESPONSE_TOO_LARGE`。
 
 ### 5.8 list_new_issues
 
@@ -1036,7 +1065,8 @@ async with AsyncQmtClient(config_path=CONFIG_PATH) as client:
 | `await get_quotes(instruments, timeout, include_raw)` | `get_quotes(...)` |
 | `await list_sector_instruments(sector_name, timeout)` | `list_sector_instruments(...)` |
 | `await get_instrument_details(instruments, timeout, include_raw)` | `get_instrument_details(...)` |
-| `await get_daily_history(instruments, ..., timeout)` | `get_daily_history(...)` |
+| `await get_bar_history(instruments, period, ..., timeout)` | `get_bar_history(...)` |
+| `await get_daily_history(instruments, ..., timeout, adjustment)` | `get_daily_history(...)` |
 | `await list_new_issues(issue_type, timeout)` | `list_new_issues(...)` |
 | `await get_new_issue_quota(account_id, timeout)` | `get_new_issue_quota(...)` |
 | `await place_order(order, wait_for, timeout)` | `place_order(...)` |
@@ -1150,7 +1180,7 @@ except QmtAdapterError as exc:
 - 单个同步或异步客户端也只允许一条请求在途；
 - 单条UTF-8 JSON消息默认上限为5 MiB，响应超限返回结构化错误且不关闭连接；
 - 正常断开后，服务端会重新创建管道并接受下一次连接；
-- QMT账户、持仓、普通行情、板块成分、合约详情、历史日线、成交、发行数据、申购额度、普通下单、逆回购、
+- QMT账户、持仓、普通行情、板块成分、合约详情、历史K线、成交、发行数据、申购额度、普通下单、逆回购、
   申购、算法下单和撤单命令在QMT主线程的定时器中执行；
 - `system.health`、`order.get/list/wait` 和 `algo_order.get/list` 是本地持久化读取，
   不需要调用QMT交易函数。
@@ -1164,7 +1194,7 @@ except QmtAdapterError as exc:
   -> health确认Bridge运行状态
   -> get_account/list_positions确认账号
   -> get_quote/get_quotes按需查询最新普通行情
-  -> list_sector_instruments/get_instrument_details/get_daily_history按小批次读取历史数据
+  -> list_sector_instruments/get_instrument_details/get_bar_history按小批次读取历史数据
   -> 新股新债：list_new_issues/get_new_issue_quota后由调用方决定是否申购
   -> 普通委托：place_order并保存client_order_id
   -> 逆回购/申购：对应独立下单函数并保存client_order_id

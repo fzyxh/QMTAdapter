@@ -39,6 +39,35 @@ ORDER_STATUSES = {
 }
 TERMINAL_ORDER_STATUSES = {"FILLED", "CANCELED", "REJECTED"}
 INSTRUMENT_PATTERN = re.compile(r"^[0-9]{6}\.(SH|SZ|BJ)$")
+BAR_PERIOD_ALIASES = {"1h": "60m"}
+BAR_PERIODS = {
+    "1m",
+    "3m",
+    "5m",
+    "10m",
+    "15m",
+    "30m",
+    "60m",
+    "2h",
+    "3h",
+    "4h",
+    "1d",
+    "2d",
+    "3d",
+    "5d",
+    "1w",
+    "1mon",
+    "1q",
+    "1hy",
+    "1y",
+}
+DAILY_ADJUSTMENTS = {
+    "none",
+    "front",
+    "back",
+    "front_ratio",
+    "back_ratio",
+}
 
 
 def _validated_include_raw(value: bool) -> bool:
@@ -74,6 +103,48 @@ def _validated_daily_date(value: Optional[str], name: str) -> str:
     if normalized and not re.match(r"^[0-9]{8}$", normalized):
         raise ValidationError("%s must be empty or YYYYMMDD" % name)
     return normalized
+
+
+def _normalized_bar_period(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValidationError("period must be a string")
+    normalized = value.strip().lower()
+    normalized = BAR_PERIOD_ALIASES.get(normalized, normalized)
+    if normalized not in BAR_PERIODS:
+        raise ValidationError("unsupported bar period: %s" % value)
+    return normalized
+
+
+def _normalized_daily_adjustment(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValidationError("adjustment must be a string")
+    normalized = value.strip().lower()
+    if normalized not in DAILY_ADJUSTMENTS:
+        raise ValidationError("unsupported daily adjustment: %s" % value)
+    return normalized
+
+
+def _validated_bar_time(value: Optional[str], name: str) -> str:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return ""
+    if re.match(r"^[0-9]{8}$", normalized):
+        date_format = "%Y%m%d"
+    elif re.match(r"^[0-9]{14}$", normalized):
+        date_format = "%Y%m%d%H%M%S"
+    else:
+        raise ValidationError("%s must be empty, YYYYMMDD or YYYYMMDDHHMMSS" % name)
+    try:
+        time.strptime(normalized, date_format)
+    except ValueError:
+        raise ValidationError("%s is not a valid date/time" % name)
+    return normalized
+
+
+def _bar_time_bound(value: str, is_end: bool) -> str:
+    if len(value) == 8:
+        return value + ("235959" if is_end else "000000")
+    return value
 
 
 def _normalized_wait_statuses(statuses: Optional[Iterable[str]]) -> List[str]:
@@ -388,6 +459,7 @@ class QmtClient:
         subscribe: bool = False,
         timeout: float = 30.0,
         include_raw: bool = False,
+        adjustment: str = "none",
     ) -> Dict[str, Any]:
         """从大QMT模型上下文读取一批证券的历史日线。
 
@@ -399,12 +471,98 @@ class QmtClient:
         ``timestamps`` 是索引时间，``data`` 按字段保存等长数组。价格和成交额
         固定输出三位小数字符串，数量与状态输出整数。``adjustment_factor``
         是截至对应交易日的完整历史累计复权因子，不随查询起点变化，最多输出
-        六位小数。``include_raw=True`` 时额外返回QMT未复权原始列。
+        六位小数。``adjustment`` 默认是 ``none``，也可指定 ``front``、
+        ``back``、``front_ratio`` 或 ``back_ratio``；它只改变标准价格字段，
+        不改变累计复权因子的定义。``include_raw=True`` 时额外返回QMT原始列。
         """
-        normalized_instruments = _normalized_instruments(instruments)
         normalized_start = _validated_daily_date(start_time, "start_time")
         normalized_end = _validated_daily_date(end_time, "end_time")
-        if normalized_start and normalized_end and normalized_start > normalized_end:
+        normalized_adjustment = _normalized_daily_adjustment(adjustment)
+        return self._request_bar_history(
+            instruments,
+            period="1d",
+            start_time=normalized_start,
+            end_time=normalized_end,
+            count=count,
+            fill_data=fill_data,
+            subscribe=subscribe,
+            timeout=timeout,
+            include_raw=include_raw,
+            adjustment=normalized_adjustment,
+        )
+
+    def get_bar_history(
+        self,
+        instruments: Iterable[str],
+        period: str,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+        count: int = -1,
+        fill_data: bool = False,
+        subscribe: bool = False,
+        timeout: float = 30.0,
+        include_raw: bool = False,
+    ) -> Dict[str, Any]:
+        """从大QMT模型上下文批量读取标准化历史K线。
+
+        Args:
+            instruments: 证券代码集合，例如 ``["932000.SH"]``。
+            period: K线周期。支持分钟、小时、日、周、月、季、半年和年等
+                大QMT合成周期；``1h`` 会规范为 ``60m``。
+            start_time: 起始时间，格式为 ``YYYYMMDD`` 或
+                ``YYYYMMDDHHMMSS``，空值表示不限制。
+            end_time: 结束时间，格式同 ``start_time``。
+            count: 返回条数；``-1`` 表示时间范围内全部数据。
+            fill_data: 是否让大QMT填充缺失K线。
+            subscribe: 是否让大QMT订阅该行情；``False`` 只读取本地数据。
+            timeout: 请求超时秒数。
+            include_raw: 是否附带大QMT原始列和原始时间索引。
+
+        Returns:
+            紧凑列式结构。每个 ``item`` 包含 ``timestamps``、``data`` 和
+            ``count``。所有周期的价格均为不复权价格；分钟、小时、周、月等
+            周期返回固定通用字段，``1d`` 额外返回最多六位的完整历史累计
+            复权因子。价格和成交额保留三位小数。
+        """
+        return self._request_bar_history(
+            instruments,
+            period=period,
+            start_time=start_time,
+            end_time=end_time,
+            count=count,
+            fill_data=fill_data,
+            subscribe=subscribe,
+            timeout=timeout,
+            include_raw=include_raw,
+            adjustment="none",
+        )
+
+    def _request_bar_history(
+        self,
+        instruments: Iterable[str],
+        period: str,
+        start_time: Optional[str],
+        end_time: Optional[str],
+        count: int,
+        fill_data: bool,
+        subscribe: bool,
+        timeout: float,
+        include_raw: bool,
+        adjustment: str,
+    ) -> Dict[str, Any]:
+        normalized_instruments = _normalized_instruments(instruments)
+        normalized_period = _normalized_bar_period(period)
+        normalized_adjustment = _normalized_daily_adjustment(adjustment)
+        if normalized_period != "1d" and normalized_adjustment != "none":
+            raise ValidationError("adjustment is only supported for period 1d")
+        normalized_start = _validated_bar_time(start_time, "start_time")
+        normalized_end = _validated_bar_time(end_time, "end_time")
+        if (
+            normalized_start
+            and normalized_end
+            and _bar_time_bound(normalized_start, False)
+            > _bar_time_bound(normalized_end, True)
+        ):
             raise ValidationError("start_time must not be later than end_time")
         if isinstance(count, bool) or not isinstance(count, int):
             raise ValidationError("count must be an integer")
@@ -416,15 +574,17 @@ class QmtClient:
             raise ValidationError("subscribe must be a boolean")
         include_raw = _validated_include_raw(include_raw)
         return self._request(
-            "market.history.daily.get",
+            "market.history.bar.get",
             {
                 "instruments": normalized_instruments,
+                "period": normalized_period,
                 "start_time": normalized_start,
                 "end_time": normalized_end,
                 "count": count,
                 "fill_data": fill_data,
                 "subscribe": subscribe,
                 "include_raw": include_raw,
+                "adjustment": normalized_adjustment,
             },
             timeout=timeout,
         )

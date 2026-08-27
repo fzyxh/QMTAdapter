@@ -39,7 +39,7 @@ _RUNTIME = None
 
 ALGORITHM_BOOK_LIQUIDITY_WEIGHTED = "BOOK_LIQUIDITY_WEIGHTED"
 RESERVED_EXECUTION_ALGORITHMS = ("TWAP", "VWAP")
-DAILY_HISTORY_FIELD_MAP = {
+BAR_HISTORY_FIELD_MAP = {
     "open_price": "open",
     "high_price": "high",
     "low_price": "low",
@@ -51,8 +51,7 @@ DAILY_HISTORY_FIELD_MAP = {
     "previous_close": "preClose",
     "suspension_status": "suspendFlag",
 }
-DAILY_HISTORY_STANDARD_FIELDS = (
-    "adjustment_factor",
+BAR_HISTORY_COMMON_FIELDS = (
     "open_price",
     "high_price",
     "low_price",
@@ -64,7 +63,8 @@ DAILY_HISTORY_STANDARD_FIELDS = (
     "previous_close",
     "suspension_status",
 )
-DAILY_HISTORY_DECIMAL_FIELDS = {
+DAILY_HISTORY_STANDARD_FIELDS = ("adjustment_factor",) + BAR_HISTORY_COMMON_FIELDS
+BAR_HISTORY_DECIMAL_FIELDS = {
     "open_price",
     "high_price",
     "low_price",
@@ -73,10 +73,39 @@ DAILY_HISTORY_DECIMAL_FIELDS = {
     "settlement_price",
     "previous_close",
 }
-DAILY_HISTORY_INTEGER_FIELDS = {
+BAR_HISTORY_INTEGER_FIELDS = {
     "volume_lots",
     "open_interest",
     "suspension_status",
+}
+BAR_PERIOD_ALIASES = {"1h": "60m"}
+BAR_PERIODS = {
+    "1m",
+    "3m",
+    "5m",
+    "10m",
+    "15m",
+    "30m",
+    "60m",
+    "2h",
+    "3h",
+    "4h",
+    "1d",
+    "2d",
+    "3d",
+    "5d",
+    "1w",
+    "1mon",
+    "1q",
+    "1hy",
+    "1y",
+}
+DAILY_ADJUSTMENTS = {
+    "none",
+    "front",
+    "back",
+    "front_ratio",
+    "back_ratio",
 }
 ALGO_TERMINAL_STATUSES = ("FILLED", "CANCELED", "FAILED")
 ORDER_TERMINAL_STATUSES = ("FILLED", "CANCELED", "REJECTED")
@@ -773,19 +802,74 @@ def _sequence_values(value, name):
         raise BridgeError("QMT_DATA_ERROR", "%s is not a sequence" % name)
 
 
-def _normalize_daily_timestamp(value):
+def _normalize_history_timestamp(value):
     text = str(_safe_value(value) or "").strip()
     if re.match(r"^[0-9]{8}$", text):
         try:
             return datetime.datetime.strptime(text, "%Y%m%d").date().isoformat()
         except Exception:
             pass
+    if re.match(r"^[0-9]{14}$", text):
+        try:
+            return datetime.datetime.strptime(text, "%Y%m%d%H%M%S").isoformat()
+        except Exception:
+            pass
     if re.match(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}", text):
         try:
+            if len(text) >= 19:
+                normalized = text[:19].replace("T", " ")
+                return datetime.datetime.strptime(
+                    normalized, "%Y-%m-%d %H:%M:%S"
+                ).isoformat()
             return datetime.datetime.strptime(text[:10], "%Y-%m-%d").date().isoformat()
         except Exception:
             pass
-    raise BridgeError("QMT_DATA_ERROR", "invalid daily history timestamp: %s" % text)
+    raise BridgeError("QMT_DATA_ERROR", "invalid bar history timestamp: %s" % text)
+
+
+def _normalize_bar_period(value):
+    normalized = str(value or "").strip().lower()
+    normalized = BAR_PERIOD_ALIASES.get(normalized, normalized)
+    if normalized not in BAR_PERIODS:
+        raise BridgeError(
+            "INVALID_ARGUMENT", "unsupported bar period: %s" % value
+        )
+    return normalized
+
+
+def _normalize_daily_adjustment(value):
+    normalized = str(value or "").strip().lower()
+    if normalized not in DAILY_ADJUSTMENTS:
+        raise BridgeError(
+            "INVALID_ARGUMENT", "unsupported daily adjustment: %s" % value
+        )
+    return normalized
+
+
+def _validate_bar_time(value, name):
+    normalized = str(value or "").strip()
+    if not normalized:
+        return ""
+    if re.match(r"^[0-9]{8}$", normalized):
+        date_format = "%Y%m%d"
+    elif re.match(r"^[0-9]{14}$", normalized):
+        date_format = "%Y%m%d%H%M%S"
+    else:
+        raise BridgeError(
+            "INVALID_ARGUMENT",
+            "%s must be empty, YYYYMMDD or YYYYMMDDHHMMSS" % name,
+        )
+    try:
+        datetime.datetime.strptime(normalized, date_format)
+    except Exception:
+        raise BridgeError("INVALID_ARGUMENT", "%s is not a valid date/time" % name)
+    return normalized
+
+
+def _bar_time_bound(value, is_end):
+    if len(value) == 8:
+        return value + ("235959" if is_end else "000000")
+    return value
 
 
 def _history_integer(value, field, instrument):
@@ -809,7 +893,7 @@ def _history_integer(value, field, instrument):
 
 
 def _normalize_history_value(value, field, instrument):
-    if field in DAILY_HISTORY_DECIMAL_FIELDS:
+    if field in BAR_HISTORY_DECIMAL_FIELDS:
         safe = _safe_value(value)
         if safe in (None, ""):
             return None
@@ -820,9 +904,9 @@ def _normalize_history_value(value, field, instrument):
                 "invalid decimal history value for %s/%s" % (instrument, field),
             )
         return normalized
-    if field in DAILY_HISTORY_INTEGER_FIELDS:
+    if field in BAR_HISTORY_INTEGER_FIELDS:
         return _history_integer(value, field, instrument)
-    raise BridgeError("QMT_DATA_ERROR", "unsupported daily history field: %s" % field)
+    raise BridgeError("QMT_DATA_ERROR", "unsupported bar history field: %s" % field)
 
 
 def _history_adjustment_factors(
@@ -856,7 +940,7 @@ def _history_adjustment_factors(
             % instrument,
         )
     adjusted_timestamps = [
-        _normalize_daily_timestamp(value)
+        _normalize_history_timestamp(value)
         for value in _sequence_values(index_value, "back-ratio history index")
     ]
     if adjusted_timestamps != raw_timestamps:
@@ -893,10 +977,45 @@ def _history_adjustment_factors(
     return normalized
 
 
-def _serialize_history_frame(
-    frame, back_ratio_frame, fields, instrument, include_raw=False
-):
+def _is_empty_history_sentinel(frame):
+    """Recognize QMT's single zero-valued 1970 row used for no bar data."""
     if frame is None:
+        return False
+    index_value = getattr(frame, "index", None)
+    columns_value = getattr(frame, "columns", None)
+    if index_value is None or columns_value is None:
+        return False
+    timestamps = _sequence_values(index_value, "history index")
+    if len(timestamps) != 1:
+        return False
+    timestamp = str(_safe_value(timestamps[0]) or "").strip()
+    if timestamp not in ("19700101", "19700101000000", "1970-01-01"):
+        return False
+    columns = set(str(value) for value in _sequence_values(columns_value, "columns"))
+    for field in ("open", "high", "low", "close", "volume", "amount"):
+        if field not in columns:
+            return False
+        values = _sequence_values(frame[field], "history sentinel field %s" % field)
+        if len(values) != 1:
+            return False
+        safe = _safe_value(values[0])
+        try:
+            if safe in (None, "") or decimal.Decimal(str(safe)) != 0:
+                return False
+        except Exception:
+            return False
+    return True
+
+
+def _serialize_history_frame(
+    frame,
+    unadjusted_frame,
+    back_ratio_frame,
+    fields,
+    instrument,
+    include_raw=False,
+):
+    if frame is None or _is_empty_history_sentinel(frame):
         return {
             "instrument": instrument,
             "timestamps": [],
@@ -915,7 +1034,7 @@ def _serialize_history_frame(
     ]
     columns = set(column_names)
     raw_timestamps = _sequence_values(index_value, "history index")
-    timestamps = [_normalize_daily_timestamp(value) for value in raw_timestamps]
+    timestamps = [_normalize_history_timestamp(value) for value in raw_timestamps]
     row_count = len(timestamps)
     data = {}
     for field in fields:
@@ -930,15 +1049,15 @@ def _serialize_history_frame(
                 data[field] = []
                 continue
             data[field] = _history_adjustment_factors(
-                frame, back_ratio_frame, timestamps, instrument
+                unadjusted_frame, back_ratio_frame, timestamps, instrument
             )
             continue
-        qmt_field = DAILY_HISTORY_FIELD_MAP[field]
+        qmt_field = BAR_HISTORY_FIELD_MAP[field]
         if qmt_field not in columns:
             if row_count:
                 raise BridgeError(
                     "QMT_DATA_ERROR",
-                    "QMT omitted requested daily history field %s for %s"
+                    "QMT omitted requested bar history field %s for %s"
                     % (field, instrument),
                 )
             data[field] = []
@@ -2412,6 +2531,7 @@ class BridgeRuntime(object):
                     "quote.list",
                     "sector.instruments.list",
                     "instrument.detail.list",
+                    "market.history.bar.get",
                     "market.history.daily.get",
                     "new_issue.list",
                     "new_issue.quota.get",
@@ -2729,6 +2849,8 @@ class BridgeRuntime(object):
             return self.query_sector_instruments(payload, context_info)
         if command == "instrument.detail.list":
             return self.query_instrument_details(payload, context_info)
+        if command == "market.history.bar.get":
+            return self.query_bar_history(payload, context_info)
         if command == "market.history.daily.get":
             return self.query_daily_history(payload, context_info)
         if command == "new_issue.list":
@@ -3008,18 +3130,28 @@ class BridgeRuntime(object):
             )
         return {"items": items, "count": len(items), "as_of": _utc_now_text()}
 
-    def query_daily_history(self, payload, context_info):
+    def query_bar_history(self, payload, context_info):
         self._require_latest_bar(context_info)
         instruments = self._payload_instruments(payload)
-        normalized_fields = list(DAILY_HISTORY_STANDARD_FIELDS)
-        start_time = str(payload.get("start_time", "") or "").strip()
-        end_time = str(payload.get("end_time", "") or "").strip()
-        for name, value in (("start_time", start_time), ("end_time", end_time)):
-            if value and not re.match(r"^[0-9]{8}$", value):
-                raise BridgeError(
-                    "INVALID_ARGUMENT", "%s must be empty or YYYYMMDD" % name
-                )
-        if start_time and end_time and start_time > end_time:
+        period = _normalize_bar_period(payload.get("period", ""))
+        adjustment = _normalize_daily_adjustment(
+            payload.get("adjustment", "none")
+        )
+        if period != "1d" and adjustment != "none":
+            raise BridgeError(
+                "INVALID_ARGUMENT", "adjustment is only supported for period 1d"
+            )
+        if period == "1d":
+            normalized_fields = list(DAILY_HISTORY_STANDARD_FIELDS)
+        else:
+            normalized_fields = list(BAR_HISTORY_COMMON_FIELDS)
+        start_time = _validate_bar_time(payload.get("start_time", ""), "start_time")
+        end_time = _validate_bar_time(payload.get("end_time", ""), "end_time")
+        if (
+            start_time
+            and end_time
+            and _bar_time_bound(start_time, False) > _bar_time_bound(end_time, True)
+        ):
             raise BridgeError(
                 "INVALID_ARGUMENT", "start_time must not be later than end_time"
             )
@@ -3043,19 +3175,19 @@ class BridgeRuntime(object):
                 "QMT_API_MISSING", "ContextInfo.get_market_data_ex is unavailable"
             )
         raw_fields = [
-            DAILY_HISTORY_FIELD_MAP[field]
+            BAR_HISTORY_FIELD_MAP[field]
             for field in normalized_fields
-            if field in DAILY_HISTORY_FIELD_MAP
+            if field in BAR_HISTORY_FIELD_MAP
         ]
         raw_fields = list(dict.fromkeys(raw_fields))
         raw = getter(
             raw_fields,
             instruments,
-            "1d",
+            period,
             start_time,
             end_time,
             count,
-            "none",
+            adjustment,
             fill_data,
             subscribe,
         )
@@ -3064,27 +3196,54 @@ class BridgeRuntime(object):
                 "QMT_DATA_ERROR",
                 "ContextInfo.get_market_data_ex did not return a mapping",
             )
-        back_ratio = getter(
-            ["close"],
-            instruments,
-            "1d",
-            start_time,
-            end_time,
-            count,
-            "back_ratio",
-            fill_data,
-            False,
-        )
-        if not isinstance(back_ratio, dict):
-            raise BridgeError(
-                "QMT_DATA_ERROR",
-                "ContextInfo.get_market_data_ex did not return a back-ratio mapping",
-            )
+        if period == "1d":
+            if adjustment == "none":
+                unadjusted = raw
+            else:
+                unadjusted = getter(
+                    ["close"],
+                    instruments,
+                    period,
+                    start_time,
+                    end_time,
+                    count,
+                    "none",
+                    fill_data,
+                    False,
+                )
+                if not isinstance(unadjusted, dict):
+                    raise BridgeError(
+                        "QMT_DATA_ERROR",
+                        "ContextInfo.get_market_data_ex did not return an unadjusted mapping",
+                    )
+            if adjustment == "back_ratio":
+                back_ratio = raw
+            else:
+                back_ratio = getter(
+                    ["close"],
+                    instruments,
+                    period,
+                    start_time,
+                    end_time,
+                    count,
+                    "back_ratio",
+                    fill_data,
+                    False,
+                )
+            if not isinstance(back_ratio, dict):
+                raise BridgeError(
+                    "QMT_DATA_ERROR",
+                    "ContextInfo.get_market_data_ex did not return a back-ratio mapping",
+                )
+        else:
+            unadjusted = {}
+            back_ratio = {}
         items = []
         row_count = 0
         for instrument in instruments:
             item = _serialize_history_frame(
                 raw.get(instrument),
+                unadjusted.get(instrument),
                 back_ratio.get(instrument),
                 normalized_fields,
                 instrument,
@@ -3093,12 +3252,18 @@ class BridgeRuntime(object):
             items.append(item)
             row_count += item["count"]
         return {
-            "period": "1d",
+            "period": period,
+            "adjustment": adjustment,
             "items": items,
             "count": len(items),
             "row_count": row_count,
             "as_of": _utc_now_text(),
         }
+
+    def query_daily_history(self, payload, context_info):
+        daily_payload = dict(payload)
+        daily_payload["period"] = "1d"
+        return self.query_bar_history(daily_payload, context_info)
 
     def query_trades(self, payload):
         account_id = self._require_account(payload)

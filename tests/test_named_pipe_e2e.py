@@ -215,8 +215,34 @@ class FakeContext(object):
             "openInterest": [0, 0],
             "suspendFlag": [0, 0],
         }
-        timestamps = ["20260820", "20260821"]
-        if dividend_type == "back_ratio":
+        if period == "60m":
+            timestamps = ["20260820103000", "20260820113000"]
+        elif period == "1w":
+            timestamps = ["19700101"]
+            base = dict((field, [0]) for field in base)
+        else:
+            timestamps = ["20260820", "20260821"]
+        if dividend_type in ("front", "front_ratio"):
+            for field in (
+                "open",
+                "high",
+                "low",
+                "close",
+                "preClose",
+                "settelementPrice",
+            ):
+                base[field] = [float(value) * 0.5 for value in base[field]]
+        elif dividend_type == "back":
+            for field in (
+                "open",
+                "high",
+                "low",
+                "close",
+                "preClose",
+                "settelementPrice",
+            ):
+                base[field] = [float(value) * 2 for value in base[field]]
+        elif dividend_type == "back_ratio":
             base["close"] = [20.0, 21.473684210526315]
         selected = [
             index
@@ -793,6 +819,99 @@ class NamedPipeEndToEndTests(unittest.TestCase):
         self.assertEqual(
             history["items"][0]["data"]["adjustment_factor"],
             ["2.105263"],
+        )
+
+    def test_daily_history_supports_adjusted_prices_with_stable_factor(self):
+        with QmtClient(config_path=self.config_path) as client:
+            history = client.get_daily_history(
+                ["600000.SH"],
+                adjustment="front_ratio",
+                timeout=5,
+                include_raw=True,
+            )
+
+        self.assertEqual(history["period"], "1d")
+        self.assertEqual(history["adjustment"], "front_ratio")
+        self.assertEqual(
+            history["items"][0]["data"]["close_price"],
+            ["5.000", "5.100"],
+        )
+        self.assertEqual(
+            history["items"][0]["data"]["adjustment_factor"],
+            ["2", "2.105263"],
+        )
+        self.assertEqual(
+            history["items"][0]["raw"]["data"]["close"],
+            [5.0, 5.1],
+        )
+        self.assertEqual(
+            [call["dividend_type"] for call in self.fake_api.history_calls],
+            ["front_ratio", "none", "back_ratio"],
+        )
+
+    def test_daily_history_rejects_unknown_adjustment_before_qmt_call(self):
+        with QmtClient(config_path=self.config_path) as client:
+            with self.assertRaises(ValidationError):
+                client.get_daily_history(
+                    ["600000.SH"], adjustment="forward_adjusted"
+                )
+        self.assertEqual(self.fake_api.history_calls, [])
+
+    def test_bar_history_normalizes_period_and_intraday_timestamps(self):
+        with QmtClient(config_path=self.config_path) as client:
+            history = client.get_bar_history(
+                ["932000.SH"],
+                period="1h",
+                start_time="20260820100000",
+                end_time="20260820120000",
+                timeout=5,
+                include_raw=True,
+            )
+
+        self.assertEqual(history["period"], "60m")
+        self.assertEqual(history["row_count"], 2)
+        self.assertEqual(
+            history["items"][0]["timestamps"],
+            ["2026-08-20T10:30:00", "2026-08-20T11:30:00"],
+        )
+        self.assertNotIn("adjustment_factor", history["items"][0]["data"])
+        self.assertEqual(
+            history["items"][0]["raw"]["timestamps"],
+            ["20260820103000", "20260820113000"],
+        )
+        self.assertEqual(
+            [call["period"] for call in self.fake_api.history_calls],
+            ["60m"],
+        )
+        self.assertEqual(self.fake_api.history_calls[0]["dividend_type"], "none")
+
+    def test_bar_history_validates_period_and_time_before_qmt_call(self):
+        with QmtClient(config_path=self.config_path) as client:
+            with self.assertRaises(ValidationError):
+                client.get_bar_history(["600000.SH"], period="7m")
+            with self.assertRaises(ValidationError):
+                client.get_bar_history(
+                    ["600000.SH"],
+                    period="60m",
+                    start_time="20260230093000",
+                )
+        self.assertEqual(self.fake_api.history_calls, [])
+
+    def test_bar_history_filters_qmt_empty_weekly_sentinel(self):
+        with QmtClient(config_path=self.config_path) as client:
+            history = client.get_bar_history(
+                ["932000.SH"], period="1w", timeout=5
+            )
+
+        self.assertEqual(history["period"], "1w")
+        self.assertEqual(history["adjustment"], "none")
+        self.assertEqual(history["row_count"], 0)
+        self.assertEqual(history["items"][0]["timestamps"], [])
+        self.assertTrue(
+            all(
+                values == []
+                for values in history["items"][0]["data"].values()
+            )
         )
 
     def test_get_order_standard_fields_and_optional_raw(self):

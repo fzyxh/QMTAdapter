@@ -17,7 +17,7 @@
 - 股票账户查询；
 - 股票持仓查询；
 - 单只及批量证券行情查询（可选返回QMT原始行情）；
-- 大QMT板块成分、股票/ETF/转债等证券的批量合约详情及历史日线查询；
+- 大QMT板块成分、股票/ETF/转债等证券的批量合约详情及多周期历史K线查询；
 - 历史日线提供不随查询起点变化的每日累计复权因子；
 - 普通现金账户股票买入和卖出；
 - 北交所普通股票委托（买入不少于100股，之后可按1股递增）；
@@ -149,7 +149,7 @@ QMT Adapter bridge [vx.x.x] is ready: \\.\pipe\qmt_adapter
 
 能够返回 Bridge 状态、账户资金和持仓即表示部署成功。从源码安装时，其他辅助脚本的用途和运行方式见 [`scripts/README.md`](scripts/README.md)。
 
-历史日线通过大QMT模型上下文读取，不需要在外部Python中导入 `xtquant`。长时间范围
+历史K线通过大QMT模型上下文读取，不需要在外部Python中导入 `xtquant`。长时间范围
 请拆成较小证券批次，避免超过单条5 MiB消息上限：
 
 ```python
@@ -157,26 +157,37 @@ from qmt_adapter import QmtClient
 
 
 with QmtClient() as client:
-    instruments = client.list_sector_instruments("沪深A股")["items"]
-    history = client.get_daily_history(
-        instruments[:10],
-        start_time="20260101",
-        end_time="20260821",
-        subscribe=True,
+    history = client.get_bar_history(
+        ["932000.SH"],
+        period="60m",
+        start_time="20260825",
+        end_time="20260827",
+        subscribe=False,
         timeout=60.0,
         include_raw=False,
     )
 ```
 
-`subscribe=False` 时，`get_daily_history()` 只读取大QMT本地已有历史数据；
+`get_bar_history()` 支持 `1m`、`3m`、`5m`、`10m`、`15m`、`30m`、
+`60m`、`2h`～`4h`、`1d`、`2d`～`5d`、`1w`、`1mon`、`1q`、
+`1hy` 和 `1y`；`1h` 作为 `60m` 的输入别名，120分钟线使用 `2h`。合成周期
+依赖本地对应的基础周期数据，例如历史 `60m` 和 `2h` 由 `5m` 合成，周线和
+月线由日线合成。
+
+`subscribe=False` 时，接口只读取大QMT本地已有历史数据；
 设置为 `True` 时由大QMT按自身规则订阅并尝试补充请求的数据。实测订阅可以补充
 最近多日日线，但不保证补齐任意长区间；需要完整的长区间数据时，应先在大QMT
-客户端完成对应日线下载。
+客户端完成对应基础周期下载。`start_time` 只限定请求范围，不代表券商行情服务器
+一定提供该日期之后的全部历史；服务器权限或数据留存不足时，接口按实际可用数据
+返回部分区间或空结果，不会用其他周期推算缺失的分钟K线。
 
-`get_daily_history()` 固定返回全部标准日线字段；设置 `include_raw=True` 才会
-额外附带QMT未复权原始列。标准字段中的 `adjustment_factor` 是截至对应交易日的
-完整历史累计复权因子，不随查询起点变化，最多保留六位小数；调用方不需要选择
-或处理辅助行情列。
+`get_bar_history()` 的开高低收默认均为不复权价格；设置 `include_raw=True` 才会
+额外附带QMT原始列。分钟、小时、周、月等周期返回固定通用字段，只有 `1d`
+额外返回 `adjustment_factor`：它是截至对应交易日的完整历史累计复权因子，不随
+查询起点变化，最多保留六位小数。`get_daily_history()` 保留为
+`period="1d"` 的兼容快捷接口，并可通过 `adjustment="front"`、`"back"`、
+`"front_ratio"` 或 `"back_ratio"` 请求复权日线；默认 `"none"`。该参数只
+改变日线标准价格字段，不改变 `adjustment_factor` 的定义。
 
 ### 5. 升级
 

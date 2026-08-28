@@ -1,6 +1,6 @@
 # QMT Adapter 部署与函数调用说明
 
-本文档对应QMTAdapter `0.7.2`、命名管道协议6，说明大 QMT 端脚本的部署方式，
+本文档对应QMTAdapter `0.7.3`、命名管道协议6，说明大 QMT 端脚本的部署方式，
 以及外部封装库的同步、异步函数调用方法。
 
 ## 1. 当前支持范围
@@ -144,7 +144,7 @@ SQLite 启用 WAL 后，运行期间可能在同一目录生成 `bridge.db-wal` 
 
 ```json
 {
-  "version": "0.7.2",
+  "version": "0.7.3",
   "pipe_name": "\\\\.\\pipe\\qmt_adapter",
   "auth_token": "由部署命令生成的64位十六进制字符串",
   "db_path": "C:\\QMTAdapter\\data\\bridge.db",
@@ -817,7 +817,7 @@ order = client.get_order(
 |---|---|
 | `client_order_id` | 外部统一委托ID |
 | `request_id` | 原始 `order.place` 协议请求 ID |
-| `qmt_order_id` | QMT委托ID，尚未收到回报时可能为空 |
+| `qmt_order_id` | QMT当日委托ID，尚未收到回报时可能为空；可能在后续交易日复用，不是持久唯一身份 |
 | `order_kind` | `STOCK`、`REVERSE_REPO` 或 `NEW_ISSUE_SUBSCRIPTION` |
 | `business_type` | 业务类型 |
 | `quantity_type` | `SHARES`、`REPO_UNITS` 或 `SUBSCRIPTION_UNITS` |

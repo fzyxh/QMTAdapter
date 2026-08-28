@@ -1589,6 +1589,7 @@ class PipeServer(object):
     ERROR_NO_DATA = 232
     ERROR_PIPE_CONNECTED = 535
     INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+    THREAD_TERMINATE = 0x0001
 
     def __init__(
         self,
@@ -1670,6 +1671,16 @@ class PipeServer(object):
         if hasattr(k32, "CancelIoEx"):
             k32.CancelIoEx.argtypes = [wintypes.HANDLE, wintypes.LPVOID]
             k32.CancelIoEx.restype = wintypes.BOOL
+        if hasattr(k32, "OpenThread"):
+            k32.OpenThread.argtypes = [
+                wintypes.DWORD,
+                wintypes.BOOL,
+                wintypes.DWORD,
+            ]
+            k32.OpenThread.restype = wintypes.HANDLE
+        if hasattr(k32, "CancelSynchronousIo"):
+            k32.CancelSynchronousIo.argtypes = [wintypes.HANDLE]
+            k32.CancelSynchronousIo.restype = wintypes.BOOL
 
     def start(self):
         self.server_thread = threading.Thread(
@@ -1698,20 +1709,22 @@ class PipeServer(object):
             listener_handle = self.listener_handle
             states = list(self.connections.values())
             self.connection_condition.notify_all()
-        if thread.is_alive() and listener_handle is not None:
-            wake_handle = self.kernel32.CreateFileW(
-                self.pipe_name,
-                self.GENERIC_READ | self.GENERIC_WRITE,
-                0,
-                None,
-                self.OPEN_EXISTING,
-                0,
-                None,
-            )
-            if wake_handle != self.INVALID_HANDLE_VALUE:
-                self.kernel32.CloseHandle(wake_handle)
-            elif hasattr(self.kernel32, "CancelIoEx"):
-                self.kernel32.CancelIoEx(listener_handle, None)
+        if thread.is_alive():
+            if listener_handle is not None:
+                wake_handle = self.kernel32.CreateFileW(
+                    self.pipe_name,
+                    self.GENERIC_READ | self.GENERIC_WRITE,
+                    0,
+                    None,
+                    self.OPEN_EXISTING,
+                    0,
+                    None,
+                )
+                if wake_handle != self.INVALID_HANDLE_VALUE:
+                    self.kernel32.CloseHandle(wake_handle)
+                elif hasattr(self.kernel32, "CancelIoEx"):
+                    self.kernel32.CancelIoEx(listener_handle, None)
+            self._cancel_synchronous_io(thread)
         deadline = time.monotonic() + self.STOP_TIMEOUT_SECONDS
         for state in states:
             self._close_connection(
@@ -1748,6 +1761,25 @@ class PipeServer(object):
                         "named pipe connection thread did not stop",
                     )
         self.server_thread = None
+
+    def _cancel_synchronous_io(self, thread):
+        """Cancel the acceptor's blocking ConnectNamedPipe during shutdown."""
+        if not hasattr(self.kernel32, "CancelSynchronousIo") or not hasattr(
+            self.kernel32, "OpenThread"
+        ):
+            return False
+        thread_id = getattr(thread, "native_id", None) or thread.ident
+        if not thread_id:
+            return False
+        thread_handle = self.kernel32.OpenThread(
+            self.THREAD_TERMINATE, False, int(thread_id)
+        )
+        if not thread_handle:
+            return False
+        try:
+            return bool(self.kernel32.CancelSynchronousIo(thread_handle))
+        finally:
+            self.kernel32.CloseHandle(thread_handle)
 
     def _server_loop(self):
         first_instance = True
@@ -1791,6 +1823,9 @@ class PipeServer(object):
                 return
             first_instance = False
             with self.connection_condition:
+                if self.stop_event.is_set():
+                    self._close_raw_handle(handle)
+                    return
                 self.listener_handle = handle
             if not self.startup_event.is_set():
                 self.startup_event.set()
@@ -2083,8 +2118,9 @@ class OrderStore(object):
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
-            CREATE UNIQUE INDEX IF NOT EXISTS uq_orders_qmt_id
-            ON orders(account_id, qmt_order_id)
+            DROP INDEX IF EXISTS uq_orders_qmt_id;
+            CREATE INDEX IF NOT EXISTS ix_orders_qmt_id
+            ON orders(account_id, qmt_order_id, created_at DESC)
             WHERE qmt_order_id IS NOT NULL;
 
             CREATE TABLE IF NOT EXISTS trades (
@@ -2248,7 +2284,8 @@ class OrderStore(object):
     def get_order_by_qmt_id(self, account_id, qmt_order_id):
         with self.lock:
             return self.conn.execute(
-                "SELECT * FROM orders WHERE account_id=? AND qmt_order_id=?",
+                "SELECT * FROM orders WHERE account_id=? AND qmt_order_id=? "
+                "ORDER BY created_at DESC, rowid DESC LIMIT 1",
                 (account_id, qmt_order_id),
             ).fetchone()
 
@@ -2854,16 +2891,15 @@ class BridgeRuntime(object):
 
     def _order_for_trade_raw(self, raw, configured_account_id):
         qmt_order_id = str(raw.get("m_strOrderSysID", "") or "").strip()
-        row = None
-        if qmt_order_id:
-            row = self.store.get_order_by_qmt_id(
-                configured_account_id, qmt_order_id
-            )
-        if row is not None:
-            return row
         remark = str(raw.get("m_strRemark", "") or "")
         if remark:
-            return self.store.get_order_by_wire_tag(remark.split(":", 1)[0])
+            row = self.store.get_order_by_wire_tag(remark.split(":", 1)[0])
+            if row is not None:
+                return row
+        if qmt_order_id:
+            return self.store.get_order_by_qmt_id(
+                configured_account_id, qmt_order_id
+            )
         return None
 
     def _persist_trade_event(self, raw):

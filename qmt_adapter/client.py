@@ -391,7 +391,9 @@ class QmtClient:
             include_raw: 是否为每只证券附带QMT原始行情和静态信息。
 
         Returns:
-            ``{"items": [...], "count": N, "as_of": ...}``。
+            包含 ``items``、``count``、``errors``、``error_count`` 和
+            ``as_of`` 的字典。大QMT未返回行情的证券只进入 ``errors``，
+            不影响同批其他证券的正常结果。
         """
         normalized = _normalized_instruments(instruments)
         include_raw = _validated_include_raw(include_raw)

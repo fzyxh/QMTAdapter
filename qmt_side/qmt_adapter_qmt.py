@@ -3112,44 +3112,60 @@ class BridgeRuntime(object):
             "as_of": _utc_now_text(),
         }
 
-    def _query_quote_items(self, instruments, include_raw, context_info):
+    def _query_quote_items(
+        self, instruments, include_raw, context_info, allow_partial=False
+    ):
         self._require_latest_bar(context_info)
         ticks = context_info.get_full_tick(instruments)
         if not isinstance(ticks, dict):
             raise BridgeError(
                 "QMT_DATA_ERROR", "ContextInfo.get_full_tick did not return a mapping"
             )
-        missing = [instrument for instrument in instruments if instrument not in ticks]
-        if missing:
-            raise BridgeError(
-                "MARKET_DATA_UNAVAILABLE",
-                "QMT did not return full tick for: %s" % ", ".join(missing),
-                {"instruments": missing},
-            )
         as_of = _utc_now_text()
         items = []
+        errors = []
         for instrument in instruments:
             tick = ticks.get(instrument)
             if not isinstance(tick, dict):
+                message = "QMT did not return full tick for: %s" % instrument
+                if allow_partial:
+                    errors.append(
+                        {
+                            "instrument": instrument,
+                            "code": "MARKET_DATA_UNAVAILABLE",
+                            "message": message,
+                        }
+                    )
+                    continue
                 raise BridgeError(
                     "MARKET_DATA_UNAVAILABLE",
-                    "QMT full tick is not an object: %s" % instrument,
+                    message,
+                    {"instruments": [instrument]},
                 )
             detail = context_info.get_instrument_detail(instrument)
             if detail is None:
                 detail = {}
             if not isinstance(detail, dict):
-                raise BridgeError(
-                    "QMT_DATA_ERROR",
+                message = (
                     "ContextInfo.get_instrument_detail did not return an object: %s"
-                    % instrument,
+                    % instrument
                 )
+                if allow_partial:
+                    errors.append(
+                        {
+                            "instrument": instrument,
+                            "code": "QMT_DATA_ERROR",
+                            "message": message,
+                        }
+                    )
+                    continue
+                raise BridgeError("QMT_DATA_ERROR", message)
             items.append(
                 _normalize_quote(
                     tick, detail, instrument, as_of, include_raw=include_raw
                 )
             )
-        return items, as_of
+        return items, errors, as_of
 
     def query_quote(self, payload, context_info):
         instrument = str(payload.get("instrument", "") or "").strip().upper()
@@ -3158,7 +3174,7 @@ class BridgeRuntime(object):
                 "INVALID_ARGUMENT", "invalid instrument code: %s" % instrument
             )
         include_raw = self._include_raw(payload)
-        items, unused_as_of = self._query_quote_items(
+        items, unused_errors, unused_as_of = self._query_quote_items(
             [instrument], include_raw, context_info
         )
         return items[0]
@@ -3184,10 +3200,16 @@ class BridgeRuntime(object):
             seen.add(instrument)
             normalized.append(instrument)
         include_raw = self._include_raw(payload)
-        items, as_of = self._query_quote_items(
-            normalized, include_raw, context_info
+        items, errors, as_of = self._query_quote_items(
+            normalized, include_raw, context_info, allow_partial=True
         )
-        return {"items": items, "count": len(items), "as_of": as_of}
+        return {
+            "items": items,
+            "count": len(items),
+            "errors": errors,
+            "error_count": len(errors),
+            "as_of": as_of,
+        }
 
     def _payload_instruments(self, payload):
         instruments = payload.get("instruments")

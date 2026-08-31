@@ -1,6 +1,6 @@
 # QMT Adapter 部署与函数调用说明
 
-本文档对应QMTAdapter `0.7.3`、命名管道协议6，说明大 QMT 端脚本的部署方式，
+本文档对应QMTAdapter `0.7.4`、命名管道协议6，说明大 QMT 端脚本的部署方式，
 以及外部封装库的同步、异步函数调用方法。
 
 ## 1. 当前支持范围
@@ -144,7 +144,7 @@ SQLite 启用 WAL 后，运行期间可能在同一目录生成 `bridge.db-wal` 
 
 ```json
 {
-  "version": "0.7.3",
+  "version": "0.7.4",
   "pipe_name": "\\\\.\\pipe\\qmt_adapter",
   "auth_token": "由部署命令生成的64位十六进制字符串",
   "db_path": "C:\\QMTAdapter\\data\\bridge.db",
@@ -470,9 +470,32 @@ quotes = client.get_quotes(
         }
     ],
     "count": 1,
+    "errors": [],
+    "error_count": 0,
     "as_of": "UTC时间",
 }
 ```
+
+批量查询允许部分成功。大QMT未返回行情的代码不会导致整批失败，而是逐项进入
+`errors`；其余代码仍按请求顺序进入 `items`：
+
+```python
+{
+    "items": [...正常行情...],
+    "count": 2,
+    "errors": [
+        {
+            "instrument": "999999.SH",
+            "code": "MARKET_DATA_UNAVAILABLE",
+            "message": "QMT did not return full tick for: 999999.SH",
+        }
+    ],
+    "error_count": 1,
+    "as_of": "UTC时间",
+}
+```
+
+单只 `get_quote()` 查询不到行情时仍直接抛出 `RemoteError`。
 
 `volume_lots`、盘口档位中的 `volume_lots` 直接使用大QMT `volume`、
 `askVol` 和 `bidVol` 的“手”值，不自动换算成股票股数或逆回购金额。

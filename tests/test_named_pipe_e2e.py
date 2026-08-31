@@ -679,6 +679,8 @@ class NamedPipeEndToEndTests(unittest.TestCase):
             "fake-stock",
         )
         self.assertEqual(batch["count"], 2)
+        self.assertEqual(batch["errors"], [])
+        self.assertEqual(batch["error_count"], 0)
         self.assertEqual(
             [item["instrument"] for item in batch["items"]],
             ["601919.SH", "600000.SH"],
@@ -697,6 +699,32 @@ class NamedPipeEndToEndTests(unittest.TestCase):
             closed_book = client.get_quote("600000.SH", timeout=5)
         self.assertEqual(closed_book["ask_levels"], [])
         self.assertIsNone(closed_book["best_ask_price"])
+
+    def test_batch_quote_returns_missing_instrument_as_item_error(self):
+        with QmtClient(config_path=self.config_path) as client:
+            batch = client.get_quotes(
+                ["601919.SH", "999999.SH", "600000.SH"], timeout=5
+            )
+            with self.assertRaises(RemoteError) as caught:
+                client.get_quote("999999.SH", timeout=5)
+
+        self.assertEqual(batch["count"], 2)
+        self.assertEqual(batch["error_count"], 1)
+        self.assertEqual(
+            [item["instrument"] for item in batch["items"]],
+            ["601919.SH", "600000.SH"],
+        )
+        self.assertEqual(
+            batch["errors"],
+            [
+                {
+                    "instrument": "999999.SH",
+                    "code": "MARKET_DATA_UNAVAILABLE",
+                    "message": "QMT did not return full tick for: 999999.SH",
+                }
+            ],
+        )
+        self.assertEqual(caught.exception.code, "MARKET_DATA_UNAVAILABLE")
 
     def test_batch_quote_rejects_duplicates_before_qmt_call(self):
         with QmtClient(config_path=self.config_path) as client:

@@ -4,7 +4,12 @@ import runpy
 import tempfile
 import unittest
 
-from qmt_adapter.deploy import DEFAULT_PIPE_NAME, deploy
+from qmt_adapter.deploy import (
+    DEFAULT_PIPE_NAME,
+    DEFAULT_QUOTE_EVENT_MAX_ITEMS,
+    DEFAULT_QUOTE_PIPE_NAME,
+    deploy,
+)
 from qmt_adapter.protocol import MAX_MESSAGE_SIZE
 from qmt_adapter.version import __version__
 
@@ -39,8 +44,16 @@ class DeployTests(unittest.TestCase):
             self.assertEqual(config["version"], __version__)
             self.assertEqual(config["accounts"][0]["account_id"], "SIM001")
             self.assertEqual(config["pipe_name"], DEFAULT_PIPE_NAME)
+            self.assertEqual(
+                config["quote_pipe_name"], DEFAULT_QUOTE_PIPE_NAME
+            )
             self.assertEqual(config["max_clients"], 8)
+            self.assertEqual(config["max_quote_clients"], 8)
             self.assertEqual(config["max_message_size"], MAX_MESSAGE_SIZE)
+            self.assertEqual(
+                config["quote_event_max_items"],
+                DEFAULT_QUOTE_EVENT_MAX_ITEMS,
+            )
             self.assertEqual(len(config["auth_token"]), 64)
             int(config["auth_token"], 16)
 
@@ -85,6 +98,14 @@ class DeployTests(unittest.TestCase):
             config["pipe_name"] = r"\\.\pipe\qmt_adapter_v1"
             config["max_message_size"] = 1024 * 1024
             del config["max_clients"]
+            for key in (
+                "quote_pipe_name",
+                "max_quote_clients",
+                "quote_client_queue_size",
+                "quote_event_queue_size",
+            ):
+                config.pop(key, None)
+            config["quote_event_max_items"] = 500
             first["config_path"].write_text(
                 json.dumps(config, ensure_ascii=True, indent=2) + "\n",
                 encoding="ascii",
@@ -99,6 +120,14 @@ class DeployTests(unittest.TestCase):
             self.assertEqual(updated["pipe_name"], DEFAULT_PIPE_NAME)
             self.assertEqual(updated["max_message_size"], MAX_MESSAGE_SIZE)
             self.assertEqual(updated["max_clients"], 8)
+            self.assertEqual(
+                updated["quote_pipe_name"], DEFAULT_QUOTE_PIPE_NAME
+            )
+            self.assertEqual(updated["max_quote_clients"], 8)
+            self.assertEqual(
+                updated["quote_event_max_items"],
+                DEFAULT_QUOTE_EVENT_MAX_ITEMS,
+            )
             self.assertEqual(updated["accounts"], config["accounts"])
             self.assertEqual(updated["auth_token"], config["auth_token"])
 
@@ -110,6 +139,7 @@ class DeployTests(unittest.TestCase):
             config["pipe_name"] = r"\\.\pipe\custom_qmt_adapter"
             config["max_clients"] = 3
             config["max_message_size"] = 2 * 1024 * 1024
+            config["quote_event_max_items"] = 1234
             first["config_path"].write_text(
                 json.dumps(config, ensure_ascii=True, indent=2) + "\n",
                 encoding="ascii",
@@ -123,6 +153,7 @@ class DeployTests(unittest.TestCase):
             self.assertEqual(
                 updated["max_message_size"], config["max_message_size"]
             )
+            self.assertEqual(updated["quote_event_max_items"], 1234)
 
     def test_first_deploy_requires_account_id(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -24,6 +24,7 @@ import struct
 import threading
 import time
 import traceback
+import uuid
 
 
 CONFIG_PATH = globals().get("QMT_ADAPTER_CONFIG_PATH") or os.environ.get(
@@ -31,7 +32,7 @@ CONFIG_PATH = globals().get("QMT_ADAPTER_CONFIG_PATH") or os.environ.get(
     r"C:\QMTAdapter\config\bridge_config.json",
 )
 
-PROTOCOL_VERSION = 6
+PROTOCOL_VERSION = 7
 # UTF-8 JSON正文上限，不包含4字节帧长度前缀。
 MAX_MESSAGE_SIZE = 5 * 1024 * 1024
 STRATEGY_NAME = "QMT_ADAPTER_V1"
@@ -163,6 +164,11 @@ REVERSE_REPO_INSTRUMENTS = {
 }
 _RUNTIME_SLOT = "_qmt_adapter_bridge_runtime_v1"
 
+QUOTE_MARKETS = ("SH", "SZ", "BJ")
+QUOTE_PUSH_MODES = ("DELTA", "SNAPSHOT")
+QUOTE_INSTRUMENT_SCOPES = ("ALL", "STOCK")
+QUOTE_STOCK_SECTOR = "沪深京A股"
+
 
 class BridgeError(Exception):
     def __init__(self, code, message, data=None):
@@ -180,6 +186,14 @@ def _utc_now_text():
     return datetime.datetime.now(datetime.timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%S.%fZ"
     )
+
+
+def _china_now_text():
+    china_timezone = datetime.timezone(datetime.timedelta(hours=8))
+    value = datetime.datetime.now(china_timezone).strftime(
+        "%Y-%m-%dT%H:%M:%S.%f"
+    )
+    return value[:-3] + "+08:00"
 
 
 def _utc_text_timestamp(value):
@@ -1422,6 +1436,71 @@ def _normalize_quote(tick, detail, instrument, as_of, include_raw=False):
     return result
 
 
+def _normalize_stream_quote(tick, instrument):
+    """Build the compact standard record used only by whole-market push."""
+
+    def quote_time():
+        text = str(tick.get("stime") or tick.get("timetag") or "").strip()
+        for pattern, date_format in (
+            (r"^([0-9]{14})(?:\.([0-9]+))?$", "%Y%m%d%H%M%S"),
+            (
+                r"^([0-9]{8} [0-9]{2}:[0-9]{2}:[0-9]{2})(?:\.([0-9]+))?$",
+                "%Y%m%d %H:%M:%S",
+            ),
+        ):
+            matched = re.match(pattern, text)
+            if matched:
+                try:
+                    parsed = datetime.datetime.strptime(
+                        matched.group(1), date_format
+                    )
+                    milliseconds = (matched.group(2) or "0")[:3].ljust(3, "0")
+                    return parsed.strftime("%Y-%m-%dT%H:%M:%S") + (
+                        ".%s+08:00" % milliseconds
+                    )
+                except Exception:
+                    pass
+        timestamp_ms = _raw_integer(tick, "time")
+        if timestamp_ms is None:
+            return None
+        try:
+            china_timezone = datetime.timezone(datetime.timedelta(hours=8))
+            parsed = datetime.datetime.fromtimestamp(
+                timestamp_ms / 1000.0, china_timezone
+            )
+            return parsed.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "+08:00"
+        except Exception:
+            return None
+
+    def price_list(values):
+        if not isinstance(values, (list, tuple)):
+            return []
+        return [_optional_three_decimal_text(value) for value in values]
+
+    def integer_list(values):
+        if not isinstance(values, (list, tuple)):
+            return []
+        result = []
+        for value in values:
+            try:
+                result.append(int(value))
+            except Exception:
+                result.append(None)
+        return result
+
+    return {
+        "instrument": instrument,
+        "quote_time": quote_time(),
+        "last_price": _optional_three_decimal_text(tick.get("lastPrice")),
+        "volume_lots": _raw_integer(tick, "volume"),
+        "turnover_amount": _optional_three_decimal_text(tick.get("amount")),
+        "ask_prices": price_list(tick.get("askPrice")),
+        "ask_volume_lots": integer_list(tick.get("askVol")),
+        "bid_prices": price_list(tick.get("bidPrice")),
+        "bid_volume_lots": integer_list(tick.get("bidVol")),
+    }
+
+
 def _raw_decimal_text(raw, name):
     return _optional_decimal_text(raw.get(name) if raw else None)
 
@@ -1587,6 +1666,8 @@ class PipeServer(object):
     ERROR_BROKEN_PIPE = 109
     ERROR_PIPE_BUSY = 231
     ERROR_NO_DATA = 232
+    ERROR_PIPE_NOT_CONNECTED = 233
+    ERROR_OPERATION_ABORTED = 995
     ERROR_PIPE_CONNECTED = 535
     INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
     THREAD_TERMINATE = 0x0001
@@ -1598,15 +1679,25 @@ class PipeServer(object):
         auth_token,
         max_message_size,
         max_clients=8,
+        channel="command",
+        event_queue_size=256,
     ):
         self.runtime = runtime
         self.pipe_name = pipe_name
         self.auth_token = auth_token
         self.max_message_size = int(max_message_size)
         self.max_clients = int(max_clients)
+        self.channel = str(channel)
+        self.event_queue_size = int(event_queue_size)
         if self.max_clients < 1 or self.max_clients > 255:
             raise BridgeError(
                 "INVALID_CONFIG", "max_clients must be between 1 and 255"
+            )
+        if self.channel not in ("command", "quote"):
+            raise BridgeError("INVALID_CONFIG", "invalid pipe channel")
+        if self.event_queue_size < 1:
+            raise BridgeError(
+                "INVALID_CONFIG", "event_queue_size must be positive"
             )
         self.stop_event = threading.Event()
         self.handle_lock = threading.Lock()
@@ -1684,7 +1775,8 @@ class PipeServer(object):
 
     def start(self):
         self.server_thread = threading.Thread(
-            target=self._server_loop, name="qmt-adapter-pipe-server"
+            target=self._server_loop,
+            name="qmt-adapter-%s-pipe-server" % self.channel,
         )
         self.server_thread.daemon = True
         self.server_thread.start()
@@ -1854,11 +1946,18 @@ class PipeServer(object):
                     "authenticated": False,
                     "client_id": None,
                     "thread": None,
+                    "write_lock": threading.Lock(),
+                    "event_queue": queue.Queue(maxsize=self.event_queue_size),
+                    "event_thread": None,
+                    "event_sequence": 0,
+                    "dropped_events": 0,
+                    "response_pending": threading.Event(),
                 }
                 connection_thread = threading.Thread(
                     target=self._connection_loop,
                     args=(state,),
-                    name="qmt-adapter-pipe-client-%s" % connection_id,
+                    name="qmt-adapter-%s-pipe-client-%s"
+                    % (self.channel, connection_id),
                 )
                 connection_thread.daemon = True
                 state["thread"] = connection_thread
@@ -1869,14 +1968,15 @@ class PipeServer(object):
         handle = state["handle"]
         connection_id = state["connection_id"]
         try:
-            self._read_connection(handle, connection_id)
+            self._read_connection(handle, state)
         except Exception as exc:
             if not self.stop_event.is_set() and not self._is_peer_disconnect(exc):
                 self.runtime.set_error("pipe connection failed: %s" % exc)
         finally:
             self._close_connection(connection_id, expected_handle=handle)
 
-    def _read_connection(self, handle, connection_id):
+    def _read_connection(self, handle, state):
+        connection_id = state["connection_id"]
         authenticated = False
         while not self.stop_event.is_set():
             header = self._read_exact(handle, 4)
@@ -1905,6 +2005,7 @@ class PipeServer(object):
                                 },
                             },
                         },
+                        state["write_lock"],
                     )
                     return
                 if message.get("auth_token") != self.auth_token:
@@ -1918,6 +2019,7 @@ class PipeServer(object):
                             "code": "AUTH_FAILED",
                             "error": {"message": "authentication failed"},
                         },
+                        state["write_lock"],
                     )
                     return
                 authenticated = True
@@ -1927,26 +2029,86 @@ class PipeServer(object):
                     return
                 self._send_direct(
                     handle,
-                    self.runtime.hello_response(message, connection_id),
+                    self.runtime.hello_response(
+                        message, connection_id, channel=self.channel
+                    ),
+                    state["write_lock"],
                 )
+                if self.channel == "quote":
+                    event_thread = threading.Thread(
+                        target=self._event_writer_loop,
+                        args=(state,),
+                        name="qmt-adapter-quote-writer-%s" % connection_id,
+                    )
+                    event_thread.daemon = True
+                    state["event_thread"] = event_thread
+                    event_thread.start()
                 continue
             if message.get("type") != "request":
                 raise BridgeError("PROTOCOL_ERROR", "request message expected")
+            if self.channel == "quote":
+                response_queue = queue.Queue(maxsize=1)
+                state["response_pending"].set()
+                immediate = self.runtime.submit_quote_request(
+                    connection_id, message, response_queue
+                )
+                if immediate is not None:
+                    try:
+                        self._send_direct(
+                            handle, immediate, state["write_lock"]
+                        )
+                    finally:
+                        state["response_pending"].clear()
+                    continue
+                completed = False
+                while not self.stop_event.is_set():
+                    try:
+                        response = response_queue.get(timeout=0.1)
+                        try:
+                            self._send_direct(
+                                handle, response, state["write_lock"]
+                            )
+                        finally:
+                            state["response_pending"].clear()
+                        completed = True
+                        break
+                    except queue.Empty:
+                        if not self._peer_is_connected(handle):
+                            return
+                        continue
+                if not completed:
+                    state["response_pending"].clear()
+                    return
+                if message.get("command") == "quote.stream.subscribe":
+                    # 行情连接完成订阅后转为服务端单向推送。同步命名管道
+                    # 同一句柄上的阻塞 ReadFile 会阻挡另一个线程 WriteFile，
+                    # 因此此处只用 PeekNamedPipe 检测断开，不再阻塞读取。
+                    while not self.stop_event.wait(0.1):
+                        if not self._peer_is_connected(handle):
+                            return
+                    return
+                continue
             if self.runtime.is_local_read_command(message.get("command")):
-                self._send_direct(handle, self.runtime.process_local_request(message))
+                self._send_direct(
+                    handle,
+                    self.runtime.process_local_request(message),
+                    state["write_lock"],
+                )
             else:
                 response_queue = queue.Queue(maxsize=1)
                 immediate = self.runtime.submit_request(
                     connection_id, message, response_queue
                 )
                 if immediate is not None:
-                    self._send_direct(handle, immediate)
+                    self._send_direct(handle, immediate, state["write_lock"])
                     continue
                 completed = False
                 while not self.stop_event.is_set():
                     try:
                         response = response_queue.get(timeout=0.1)
-                        self._send_direct(handle, response)
+                        self._send_direct(
+                            handle, response, state["write_lock"]
+                        )
                         completed = True
                         break
                     except queue.Empty:
@@ -1972,40 +2134,121 @@ class PipeServer(object):
                 1 for state in self.connections.values() if state["authenticated"]
             )
 
-    def _send_direct(self, handle, message):
+    def queue_event(self, connection_id, message):
+        """向一个行情连接排队；队列满时丢弃最旧事件而不阻塞行情线程。"""
+        with self.connection_condition:
+            state = self.connections.get(connection_id)
+            if state is None or not state["authenticated"]:
+                return False
+            state["event_sequence"] += 1
+            sequence = state["event_sequence"]
+            event_queue = state["event_queue"]
+            event = dict(message)
+            result = dict(event.get("result") or {})
+            result["sequence"] = sequence
+            result["server_dropped_events"] = state["dropped_events"]
+            event["result"] = result
+        if event_queue.full():
+            try:
+                event_queue.get_nowait()
+                with self.connection_condition:
+                    current = self.connections.get(connection_id)
+                    if current is state:
+                        state["dropped_events"] += 1
+                        result["server_dropped_events"] = state[
+                            "dropped_events"
+                        ]
+            except queue.Empty:
+                pass
+        try:
+            event_queue.put_nowait(event)
+            return True
+        except queue.Full:
+            with self.connection_condition:
+                current = self.connections.get(connection_id)
+                if current is state:
+                    state["dropped_events"] += 1
+            return False
+
+    def _event_writer_loop(self, state):
+        connection_id = state["connection_id"]
+        handle = state["handle"]
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    event = state["event_queue"].get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if event is None:
+                    return
+                while (
+                    state["response_pending"].is_set()
+                    and not self.stop_event.wait(0.001)
+                ):
+                    pass
+                self._send_direct(handle, event, state["write_lock"])
+        except Exception as exc:
+            if not self.stop_event.is_set() and not self._is_peer_disconnect(exc):
+                self.runtime.set_error(
+                    "quote pipe writer failed: %s" % exc
+                )
+        finally:
+            self._close_connection(connection_id, expected_handle=handle)
+
+    def _send_direct(self, handle, message, write_lock=None):
         """发送一帧消息；响应过大时改发可关联的结构化错误。"""
         encoded = json.dumps(
             message, ensure_ascii=False, separators=(",", ":")
         ).encode("utf-8")
         if len(encoded) > self.max_message_size:
-            if message.get("type") != "response":
-                raise BridgeError("PROTOCOL_ERROR", "outbound message is too large")
             encoded_size = len(encoded)
-            message = {
-                "v": PROTOCOL_VERSION,
-                "type": "response",
-                "request_id": message.get("request_id"),
-                "ok": False,
-                "code": "RESPONSE_TOO_LARGE",
-                "result": None,
-                "error": {
-                    "message": "response exceeds max_message_size",
-                    "data": {
+            if message.get("type") == "event":
+                message = {
+                    "v": PROTOCOL_VERSION,
+                    "type": "event",
+                    "event": "quote.error",
+                    "result": {
+                        "code": "EVENT_TOO_LARGE",
+                        "message": "quote event exceeds max_message_size",
                         "max_message_size": self.max_message_size,
                         "encoded_size": encoded_size,
                     },
-                },
-                "server_time": _utc_now_text(),
-            }
+                    "server_time": _utc_now_text(),
+                }
+            elif message.get("type") == "response":
+                message = {
+                    "v": PROTOCOL_VERSION,
+                    "type": "response",
+                    "request_id": message.get("request_id"),
+                    "ok": False,
+                    "code": "RESPONSE_TOO_LARGE",
+                    "result": None,
+                    "error": {
+                        "message": "response exceeds max_message_size",
+                        "data": {
+                            "max_message_size": self.max_message_size,
+                            "encoded_size": encoded_size,
+                        },
+                    },
+                    "server_time": _utc_now_text(),
+                }
+            else:
+                raise BridgeError(
+                    "PROTOCOL_ERROR", "outbound message is too large"
+                )
             encoded = json.dumps(
                 message, ensure_ascii=False, separators=(",", ":")
             ).encode("utf-8")
             if len(encoded) > self.max_message_size:
                 raise BridgeError(
-                    "PROTOCOL_ERROR", "response-too-large error does not fit"
+                    "PROTOCOL_ERROR", "message-too-large error does not fit"
                 )
         frame = struct.pack(">I", len(encoded)) + encoded
-        self._write_all(handle, frame)
+        if write_lock is None:
+            self._write_all(handle, frame)
+        else:
+            with write_lock:
+                self._write_all(handle, frame)
 
     def _read_exact(self, handle, size):
         chunks = []
@@ -2027,6 +2270,8 @@ class PipeServer(object):
         return getattr(exc, "winerror", None) in (
             self.ERROR_BROKEN_PIPE,
             self.ERROR_NO_DATA,
+            self.ERROR_PIPE_NOT_CONNECTED,
+            self.ERROR_OPERATION_ABORTED,
         )
 
     def _peer_is_connected(self, handle):
@@ -2055,7 +2300,6 @@ class PipeServer(object):
             offset += written.value
 
     def _close_connection(self, connection_id, expected_handle=None):
-        self.runtime.discard_broker_responses(connection_id)
         with self.connection_condition:
             state = self.connections.get(connection_id)
             if state is None:
@@ -2063,7 +2307,28 @@ class PipeServer(object):
             if expected_handle is not None and state["handle"] != expected_handle:
                 return False
             self.connections.pop(connection_id, None)
+        if self.channel == "command":
+            self.runtime.discard_broker_responses(connection_id)
+        else:
+            self.runtime.remove_quote_subscriber(connection_id)
+            try:
+                state["event_queue"].put_nowait(None)
+            except queue.Full:
+                try:
+                    state["event_queue"].get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    state["event_queue"].put_nowait(None)
+                except queue.Full:
+                    pass
         self._close_raw_handle(state["handle"])
+        event_thread = state.get("event_thread")
+        if (
+            event_thread is not None
+            and event_thread is not threading.current_thread()
+        ):
+            event_thread.join(1.0)
         with self.connection_condition:
             self.connection_condition.notify_all()
         return True
@@ -2582,8 +2847,33 @@ class BridgeRuntime(object):
         self.config = config
         self.accounts = self._load_accounts(config.get("accounts", []))
         self.inbound = queue.Queue(maxsize=int(config.get("max_pending_commands", 1000)))
+        self.quote_control_inbound = queue.Queue(
+            maxsize=int(config.get("max_pending_commands", 1000))
+        )
         self.order_events = queue.Queue()
         self.trade_events = queue.Queue()
+        # 全推回调可能在订阅建立时短时间送入整个市场。这里保存每只证券
+        # 最新的一条原始行情并用 Event 唤醒工作线程，内存上限自然受证券
+        # 数量约束；同一证券在一个处理周期内的旧值会被新值覆盖，恰好符合
+        # DELTA“周期内只保留最新更新”和 SNAPSHOT“读取最新快照”的语义。
+        self.quote_input_lock = threading.Lock()
+        self.quote_input_latest = {}
+        self.quote_input_ready = threading.Event()
+        self.quote_lock = threading.RLock()
+        self.quote_subscribers = {}
+        self.quote_cache = {}
+        self.quote_stock_universe = None
+        self.quote_subscription_id = None
+        self.quote_subscription_markets = ()
+        self.quote_generation = 0
+        self.quote_subscription_dirty = False
+        self.quote_context_info = None
+        self.quote_coalesced_input_items = 0
+        self.quote_received_batches = 0
+        self.quote_received_items = 0
+        self.quote_emitted_events = 0
+        self.quote_worker_stop = threading.Event()
+        self.quote_worker_thread = None
         self.order_event_cache = {}
         self.order_event_cache_lock = threading.Lock()
         self.order_state_condition = threading.Condition()
@@ -2615,6 +2905,23 @@ class BridgeRuntime(object):
             int(config.get("max_message_size", MAX_MESSAGE_SIZE)),
             int(config.get("max_clients", 8)),
         )
+        quote_pipe_name = config.get("quote_pipe_name") or (
+            str(config.get("pipe_name", r"\\.\pipe\qmt_adapter"))
+            + "_quote"
+        )
+        if quote_pipe_name == self.pipe.pipe_name:
+            raise BridgeError(
+                "INVALID_CONFIG", "quote_pipe_name must differ from pipe_name"
+            )
+        self.quote_pipe = PipeServer(
+            self,
+            quote_pipe_name,
+            config["auth_token"],
+            int(config.get("max_message_size", MAX_MESSAGE_SIZE)),
+            int(config.get("max_quote_clients", config.get("max_clients", 8))),
+            channel="quote",
+            event_queue_size=int(config.get("quote_client_queue_size", 256)),
+        )
 
     def _load_accounts(self, values):
         result = {}
@@ -2632,12 +2939,39 @@ class BridgeRuntime(object):
 
     def start(self):
         self.pipe.start()
+        try:
+            self.quote_pipe.start()
+            self.quote_worker_thread = threading.Thread(
+                target=self._quote_worker_loop,
+                name="qmt-adapter-quote-worker",
+            )
+            self.quote_worker_thread.daemon = True
+            self.quote_worker_thread.start()
+        except Exception:
+            self.quote_pipe.stop()
+            self.pipe.stop()
+            raise
 
     def stop(self):
         self.stopping = True
         with self.order_state_condition:
             self.order_state_condition.notify_all()
+        self._stop_qmt_quote_subscription()
+        self.quote_worker_stop.set()
+        self.quote_input_ready.set()
+        self.quote_pipe.stop()
         self.pipe.stop()
+        quote_worker_thread = self.quote_worker_thread
+        if (
+            quote_worker_thread is not None
+            and quote_worker_thread is not threading.current_thread()
+        ):
+            quote_worker_thread.join(5.0)
+            if quote_worker_thread.is_alive():
+                raise BridgeError(
+                    "QUOTE_STOP_TIMEOUT", "quote worker thread did not stop"
+                )
+        self.quote_worker_thread = None
         self.store.close()
 
     def set_error(self, value):
@@ -2650,8 +2984,37 @@ class BridgeRuntime(object):
         self.last_request_error = self.last_error
         print("QMT Adapter request error: %s" % self.last_request_error)
 
-    def hello_response(self, message, connection_id=None):
-        return {
+    def hello_response(self, message, connection_id=None, channel="command"):
+        if channel == "quote":
+            commands = [
+                "quote.stream.subscribe",
+            ]
+        else:
+            commands = [
+                "system.health",
+                "account.get",
+                "position.list",
+                "quote.get",
+                "quote.list",
+                "sector.instruments.list",
+                "instrument.detail.list",
+                "market.history.bar.get",
+                "market.history.daily.get",
+                "new_issue.list",
+                "new_issue.quota.get",
+                "order.place",
+                "order.get",
+                "order.list",
+                "order.wait",
+                "order.cancel",
+                "trade.list",
+                "algo_order.preview",
+                "algo_order.place",
+                "algo_order.get",
+                "algo_order.list",
+                "algo_order.cancel",
+            ]
+        result = {
             "v": PROTOCOL_VERSION,
             "type": "hello_ack",
             "request_id": message.get("message_id"),
@@ -2659,36 +3022,20 @@ class BridgeRuntime(object):
             "code": "OK",
             "result": {
                 "protocol_version": PROTOCOL_VERSION,
+                "channel": channel,
                 "connection_id": connection_id,
-                "max_clients": self.pipe.max_clients,
+                "max_clients": (
+                    self.quote_pipe.max_clients
+                    if channel == "quote"
+                    else self.pipe.max_clients
+                ),
                 "idempotency_mode": "CLIENT_ORDER_ID_ENFORCED",
                 "accounts": list(self.accounts.values()),
-                "commands": [
-                    "system.health",
-                    "account.get",
-                    "position.list",
-                    "quote.get",
-                    "quote.list",
-                    "sector.instruments.list",
-                    "instrument.detail.list",
-                    "market.history.bar.get",
-                    "market.history.daily.get",
-                    "new_issue.list",
-                    "new_issue.quota.get",
-                    "order.place",
-                    "order.get",
-                    "order.list",
-                    "order.wait",
-                    "order.cancel",
-                    "trade.list",
-                    "algo_order.preview",
-                    "algo_order.place",
-                    "algo_order.get",
-                    "algo_order.list",
-                    "algo_order.cancel",
-                ],
+                "quote_pipe_name": self.quote_pipe.pipe_name,
+                "commands": commands,
             },
         }
+        return result
 
     def submit_request(self, connection_id, message, response_queue):
         try:
@@ -2697,6 +3044,17 @@ class BridgeRuntime(object):
         except queue.Full:
             return self._error_response(
                 message, "BACKPRESSURE", "command queue is full"
+            )
+
+    def submit_quote_request(self, connection_id, message, response_queue):
+        try:
+            self.quote_control_inbound.put_nowait(
+                (connection_id, message, response_queue)
+            )
+            return None
+        except queue.Full:
+            return self._error_response(
+                message, "BACKPRESSURE", "quote control queue is full"
             )
 
     def is_local_read_command(self, command):
@@ -2721,6 +3079,12 @@ class BridgeRuntime(object):
             self.tick_count += 1
         self.process_order_events()
         self.process_trade_events()
+        self.quote_context_info = context_info
+        self._process_quote_controls(context_info)
+        try:
+            self._reconcile_quote_subscription(context_info)
+        except Exception as exc:
+            self.set_error("whole quote subscription update failed: %s" % exc)
         if time.monotonic() - self.last_algo_scan >= 0.1:
             self.last_algo_scan = time.monotonic()
             try:
@@ -2752,6 +3116,512 @@ class BridgeRuntime(object):
                 self.reconcile_orders()
             except Exception as exc:
                 self.set_error("order reconciliation failed: %s" % exc)
+
+    def _process_quote_controls(self, context_info):
+        max_commands = int(self.config.get("max_commands_per_tick", 20))
+        for unused in range(max_commands):
+            try:
+                connection_id, message, response_queue = (
+                    self.quote_control_inbound.get_nowait()
+                )
+            except queue.Empty:
+                return
+            try:
+                result = self._dispatch_quote_control(
+                    connection_id, message, context_info
+                )
+                response = self._success_response(message, result)
+            except BridgeError as exc:
+                response = self._error_response(
+                    message, exc.code, exc.message, exc.data
+                )
+            except Exception as exc:
+                self.set_request_error(traceback.format_exc())
+                response = self._error_response(
+                    message,
+                    "INTERNAL_ERROR",
+                    "%s: %s" % (type(exc).__name__, exc),
+                )
+            self._send_completed_response(
+                connection_id, response_queue, response
+            )
+
+    def _dispatch_quote_control(self, connection_id, message, context_info):
+        request_id = str(message.get("request_id", "") or "").strip()
+        command = str(message.get("command", "") or "").strip()
+        payload = message.get("payload") or {}
+        if not request_id or not command:
+            raise BridgeError(
+                "INVALID_ARGUMENT", "request_id and command are required"
+            )
+        if command == "quote.stream.subscribe":
+            return self._subscribe_quote_stream(
+                connection_id, payload, context_info
+            )
+        raise BridgeError(
+            "UNSUPPORTED_COMMAND", "unsupported quote command: %s" % command
+        )
+
+    def _subscribe_quote_stream(self, connection_id, payload, context_info):
+        markets = payload.get("markets")
+        if not isinstance(markets, list) or not markets:
+            raise BridgeError(
+                "INVALID_ARGUMENT", "markets must be a non-empty array"
+            )
+        normalized_markets = []
+        seen = set()
+        for value in markets:
+            market = str(value or "").strip().upper()
+            if market not in QUOTE_MARKETS:
+                raise BridgeError(
+                    "INVALID_ARGUMENT", "unsupported quote market: %s" % market
+                )
+            if market in seen:
+                raise BridgeError(
+                    "INVALID_ARGUMENT", "duplicate quote market: %s" % market
+                )
+            seen.add(market)
+            normalized_markets.append(market)
+        mode = str(payload.get("mode", "DELTA") or "").strip().upper()
+        if mode not in QUOTE_PUSH_MODES:
+            raise BridgeError(
+                "INVALID_ARGUMENT", "unsupported quote push mode: %s" % mode
+            )
+        instrument_scope = str(
+            payload.get("instrument_scope", "ALL") or ""
+        ).strip().upper()
+        if instrument_scope not in QUOTE_INSTRUMENT_SCOPES:
+            raise BridgeError(
+                "INVALID_ARGUMENT",
+                "unsupported quote instrument scope: %s" % instrument_scope,
+            )
+        if instrument_scope == "STOCK":
+            self._load_quote_stock_universe(context_info)
+        push_interval_ms = payload.get("push_interval_ms", 50)
+        if isinstance(push_interval_ms, bool) or not isinstance(
+            push_interval_ms, int
+        ):
+            raise BridgeError(
+                "INVALID_ARGUMENT", "push_interval_ms must be an integer"
+            )
+        if push_interval_ms < 10 or push_interval_ms > 60000:
+            raise BridgeError(
+                "INVALID_ARGUMENT",
+                "push_interval_ms must be between 10 and 60000",
+            )
+        chunk_size = payload.get("chunk_size")
+        if chunk_size is None:
+            chunk_size = int(self.config.get("quote_event_max_items", 2000))
+        if isinstance(chunk_size, bool) or not isinstance(chunk_size, int):
+            raise BridgeError(
+                "INVALID_ARGUMENT", "chunk_size must be an integer or null"
+            )
+        if chunk_size < 0 or chunk_size > 100000:
+            raise BridgeError(
+                "INVALID_ARGUMENT",
+                "chunk_size must be between 0 and 100000",
+            )
+        include_raw = payload.get("include_raw", False)
+        if not isinstance(include_raw, bool):
+            raise BridgeError(
+                "INVALID_ARGUMENT", "include_raw must be a boolean"
+            )
+        now = time.monotonic()
+        state = {
+            "connection_id": connection_id,
+            "subscription_id": str(uuid.uuid4()),
+            "markets": tuple(normalized_markets),
+            "mode": mode,
+            "instrument_scope": instrument_scope,
+            "push_interval_ms": push_interval_ms,
+            "chunk_size": chunk_size,
+            "include_raw": include_raw,
+            "next_emit_at": now + push_interval_ms / 1000.0,
+            "pending": {},
+        }
+        with self.quote_lock:
+            previous = self.quote_subscribers.get(connection_id)
+            self.quote_subscribers[connection_id] = state
+            self.quote_subscription_dirty = True
+        try:
+            self._reconcile_quote_subscription(context_info)
+        except Exception:
+            with self.quote_lock:
+                if previous is None:
+                    self.quote_subscribers.pop(connection_id, None)
+                else:
+                    self.quote_subscribers[connection_id] = previous
+                self.quote_subscription_dirty = True
+            raise
+        return {
+            "subscribed": True,
+            "subscription_id": state["subscription_id"],
+            "markets": list(state["markets"]),
+            "mode": state["mode"],
+            "instrument_scope": state["instrument_scope"],
+            "push_interval_ms": state["push_interval_ms"],
+            "chunk_size": state["chunk_size"],
+            "include_raw": state["include_raw"],
+            "quote_pipe_name": self.quote_pipe.pipe_name,
+        }
+
+    def _load_quote_stock_universe(self, context_info):
+        if self.quote_stock_universe is not None:
+            return self.quote_stock_universe
+        getter = getattr(context_info, "get_stock_list_in_sector", None)
+        if not callable(getter):
+            raise BridgeError(
+                "QMT_API_MISSING",
+                "ContextInfo.get_stock_list_in_sector is unavailable",
+            )
+        values = getter(QUOTE_STOCK_SECTOR)
+        if not isinstance(values, (list, tuple)):
+            raise BridgeError(
+                "QMT_DATA_ERROR",
+                "QMT stock sector did not return a list",
+                {"sector_name": QUOTE_STOCK_SECTOR},
+            )
+        universe = set()
+        for value in values:
+            instrument = str(value or "").strip().upper()
+            if re.match(r"^[0-9]{6}\.(SH|SZ|BJ)$", instrument):
+                universe.add(instrument)
+        if not universe:
+            raise BridgeError(
+                "QMT_DATA_ERROR",
+                "QMT stock sector is empty",
+                {"sector_name": QUOTE_STOCK_SECTOR},
+            )
+        with self.quote_lock:
+            if self.quote_stock_universe is None:
+                self.quote_stock_universe = frozenset(universe)
+            return self.quote_stock_universe
+
+    def remove_quote_subscriber(self, connection_id):
+        """行情管道断开时移除逻辑订阅；QMT反订阅由主线程下次处理。"""
+        with self.quote_lock:
+            removed = self.quote_subscribers.pop(connection_id, None)
+            if removed is not None:
+                self.quote_subscription_dirty = True
+        return removed is not None
+
+    def _desired_quote_markets(self):
+        desired = set()
+        for state in self.quote_subscribers.values():
+            desired.update(state["markets"])
+        return tuple(market for market in QUOTE_MARKETS if market in desired)
+
+    def _reconcile_quote_subscription(self, context_info):
+        with self.quote_lock:
+            desired_markets = self._desired_quote_markets()
+            current_markets = self.quote_subscription_markets
+            current_id = self.quote_subscription_id
+            dirty = self.quote_subscription_dirty
+            if not dirty and desired_markets == current_markets:
+                return
+            if desired_markets == current_markets and (
+                bool(desired_markets) == (current_id is not None)
+            ):
+                self.quote_subscription_dirty = False
+                return
+            new_id = None
+            previous_generation = self.quote_generation
+            new_generation = previous_generation + 1
+            if desired_markets:
+                subscribe = getattr(context_info, "subscribe_whole_quote", None)
+                if not callable(subscribe):
+                    raise BridgeError(
+                        "QMT_API_MISSING",
+                        "ContextInfo.subscribe_whole_quote is unavailable",
+                    )
+                # 某些QMT版本会在subscribe_whole_quote返回前同步触发首批
+                # 回调。先切换代次，避免把这批全市场初始行情误判为旧回调。
+                with self.quote_input_lock:
+                    self.quote_generation = new_generation
+                    self.quote_input_latest.clear()
+                    self.quote_input_ready.clear()
+                try:
+                    new_id = subscribe(
+                        list(desired_markets),
+                        callback=_make_qmt_adapter_whole_quote_callback(
+                            new_generation
+                        ),
+                    )
+                except Exception:
+                    with self.quote_input_lock:
+                        self.quote_generation = previous_generation
+                        self.quote_input_latest.clear()
+                        self.quote_input_ready.clear()
+                    raise
+                if (
+                    isinstance(new_id, bool)
+                    or not isinstance(new_id, int)
+                    or new_id < 0
+                ):
+                    with self.quote_input_lock:
+                        self.quote_generation = previous_generation
+                        self.quote_input_latest.clear()
+                        self.quote_input_ready.clear()
+                    raise BridgeError(
+                        "QMT_SUBSCRIBE_FAILED",
+                        "subscribe_whole_quote did not return a valid subscription id",
+                        {"subscription_id": new_id},
+                    )
+            if current_id is not None:
+                unsubscribe = getattr(context_info, "unsubscribe_quote", None)
+                if callable(unsubscribe):
+                    try:
+                        unsubscribe(current_id)
+                    except Exception:
+                        if new_id is not None:
+                            try:
+                                unsubscribe(new_id)
+                            except Exception as rollback_exc:
+                                self.set_error(
+                                    "whole quote rollback unsubscribe failed: %s"
+                                    % rollback_exc
+                                )
+                        with self.quote_input_lock:
+                            self.quote_generation = previous_generation
+                            self.quote_input_latest.clear()
+                            self.quote_input_ready.clear()
+                        raise
+            elif not desired_markets:
+                with self.quote_input_lock:
+                    self.quote_generation = new_generation
+                    self.quote_input_latest.clear()
+                    self.quote_input_ready.clear()
+            # QMT订阅集合发生变化后，不把旧订阅留下的缓存冒充新快照。
+            self.quote_cache.clear()
+            for state in self.quote_subscribers.values():
+                state["pending"].clear()
+            self.quote_subscription_id = new_id
+            self.quote_subscription_markets = desired_markets
+            self.quote_subscription_dirty = False
+            self.quote_context_info = context_info
+
+    def _stop_qmt_quote_subscription(self):
+        with self.quote_lock:
+            subscription_id = self.quote_subscription_id
+            context_info = self.quote_context_info
+            self.quote_subscription_id = None
+            self.quote_subscription_markets = ()
+            with self.quote_input_lock:
+                self.quote_generation += 1
+                self.quote_input_latest.clear()
+                self.quote_input_ready.clear()
+            self.quote_subscription_dirty = False
+            self.quote_subscribers.clear()
+        if subscription_id is None or context_info is None:
+            return
+        unsubscribe = getattr(context_info, "unsubscribe_quote", None)
+        if callable(unsubscribe):
+            try:
+                unsubscribe(subscription_id)
+            except Exception as exc:
+                self.set_error("whole quote unsubscribe failed: %s" % exc)
+
+    def enqueue_quote_batch(self, data, generation=None):
+        """QMT回调入口：合并最新原始值，绝不做标准化或管道写入。"""
+        if not isinstance(data, dict) or not data:
+            return
+        if generation is None:
+            generation = self.quote_generation
+        with self.quote_input_lock:
+            if generation != self.quote_generation:
+                return
+            self.quote_received_batches += 1
+            self.quote_received_items += len(data)
+            before = len(self.quote_input_latest)
+            self.quote_input_latest.update(data)
+            added = len(self.quote_input_latest) - before
+            self.quote_coalesced_input_items += len(data) - added
+            self.quote_input_ready.set()
+
+    def _quote_worker_loop(self):
+        while not self.quote_worker_stop.is_set():
+            timeout = self._quote_worker_timeout()
+            self.quote_input_ready.wait(timeout)
+            raw_batch = None
+            generation = None
+            with self.quote_input_lock:
+                if self.quote_input_latest:
+                    raw_batch = self.quote_input_latest
+                    self.quote_input_latest = {}
+                    generation = self.quote_generation
+                self.quote_input_ready.clear()
+            if raw_batch:
+                try:
+                    self._ingest_quote_batch(raw_batch, generation)
+                except Exception as exc:
+                    self.set_error("whole quote normalization failed: %s" % exc)
+            try:
+                self._emit_due_quote_batches()
+            except Exception as exc:
+                self.set_error("whole quote emission failed: %s" % exc)
+
+    def _quote_worker_timeout(self):
+        with self.quote_lock:
+            due_times = [
+                state["next_emit_at"]
+                for state in self.quote_subscribers.values()
+            ]
+        if not due_times:
+            return 0.1
+        return max(0.001, min(0.1, min(due_times) - time.monotonic()))
+
+    def _ingest_quote_batch(self, data, generation):
+        with self.quote_lock:
+            if generation != self.quote_generation:
+                return
+            all_scope_markets = set()
+            stock_scope_markets = set()
+            for state in self.quote_subscribers.values():
+                if state["instrument_scope"] == "ALL":
+                    all_scope_markets.update(state["markets"])
+                else:
+                    stock_scope_markets.update(state["markets"])
+            stock_universe = self.quote_stock_universe or frozenset()
+        normalized = []
+        for raw_instrument, tick in data.items():
+            instrument = str(raw_instrument or "").strip().upper()
+            if not re.match(r"^[0-9]{6}\.(SH|SZ|BJ)$", instrument):
+                continue
+            if not isinstance(tick, dict):
+                continue
+            market = instrument.rsplit(".", 1)[-1]
+            if not (
+                market in all_scope_markets
+                or (
+                    market in stock_scope_markets
+                    and instrument in stock_universe
+                )
+            ):
+                continue
+            normalized.append(
+                (
+                    instrument,
+                    market,
+                    _normalize_stream_quote(tick, instrument),
+                    tick,
+                )
+            )
+        if not normalized:
+            return
+        with self.quote_lock:
+            if generation != self.quote_generation:
+                return
+            for instrument, market, standard, raw in normalized:
+                record = {
+                    "instrument": instrument,
+                    "market": market,
+                    "standard": standard,
+                    "raw": raw,
+                }
+                self.quote_cache[instrument] = record
+                for state in self.quote_subscribers.values():
+                    if (
+                        state["mode"] == "DELTA"
+                        and market in state["markets"]
+                        and (
+                            state["instrument_scope"] == "ALL"
+                            or instrument in stock_universe
+                        )
+                    ):
+                        state["pending"][instrument] = record
+
+    def _emit_due_quote_batches(self):
+        now = time.monotonic()
+        emissions = []
+        with self.quote_lock:
+            cache_size = len(self.quote_cache)
+            with self.quote_input_lock:
+                coalesced_items = self.quote_coalesced_input_items
+            for connection_id, state in list(self.quote_subscribers.items()):
+                if now < state["next_emit_at"]:
+                    continue
+                interval = state["push_interval_ms"] / 1000.0
+                while state["next_emit_at"] <= now:
+                    state["next_emit_at"] += interval
+                if state["mode"] == "DELTA":
+                    records = list(state["pending"].values())
+                    state["pending"].clear()
+                else:
+                    markets = set(state["markets"])
+                    records = [
+                        record
+                        for record in self.quote_cache.values()
+                        if record["market"] in markets
+                        and (
+                            state["instrument_scope"] == "ALL"
+                            or record["instrument"]
+                            in (self.quote_stock_universe or frozenset())
+                        )
+                    ]
+                if not records:
+                    continue
+                emissions.append(
+                    (
+                        connection_id,
+                        dict(state),
+                        records,
+                        cache_size,
+                        coalesced_items,
+                    )
+                )
+        for emission in emissions:
+            self._emit_quote_batch(*emission)
+
+    def _emit_quote_batch(
+        self,
+        connection_id,
+        state,
+        records,
+        cache_size,
+        coalesced_items,
+    ):
+        total_count = len(records)
+        max_items = state["chunk_size"] or total_count
+        chunk_count = (total_count + max_items - 1) // max_items
+        batch_id = str(uuid.uuid4())
+        push_time = _china_now_text()
+        server_time = _utc_now_text()
+        for chunk_index in range(chunk_count):
+            start = chunk_index * max_items
+            chunk_records = records[start : start + max_items]
+            items = []
+            for record in chunk_records:
+                item = dict(record["standard"])
+                if state["include_raw"]:
+                    item["raw"] = {"full_tick": _safe_value(record["raw"])}
+                items.append(item)
+            event = {
+                "v": PROTOCOL_VERSION,
+                "type": "event",
+                "event": "quote.batch",
+                "result": {
+                    "subscription_id": state["subscription_id"],
+                    "batch_id": batch_id,
+                    "chunk_index": chunk_index + 1,
+                    "chunk_count": chunk_count,
+                    "mode": state["mode"],
+                    "instrument_scope": state["instrument_scope"],
+                    "markets": list(state["markets"]),
+                    "push_interval_ms": state["push_interval_ms"],
+                    "chunk_size": state["chunk_size"],
+                    "is_snapshot": state["mode"] == "SNAPSHOT",
+                    "items": items,
+                    "count": len(items),
+                    "batch_total_count": total_count,
+                    "cache_size": cache_size,
+                    "qmt_coalesced_input_items": coalesced_items,
+                    "push_time": push_time,
+                },
+                "server_time": server_time,
+            }
+            if self.quote_pipe.queue_event(connection_id, event):
+                with self.quote_lock:
+                    self.quote_emitted_events += 1
 
     def _send_completed_response(self, connection_id, response_queue, response):
         try:
@@ -3033,11 +3903,13 @@ class BridgeRuntime(object):
             tick_median_ms = None
             tick_min_ms = None
             tick_max_ms = None
-        return {
+        result = {
             "status": "OK" if not self.health_error else "DEGRADED",
             "connected": active_client_count > 0,
             "active_client_count": active_client_count,
             "max_clients": self.pipe.max_clients,
+            "quote_pipe_name": self.quote_pipe.pipe_name,
+            "quote_subscriber_count": len(self.quote_subscribers),
             "configured_accounts": list(self.accounts.values()),
             "pending_commands": self.inbound.qsize(),
             "last_error": self.last_error,
@@ -3049,6 +3921,23 @@ class BridgeRuntime(object):
             "timer_interval_min_ms": tick_min_ms,
             "timer_interval_max_ms": tick_max_ms,
         }
+        with self.quote_input_lock:
+            pending_input_items = len(self.quote_input_latest)
+            received_batches = self.quote_received_batches
+            received_items = self.quote_received_items
+            coalesced_input_items = self.quote_coalesced_input_items
+        if self.quote_pipe.active_client_count or received_batches:
+            result["quote_stream"] = {
+                "active_client_count": self.quote_pipe.active_client_count,
+                "markets": list(self.quote_subscription_markets),
+                "cache_size": len(self.quote_cache),
+                "pending_input_items": pending_input_items,
+                "coalesced_input_items": coalesced_input_items,
+                "received_batches": received_batches,
+                "received_items": received_items,
+                "emitted_events": self.quote_emitted_events,
+            }
+        return result
 
     def _require_account(self, payload):
         account_id = str(payload.get("account_id", "")).strip()
@@ -5082,6 +5971,13 @@ def init(ContextInfo):
             "QMT Adapter bridge [v%s] is ready: %s"
             % (config["version"], config.get("pipe_name"))
         )
+        print(
+            "QMT Adapter quote stream is ready: %s"
+            % (
+                config.get("quote_pipe_name")
+                or (str(config.get("pipe_name")) + "_quote")
+            )
+        )
     except Exception as exc:
         if _RUNTIME is runtime:
             _RUNTIME = None
@@ -5119,6 +6015,20 @@ def order_callback(ContextInfo, orderInfo):
 def deal_callback(ContextInfo, dealInfo):
     if _RUNTIME is not None:
         _RUNTIME.enqueue_trade_event(dealInfo)
+
+
+def _make_qmt_adapter_whole_quote_callback(generation):
+    def callback(data):
+        if _RUNTIME is not None:
+            _RUNTIME.enqueue_quote_batch(data, generation=generation)
+
+    return callback
+
+
+def _qmt_adapter_whole_quote_callback(data):
+    """兼容直接调用；正式订阅使用带代次标识的闭包回调。"""
+    if _RUNTIME is not None:
+        _RUNTIME.enqueue_quote_batch(data)
 
 
 def stop(ContextInfo):

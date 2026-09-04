@@ -21,11 +21,12 @@ from .protocol import (
     ERROR_PIPE_NOT_CONNECTED,
     MAX_MESSAGE_SIZE,
     NamedPipeConnection,
+    StreamingNamedPipeConnection,
 )
 from .version import __version__
 
 
-PROTOCOL_VERSION = 6
+PROTOCOL_VERSION = 7
 ORDER_STATUSES = {
     "PENDING_QMT",
     "PENDING_BROKER_ID",
@@ -68,6 +69,9 @@ DAILY_ADJUSTMENTS = {
     "front_ratio",
     "back_ratio",
 }
+QUOTE_MARKETS = {"SH", "SZ", "BJ"}
+QUOTE_PUSH_MODES = {"DELTA", "SNAPSHOT"}
+QUOTE_INSTRUMENT_SCOPES = {"ALL", "STOCK"}
 
 
 def _validated_include_raw(value: bool) -> bool:
@@ -168,11 +172,51 @@ def _normalized_wait_statuses(statuses: Optional[Iterable[str]]) -> List[str]:
     return result
 
 
+def _normalized_quote_markets(markets: Optional[Iterable[str]]) -> List[str]:
+    if markets is None:
+        return ["SH", "SZ", "BJ"]
+    if isinstance(markets, str):
+        raise ValidationError("markets must be an iterable of market codes")
+    try:
+        values = list(markets)
+    except TypeError:
+        raise ValidationError("markets must be an iterable of market codes")
+    if not values:
+        raise ValidationError("markets must not be empty")
+    result = []
+    seen = set()
+    for value in values:
+        market = str(value or "").strip().upper()
+        if market not in QUOTE_MARKETS:
+            raise ValidationError("unsupported quote market: %s" % market)
+        if market in seen:
+            raise ValidationError("duplicate quote market: %s" % market)
+        seen.add(market)
+        result.append(market)
+    return result
+
+
+def _normalized_quote_mode(mode: str) -> str:
+    normalized = str(mode or "").strip().upper()
+    if normalized not in QUOTE_PUSH_MODES:
+        raise ValidationError("unsupported quote push mode: %s" % mode)
+    return normalized
+
+
+def _normalized_quote_instrument_scope(instrument_scope: str) -> str:
+    normalized = str(instrument_scope or "").strip().upper()
+    if normalized not in QUOTE_INSTRUMENT_SCOPES:
+        raise ValidationError(
+            "unsupported quote instrument scope: %s" % instrument_scope
+        )
+    return normalized
+
+
 class QmtClient:
     """大 QMT Adapter 的同步客户端。
 
-    客户端通过一个持久化的 Windows 命名管道连接与 QMT Bridge 通信，
-    本模块不导入也不依赖任何 QMT 函数。
+    客户端通过持久化 Windows 命名管道与 QMT Bridge 通信。本模块不导入也
+    不依赖任何QMT函数；只有使用全推行情时才额外建立专用行情管道。
 
     Args:
         config_path: ``bridge_config.json`` 路径。为 ``None`` 时使用默认路径。
@@ -194,7 +238,17 @@ class QmtClient:
             self.config["pipe_name"],
             int(self.config.get("max_message_size", MAX_MESSAGE_SIZE)),
         )
+        quote_pipe_name = self.config.get("quote_pipe_name") or (
+            str(self.config["pipe_name"]) + "_quote"
+        )
+        self.quote_connection = StreamingNamedPipeConnection(
+            quote_pipe_name,
+            int(self.config.get("max_message_size", MAX_MESSAGE_SIZE)),
+            int(self.config.get("quote_event_queue_size", 256)),
+        )
         self.hello: Optional[Dict[str, Any]] = None
+        self.quote_hello: Optional[Dict[str, Any]] = None
+        self._quote_subscription: Optional[Dict[str, Any]] = None
 
     def connect(self, timeout: float = 5.0) -> "QmtClient":
         """连接 QMT Bridge 并完成协议握手。
@@ -251,20 +305,25 @@ class QmtClient:
         self._raise_for_error(response)
         self.hello = response["result"]
         if self.hello.get("protocol_version") != PROTOCOL_VERSION:
+            bridge_protocol_version = self.hello.get("protocol_version")
             self.close()
             raise RemoteError(
                 "QMT Bridge protocol version does not match client",
                 code="PROTOCOL_MISMATCH",
                 data={
                     "client_protocol_version": PROTOCOL_VERSION,
-                    "bridge_protocol_version": self.hello.get("protocol_version"),
+                    "bridge_protocol_version": bridge_protocol_version,
                 },
             )
         return self
 
     def close(self) -> None:
         """关闭当前命名管道连接；重复调用是安全的。"""
+        self.quote_connection.close()
+        self.quote_hello = None
+        self._quote_subscription = None
         self.connection.close()
+        self.hello = None
 
     def __enter__(self) -> "QmtClient":
         """进入上下文时连接Bridge并返回当前客户端。"""
@@ -402,6 +461,129 @@ class QmtClient:
             {"instruments": normalized, "include_raw": include_raw},
             timeout=timeout,
         )
+
+    def subscribe_whole_quote(
+        self,
+        markets: Optional[Iterable[str]] = None,
+        mode: str = "DELTA",
+        instrument_scope: str = "ALL",
+        push_interval_ms: int = 50,
+        chunk_size: Optional[int] = None,
+        include_raw: bool = False,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """通过专用行情管道订阅大QMT全推行情。
+
+        Args:
+            markets: 市场代码集合，默认订阅 ``SH``、``SZ``、``BJ``。
+            mode: ``DELTA`` 只发送周期内发生更新的证券；``SNAPSHOT``
+                每个周期发送当前缓存的全部证券快照。
+            instrument_scope: ``ALL`` 接收交易所全部二级市场标的；
+                ``STOCK`` 只接收大QMT“沪深京A股”板块中的股票。
+            push_interval_ms: 推送聚合周期，范围为10至60000毫秒。
+            chunk_size: 单个事件最多包含的证券数；``None`` 使用服务端
+                默认值，``0`` 表示不按证券数量分片，但仍受5 MiB消息上限约束。
+            include_raw: 是否在每个标准行情项中附带QMT原始全推字段。
+            timeout: 连接专用行情管道并完成订阅的最长秒数。
+
+        Returns:
+            订阅信息，包含订阅ID、市场、模式、周期和行情管道名称。
+
+        Note:
+            每个客户端连接维护一个全推订阅；再次调用会替换原订阅。
+            行情数据由 :meth:`get_quote_event` 持续读取，交易和普通查询仍
+            使用原命名管道，二者互不占用对方的响应流。
+        """
+        normalized_markets = _normalized_quote_markets(markets)
+        normalized_mode = _normalized_quote_mode(mode)
+        normalized_instrument_scope = _normalized_quote_instrument_scope(
+            instrument_scope
+        )
+        if isinstance(push_interval_ms, bool) or not isinstance(
+            push_interval_ms, int
+        ):
+            raise ValidationError("push_interval_ms must be an integer")
+        if push_interval_ms < 10 or push_interval_ms > 60000:
+            raise ValidationError(
+                "push_interval_ms must be between 10 and 60000"
+            )
+        if chunk_size is not None:
+            if isinstance(chunk_size, bool) or not isinstance(chunk_size, int):
+                raise ValidationError("chunk_size must be an integer or None")
+            if chunk_size < 0 or chunk_size > 100000:
+                raise ValidationError(
+                    "chunk_size must be between 0 and 100000"
+                )
+        include_raw = _validated_include_raw(include_raw)
+        if self.quote_connection.is_streaming:
+            self.quote_connection.close()
+            self.quote_hello = None
+            self._quote_subscription = None
+        self._connect_quote(timeout=timeout)
+        result = self._quote_request(
+            "quote.stream.subscribe",
+            {
+                "markets": normalized_markets,
+                "mode": normalized_mode,
+                "instrument_scope": normalized_instrument_scope,
+                "push_interval_ms": push_interval_ms,
+                "chunk_size": chunk_size,
+                "include_raw": include_raw,
+            },
+            timeout=timeout,
+        )
+        self._quote_subscription = dict(result)
+        try:
+            self.quote_connection.start_reader()
+        except Exception:
+            self.quote_connection.close()
+            self.quote_hello = None
+            self._quote_subscription = None
+            raise
+        return result
+
+    def get_quote_event(self, timeout: Optional[float] = None) -> Dict[str, Any]:
+        """等待并返回下一批全推行情。
+
+        返回字典包含 ``subscription_id``、``sequence``、``batch_id``、
+        ``chunk_index``、``chunk_count``、``mode``、``push_time``、精简的
+        ``items`` 和丢弃计数。每个行情项包含证券代码、北京时间、最新
+        价量额以及按档位对齐的买卖价格和数量数组。
+        ``SNAPSHOT`` 的一个周期可能拆成多批，可按 ``batch_id`` 和分片字段
+        重新组合。``timeout=None`` 表示一直等待。
+        """
+        if not self.quote_connection.is_streaming or self.quote_hello is None:
+            raise RuntimeError("quote stream is not connected")
+        event = self.quote_connection.get_event(timeout=timeout)
+        if event.get("event") == "quote.error":
+            error = event.get("result") or {}
+            raise RemoteError(
+                error.get("message", "QMT quote stream error"),
+                code=error.get("code", "QUOTE_STREAM_ERROR"),
+                data=error,
+            )
+        if event.get("event") != "quote.batch":
+            raise RemoteError(
+                "unexpected quote event: %s" % event.get("event"),
+                code="PROTOCOL_ERROR",
+                data={"event": event},
+            )
+        return event.get("result") or {}
+
+    def unsubscribe_whole_quote(self) -> Dict[str, Any]:
+        """取消当前客户端的全推订阅，并关闭专用行情管道。"""
+        if not self.quote_connection.is_connected or self.quote_hello is None:
+            return {"subscribed": False}
+        subscription_id = (
+            (self._quote_subscription or {}).get("subscription_id")
+        )
+        self.quote_connection.close()
+        self.quote_hello = None
+        self._quote_subscription = None
+        return {
+            "subscribed": False,
+            "subscription_id": subscription_id,
+        }
 
     def list_sector_instruments(
         self,
@@ -1145,6 +1327,66 @@ class QmtClient:
         response = self.connection.request(message, timeout=timeout)
         self._raise_for_error(response)
         return response.get("result")
+
+    def _connect_quote(self, timeout: float = 5.0) -> None:
+        if self.quote_connection.is_connected and self.quote_hello is not None:
+            return
+        if self.quote_connection.is_connected:
+            self.quote_connection.close()
+        deadline = time.monotonic() + float(timeout)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RequestTimeout("quote pipe connection timed out")
+        self.quote_connection.connect(timeout=remaining)
+        message_id = str(uuid.uuid4())
+        response = self.quote_connection.request(
+            {
+                "v": PROTOCOL_VERSION,
+                "type": "hello",
+                "message_id": message_id,
+                "client_id": self.client_id,
+                "client_version": __version__,
+                "auth_token": self.config["auth_token"],
+                "channel": "quote",
+            },
+            timeout=max(0.001, deadline - time.monotonic()),
+            correlation_field="message_id",
+        )
+        self._raise_for_error(response)
+        self.quote_hello = response.get("result") or {}
+        if self.quote_hello.get("protocol_version") != PROTOCOL_VERSION:
+            bridge_protocol_version = self.quote_hello.get("protocol_version")
+            self.quote_connection.close()
+            self.quote_hello = None
+            raise RemoteError(
+                "QMT quote protocol version does not match client",
+                code="PROTOCOL_MISMATCH",
+                data={
+                    "client_protocol_version": PROTOCOL_VERSION,
+                    "bridge_protocol_version": bridge_protocol_version,
+                },
+            )
+
+    def _quote_request(
+        self,
+        command: str,
+        payload: Dict[str, Any],
+        timeout: float,
+    ) -> Dict[str, Any]:
+        request_id = str(uuid.uuid4())
+        response = self.quote_connection.request(
+            {
+                "v": PROTOCOL_VERSION,
+                "type": "request",
+                "message_id": str(uuid.uuid4()),
+                "request_id": request_id,
+                "command": command,
+                "payload": payload,
+            },
+            timeout=timeout,
+        )
+        self._raise_for_error(response)
+        return response.get("result") or {}
 
     @staticmethod
     def _raise_for_error(response: Dict[str, Any]) -> None:

@@ -5,6 +5,7 @@ import unittest
 from unittest import mock
 
 from qmt_adapter import QmtClient, RemoteError
+from qmt_adapter.client import PROTOCOL_VERSION
 
 
 class ProtocolVersionTests(unittest.TestCase):
@@ -22,7 +23,7 @@ class ProtocolVersionTests(unittest.TestCase):
             )
             client = QmtClient(config_path=config_path)
             client.connection._handle = 1
-            client.hello = {"protocol_version": 6}
+            client.hello = {"protocol_version": PROTOCOL_VERSION}
             client.connection.connect = mock.Mock()
             client.connection.request = mock.Mock()
 

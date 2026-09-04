@@ -20,8 +20,11 @@ CONFIG_RELATIVE_PATH = Path("config") / "bridge_config.json"
 DATABASE_RELATIVE_PATH = Path("data") / "bridge.db"
 LOADER_RELATIVE_PATH = Path("qmt_adapter_loader.py")
 DEFAULT_PIPE_NAME = r"\\.\pipe\qmt_adapter"
+DEFAULT_QUOTE_PIPE_NAME = r"\\.\pipe\qmt_adapter_quote"
 LEGACY_DEFAULT_PIPE_NAME = r"\\.\pipe\qmt_adapter_v1"
 LEGACY_MAX_MESSAGE_SIZE = 1024 * 1024
+DEFAULT_QUOTE_EVENT_MAX_ITEMS = 2000
+LEGACY_QUOTE_EVENT_MAX_ITEMS = 500
 
 
 def _atomic_write(path: Path, content: bytes) -> None:
@@ -98,6 +101,7 @@ def _initial_config(account_ids: Iterable[str], db_path: Path) -> Dict[str, Any]
     return {
         "version": __version__,
         "pipe_name": DEFAULT_PIPE_NAME,
+        "quote_pipe_name": DEFAULT_QUOTE_PIPE_NAME,
         "auth_token": secrets.token_hex(32),
         "db_path": str(db_path),
         "accounts": normalized_accounts,
@@ -106,7 +110,11 @@ def _initial_config(account_ids: Iterable[str], db_path: Path) -> Dict[str, Any]
         "max_commands_per_tick": 20,
         "max_pending_commands": 1000,
         "max_clients": 8,
+        "max_quote_clients": 8,
         "max_message_size": MAX_MESSAGE_SIZE,
+        "quote_client_queue_size": 256,
+        "quote_event_queue_size": 256,
+        "quote_event_max_items": DEFAULT_QUOTE_EVENT_MAX_ITEMS,
         "qmt_remark_max_bytes": 64,
     }
 
@@ -130,6 +138,20 @@ def _migrate_existing_config(config_path: Path) -> None:
     if "max_clients" not in config:
         config["max_clients"] = 8
         changed = True
+    if config.get("quote_event_max_items") == LEGACY_QUOTE_EVENT_MAX_ITEMS:
+        config["quote_event_max_items"] = DEFAULT_QUOTE_EVENT_MAX_ITEMS
+        changed = True
+    quote_defaults = {
+        "quote_pipe_name": DEFAULT_QUOTE_PIPE_NAME,
+        "max_quote_clients": 8,
+        "quote_client_queue_size": 256,
+        "quote_event_queue_size": 256,
+        "quote_event_max_items": DEFAULT_QUOTE_EVENT_MAX_ITEMS,
+    }
+    for key, value in quote_defaults.items():
+        if key not in config:
+            config[key] = value
+            changed = True
     if not changed:
         return
     encoded_config = (json.dumps(config, ensure_ascii=True, indent=2) + "\n").encode(
@@ -147,10 +169,10 @@ def deploy(
     The bridge and loader are replaced atomically on every call. Existing
     account, authentication, database settings and SQLite data are preserved.
     The configuration's ``version`` is updated to the deployed package version.
-    Legacy default pipe and message-size settings are migrated; existing
-    configurations receive the default multi-client limit when absent, while
-    custom values are preserved. The obsolete ``environment`` setting is
-    removed.
+    Legacy default pipe, message-size and 500-item quote chunk settings are
+    migrated. Existing configurations receive the command/quote pipe and queue
+    defaults when absent, while custom values are preserved. The obsolete
+    ``environment`` setting is removed.
 
     Args:
         root: Absolute deployment directory. Defaults to ``C:\\QMTAdapter``.

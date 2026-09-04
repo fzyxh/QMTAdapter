@@ -1,6 +1,7 @@
 {
-  "version": "0.7.3",
+  "version": "0.8.0",
   "pipe_name": "\\\\.\\pipe\\qmt_adapter",
+  "quote_pipe_name": "\\\\.\\pipe\\qmt_adapter_quote",
   "auth_token": "replace-with-a-random-64-character-hex-token",
   "db_path": "C:\\QMTAdapter\\data\\bridge.db",
   "accounts": [
@@ -14,6 +15,10 @@
   "max_commands_per_tick": 20,
   "max_pending_commands": 1000,
   "max_clients": 8,
+  "max_quote_clients": 8,
   "max_message_size": 5242880,
+  "quote_client_queue_size": 256,
+  "quote_event_queue_size": 256,
+  "quote_event_max_items": 2000,
   "qmt_remark_max_bytes": 64
 }

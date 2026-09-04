@@ -22,8 +22,9 @@ T = TypeVar("T")
 class AsyncQmtClient:
     """大 QMT Adapter 的 asyncio 客户端。
 
-    所有公开方法都在一个工作线程和一个持久命名管道连接上严格串行执行，
-    因此不会并行调用 QMT。异步接口的作用是避免阻塞调用方事件循环。
+    交易和查询方法在一个工作线程及一条持久命令管道上严格串行执行，因此不会
+    并行调用QMT。全推行情使用独立管道和独立事件工作线程，等待行情不会占用
+    交易命令线程。异步接口不会阻塞调用方事件循环。
 
     Args:
         config_path: ``bridge_config.json`` 路径。为 ``None`` 时使用默认路径。
@@ -42,6 +43,9 @@ class AsyncQmtClient:
         self._client = QmtClient(config_path=config_path, client_id=client_id)
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="qmt-adapter-async"
+        )
+        self._event_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="qmt-adapter-quote-events"
         )
         self._operation_lock = asyncio.Lock()
         self._closed = False
@@ -74,6 +78,7 @@ class AsyncQmtClient:
         finally:
             self._closed = True
             self._executor.shutdown(wait=True)
+            self._event_executor.shutdown(wait=True)
 
     async def __aenter__(self) -> "AsyncQmtClient":
         """进入异步上下文时连接Bridge并返回当前客户端。"""
@@ -225,6 +230,48 @@ class AsyncQmtClient:
             timeout=timeout,
             include_raw=include_raw,
         )
+
+    async def subscribe_whole_quote(
+        self,
+        markets: Optional[Iterable[str]] = None,
+        mode: str = "DELTA",
+        instrument_scope: str = "ALL",
+        push_interval_ms: int = 50,
+        chunk_size: Optional[int] = None,
+        include_raw: bool = False,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """异步订阅专用行情管道的全推行情。
+
+        参数和返回值与 :meth:`QmtClient.subscribe_whole_quote` 相同。
+        """
+        return await self._call(
+            self._client.subscribe_whole_quote,
+            markets=markets,
+            mode=mode,
+            instrument_scope=instrument_scope,
+            push_interval_ms=push_interval_ms,
+            chunk_size=chunk_size,
+            include_raw=include_raw,
+            timeout=timeout,
+        )
+
+    async def get_quote_event(
+        self, timeout: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """异步等待下一批全推行情，不占用交易命令工作线程。"""
+        if self._closed:
+            raise RuntimeError("async QMT client is closed")
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(
+            self._event_executor,
+            partial(self._client.get_quote_event, timeout=timeout),
+        )
+        return await asyncio.shield(future)
+
+    async def unsubscribe_whole_quote(self) -> Dict[str, Any]:
+        """异步取消当前客户端的全推订阅。"""
+        return await self._call(self._client.unsubscribe_whole_quote)
 
     async def place_order(
         self,

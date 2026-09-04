@@ -126,6 +126,40 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(receipt.qmt_order_id, "QMT-ORDER-0001")
 
+    async def test_quote_event_wait_does_not_block_order_commands(self):
+        async with AsyncQmtClient(
+            config_path=self.config_path, client_id="async-quote-stream"
+        ) as client:
+            await client.subscribe_whole_quote(
+                markets=["SH"],
+                mode="DELTA",
+                push_interval_ms=10,
+                timeout=5,
+            )
+            event_task = asyncio.create_task(
+                client.get_quote_event(timeout=2)
+            )
+            await asyncio.sleep(0.02)
+            receipt = await client.place_order(
+                OrderRequest(
+                    account_id=ACCOUNT_ID,
+                    instrument="600000.SH",
+                    side="BUY",
+                    quantity=100,
+                    price_type="LIMIT",
+                    limit_price="10.25",
+                    client_order_id="ASYNC-QUOTE-ORDER-0001",
+                ),
+                wait_for="BROKER_ID",
+                timeout=5,
+            )
+            self.fake_api.emit_whole_quote(self.fake_api.full_ticks)
+            event = await event_task
+
+            self.assertEqual(receipt.qmt_order_id, "QMT-ORDER-0001")
+            self.assertEqual(event["mode"], "DELTA")
+            self.assertEqual(event["count"], 2)
+
     async def test_async_new_issue_and_reverse_repo_interfaces(self):
         async with AsyncQmtClient(config_path=self.config_path) as client:
             issues = await client.list_new_issues("STOCK", timeout=5)

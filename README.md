@@ -17,6 +17,8 @@
 - 股票账户查询；
 - 股票持仓查询；
 - 单只及批量证券行情查询（可选返回QMT原始行情）；
+- 沪深北行情持续推送，可选择全部标的或仅沪深京A股、增量或完整快照模式，
+  并设置推送周期；
 - 大QMT板块成分、股票/ETF/转债等证券的批量合约详情及多周期历史K线查询；
 - 历史日线提供不随查询起点变化的每日累计复权因子；
 - 普通现金账户股票买入和卖出；
@@ -38,6 +40,8 @@ QMTAdapter 使用本机持久化双向命名管道，默认允许最多8个外�
 保持连接，客户端不需要在每条命令前重新连接。每个客户端最多一条请求在途；
 不同客户端可以同时排队，但所有QMT函数仍由QMT主线程串行调用。每条连接的
 管道读写由独立线程处理，单个客户端断开或停止读取不会阻塞QMT主线程及其他客户端。
+持续行情使用独立的 `qmt_adapter_quote` 管道，行情分片和慢消费者不会占用交易
+命令管道的响应流。
 QMT 端默认以 `10ms` 定时器处理命令队列，即约每 `10ms` 进入一次
 QMT 主线程处理。命名管道本身的读写往返延迟处于微秒级，显著低于 QMT
 的命令调度周期。
@@ -62,6 +66,17 @@ Bridge 真实运行时的 QMT 定时器间隔中位数实测为 `10.003ms`，与
 | `list_positions()` | `20.720ms` | `30.940ms` | `31.466ms` |
 | `get_quote()` | `28.560ms` | `31.036ms` | `31.388ms` |
 | `get_quotes()`（5只证券） | `29.087ms` | `31.740ms` | `37.264ms` |
+
+全推完整快照另按“从服务端生成该轮快照到客户端收齐全部分片”计时。以下结果来自
+同机大QMT实测：`instrument_scope="STOCK"`、沪深京A股共5558只、
+`include_raw=False`、22轮稳定样本。默认每片2000只，在首次收到数据的速度和
+收齐全量快照的延迟之间较为均衡：
+
+| `chunk_size` | 每轮分片数 | 首片延迟中位数 | 收齐延迟中位数 | 收齐延迟P95 |
+|---:|---:|---:|---:|---:|
+| `500` | 12 | `11.809ms` | `234.223ms` | `317.966ms` |
+| `2000`（默认） | 3 | `52.611ms` | `135.040ms` | `207.654ms` |
+| `0`（不按数量分片） | 1 | `125.768ms` | `125.768ms` | `158.481ms` |
 
 首次连接和协议握手本次实测为 `7.569ms`，不计入上表的单次调用延迟。
 这些数据用于展示当前实现的延迟量级，不是跨机器、跨 QMT 版本的性能保证。
@@ -139,6 +154,7 @@ C:\QMTAdapter\
 
 ```text
 QMT Adapter bridge [vx.x.x] is ready: \\.\pipe\qmt_adapter
+QMT Adapter quote stream is ready: \\.\pipe\qmt_adapter_quote
 ```
 
 短加载器只在策略启动时读取一次完整 Bridge，不会在每次查询或下单时重复加载。
@@ -193,7 +209,46 @@ with QmtClient() as client:
 `"front_ratio"` 或 `"back_ratio"` 请求复权日线；默认 `"none"`。该参数只
 改变日线标准价格字段，不改变 `adjustment_factor` 的定义。
 
-### 5. 升级
+### 5. 全市场行情推送
+
+全推通过独立行情管道工作，不占用查询和交易命令管道。`DELTA` 会把一个周期内
+发生更新的证券合并后发送，同一证券只保留该周期最后一条；`SNAPSHOT` 每个周期
+发送当前缓存中的完整市场快照。完整快照可能超过5 MiB，因此会自动拆成多个事件，
+调用方按相同 `batch_id`、`chunk_index` 和 `chunk_count` 组合。
+默认行情项只包含证券代码、北京时间、最新价量额以及买卖档位数组；批次推送
+时间只在事件最外层出现一次，以减少全市场消息体积。需要QMT原始字段时再设置
+`include_raw=True`。
+
+```python
+from qmt_adapter import QmtClient
+
+
+with QmtClient() as client:
+    subscription = client.subscribe_whole_quote(
+        markets=["SH", "SZ", "BJ"],
+        mode="DELTA",              # 或 "SNAPSHOT"
+        instrument_scope="STOCK",  # 只推送沪深京A股；"ALL" 为全部标的
+        push_interval_ms=50,
+        chunk_size=2000,           # None用服务端默认值；0表示不按数量分片
+        include_raw=False,
+    )
+    while True:
+        event = client.get_quote_event(timeout=5.0)
+        for quote in event["items"]:
+            print(quote["instrument"], quote["last_price"])
+```
+
+每个客户端只维护一个全推订阅，再次订阅会替换原订阅。调用
+`unsubscribe_whole_quote()` 或关闭客户端都会释放订阅。行情回调只负责按证券代码
+合并最新原始值并唤醒后台线程；标准化、周期聚合、分片和管道发送均在后台完成。
+`instrument_scope="STOCK"` 使用大QMT的“沪深京A股”板块过滤股票，不使用证券
+代码前缀推断；默认 `"ALL"` 保持交易所全部二级市场标的。
+`chunk_size` 可为每次订阅单独设置：`None` 使用服务端
+`quote_event_max_items=2000` 的默认值，正整数表示每片最多证券数，`0` 表示
+不按数量分片。无论如何设置，单条
+消息仍受5 MiB硬上限约束。
+
+### 6. 升级
 
 安装新版代码后执行：
 
@@ -312,8 +367,9 @@ with QmtClient() as client:
 
 ## Asyncio 客户端
 
-`AsyncQmtClient` 使用一个工作线程和一条命名管道连接。调用按提交顺序串行执行，
-不会并行调用 QMT API。
+`AsyncQmtClient` 的交易和查询使用一个串行工作线程；全推行情使用独立管道和独立
+事件线程。等待 `get_quote_event()` 不会阻塞同一客户端提交交易命令，QMT API
+调用本身仍在QMT主线程串行执行。
 
 ```python
 import asyncio

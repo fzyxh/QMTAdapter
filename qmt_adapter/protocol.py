@@ -256,3 +256,180 @@ class NamedPipeConnection:
             if not written.value:
                 raise ConnectionClosed("named pipe closed during write")
             offset += written.value
+
+
+class StreamingNamedPipeConnection(NamedPipeConnection):
+    """支持服务端持续推送事件的命名管道连接。
+
+    普通命令管道仍采用一次请求对应一次读取；行情管道完成握手和订阅响应
+    后转为只接收模式，由一个读线程持续把 ``event`` 帧放入有界队列。
+    即使调用方暂时不消费行情，读线程也会继续排空 Windows 管道缓冲区。
+    """
+
+    def __init__(
+        self,
+        pipe_name,
+        max_message_size=MAX_MESSAGE_SIZE,
+        max_event_queue_size=256,
+    ):
+        super().__init__(pipe_name, max_message_size=max_message_size)
+        self.max_event_queue_size = int(max_event_queue_size)
+        if self.max_event_queue_size < 1:
+            raise ValueError("max_event_queue_size must be positive")
+        self._events = queue.Queue(maxsize=self.max_event_queue_size)
+        self._write_lock = threading.Lock()
+        self._reader_thread = None
+        self._client_dropped_events = 0
+
+    def connect(self, timeout=5.0):
+        if self.is_connected:
+            return self
+        super().connect(timeout=timeout)
+        self._drain_events()
+        self._client_dropped_events = 0
+        self._reader_thread = None
+        return self
+
+    @property
+    def is_streaming(self):
+        return self.is_connected and self._reader_thread is not None
+
+    def start_reader(self):
+        """完成握手和订阅响应后，开始持续读取服务端事件。"""
+        if self._reader_thread is not None:
+            return
+        handle = self._get_handle()
+        reader_thread = threading.Thread(
+            target=self._reader_loop,
+            args=(handle,),
+            name="qmt-adapter-stream-reader",
+        )
+        reader_thread.daemon = True
+        self._reader_thread = reader_thread
+        reader_thread.start()
+
+    def close(self):
+        self._closed.set()
+        with self._handle_lock:
+            handle = self._handle
+            incoming = self._active_incoming
+            self._handle = None
+            self._active_incoming = None
+        closed_error = ConnectionClosed()
+        if incoming is not None:
+            incoming.put(closed_error)
+        self._put_terminal_event(closed_error)
+        if handle is not None:
+            if hasattr(self._kernel32, "CancelIoEx"):
+                self._kernel32.CancelIoEx(handle, None)
+            self._kernel32.CloseHandle(handle)
+        reader_thread = self._reader_thread
+        if (
+            reader_thread is not None
+            and reader_thread is not threading.current_thread()
+        ):
+            reader_thread.join(1.0)
+        self._reader_thread = None
+
+    def request(self, message, timeout=10.0, correlation_field="request_id"):
+        if self._reader_thread is None:
+            return NamedPipeConnection.request(
+                self,
+                message,
+                timeout=timeout,
+                correlation_field=correlation_field,
+            )
+        raise RuntimeError("streaming quote connection is receive-only")
+
+    def _read_response(self, handle, incoming):
+        try:
+            while True:
+                message = self._read_message(handle)
+                if message.get("type") == "event":
+                    self._queue_event(message)
+                else:
+                    incoming.put(message)
+                    return
+        except Exception as exc:
+            incoming.put(exc)
+
+    def send(self, message):
+        encoded = json.dumps(
+            message, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        if len(encoded) > self.max_message_size:
+            raise ValueError("message exceeds maximum size")
+        frame = struct.pack(">I", len(encoded)) + encoded
+        handle = self._get_handle()
+        with self._write_lock:
+            if self._get_handle() != handle:
+                raise ConnectionClosed()
+            self._write_all(handle, frame)
+
+    def get_event(self, timeout=None):
+        try:
+            item = self._events.get(timeout=timeout)
+        except queue.Empty:
+            raise RequestTimeout("quote event wait timed out")
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    def _reader_loop(self, handle):
+        try:
+            while not self._closed.is_set():
+                message = self._read_message(handle)
+                if message.get("type") == "event":
+                    self._queue_event(message)
+                    continue
+                raise ConnectionClosed("unexpected response on quote event stream")
+        except Exception as exc:
+            if not isinstance(exc, (ConnectionClosed, OSError)):
+                exc = ConnectionClosed("stream reader failed: %s" % exc)
+            self._reader_failed(handle, exc)
+
+    def _reader_failed(self, handle, exc):
+        with self._handle_lock:
+            if self._handle != handle:
+                return
+            self._handle = None
+        self._closed.set()
+        self._put_terminal_event(exc)
+        self._kernel32.CloseHandle(handle)
+
+    def _queue_event(self, message):
+        event = message
+        if self._events.full():
+            try:
+                self._events.get_nowait()
+                self._client_dropped_events += 1
+            except queue.Empty:
+                pass
+        if self._client_dropped_events:
+            event = dict(message)
+            result = dict(event.get("result") or {})
+            result["client_dropped_events"] = self._client_dropped_events
+            event["result"] = result
+        try:
+            self._events.put_nowait(event)
+        except queue.Full:
+            # 只有另一线程在满队列检查后抢先写入时才会走到这里。
+            self._client_dropped_events += 1
+
+    def _put_terminal_event(self, exc):
+        if self._events.full():
+            try:
+                self._events.get_nowait()
+            except queue.Empty:
+                pass
+        try:
+            self._events.put_nowait(exc)
+        except queue.Full:
+            pass
+
+    def _drain_events(self):
+        while True:
+            try:
+                self._events.get_nowait()
+            except queue.Empty:
+                return

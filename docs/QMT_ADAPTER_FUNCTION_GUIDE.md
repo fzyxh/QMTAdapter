@@ -1,6 +1,6 @@
 # QMT Adapter 部署与函数调用说明
 
-本文档对应QMTAdapter `0.8.0`、命名管道协议7，说明大 QMT 端脚本的部署方式，
+本文档对应QMTAdapter `0.8.1`、命名管道协议8，说明大 QMT 端脚本的部署方式，
 以及外部封装库的同步、异步函数调用方法。
 
 ## 1. 当前支持范围
@@ -10,8 +10,8 @@
 - 查询股票资金账户；
 - 查询股票持仓；
 - 查询单只或一批证券的最新普通行情，可选返回QMT原始字段；
-- 持续接收沪深北行情，可选全部标的或仅沪深京A股、增量或完整快照模式及
-  推送周期；
+- 持续接收沪深北行情，可选全部标的、沪深京A股、明确证券或组合范围，以及
+  增量或完整快照模式和推送周期；
 - 查询大QMT板块成分、股票/ETF/转债等证券的批量合约详情和多周期历史K线；
 - 历史日线返回不随查询起点变化的每日累计复权因子；
 - 普通股票买入、卖出；
@@ -148,7 +148,7 @@ SQLite 启用 WAL 后，运行期间可能在同一目录生成 `bridge.db-wal` 
 
 ```json
 {
-  "version": "0.8.0",
+  "version": "0.8.1",
   "pipe_name": "\\\\.\\pipe\\qmt_adapter",
   "quote_pipe_name": "\\\\.\\pipe\\qmt_adapter_quote",
   "auth_token": "由部署命令生成的64位十六进制字符串",
@@ -196,7 +196,7 @@ SQLite 启用 WAL 后，运行期间可能在同一目录生成 `bridge.db-wal` 
 | `qmt_remark_max_bytes` | 传入 QMT 的委托备注最大字节数 |
 
 配置中的 `version` 与 `qmt_adapter.__version__` 一致，表示写入当前 QMT
-部署目录的包版本；它不是命名管道协议版本，当前协议版本为7。
+部署目录的包版本；它不是命名管道协议版本，当前协议版本为8。
 
 ### 3.3 创建并运行 QMT 策略
 
@@ -306,7 +306,7 @@ client.hello
 
 ```python
 {
-    "protocol_version": 7,
+    "protocol_version": 8,
     "channel": "command",
     "connection_id": 1,
     "max_clients": 8,
@@ -555,6 +555,7 @@ subscription = client.subscribe_whole_quote(
     push_interval_ms=50,
     chunk_size=2000,
     include_raw=False,
+    initial_snapshot=True,
     timeout=10.0,
 )
 
@@ -571,9 +572,17 @@ client.unsubscribe_whole_quote()
 | `mode="SNAPSHOT"` | 每个周期发送当前内存缓存中的全部所选市场证券 |
 | `instrument_scope="ALL"` | 接收所选交易所的全部二级市场标的 |
 | `instrument_scope="STOCK"` | 只接收大QMT“沪深京A股”板块中的股票 |
+| `instrument_scope=None` | 不使用基础范围，只接收 `include_instruments` 明确指定的证券 |
+| `include_instruments` | 在基础范围之外明确加入的证券代码；自动去重，市场必须包含在 `markets` 中 |
 | `push_interval_ms` | 10～60000毫秒；默认50毫秒 |
 | `chunk_size` | `None` 使用服务端默认值；正整数指定每片最多证券数；`0` 不按数量分片 |
 | `include_raw` | 是否在每个项目中附带QMT回调的原始 `full_tick` |
+| `initial_snapshot` | 是否主动获取并首先发送当前完整快照；默认 `False` |
+
+`initial_snapshot=False` 时，订阅函数返回只表示行情连接和逻辑订阅已经建立，
+不保证立即产生事件。`DELTA` 必须等到所选证券出现后续行情更新；收盘后可能一直
+没有事件。需要在订阅建立后立即取得一轮当前行情时，使用
+`initial_snapshot=True`。
 
 `get_quote_event()` 返回：
 
@@ -590,11 +599,16 @@ client.unsubscribe_whole_quote()
     "push_interval_ms": 50,
     "chunk_size": 2000,
     "is_snapshot": False,
+    "initial_snapshot": False,
     "items": [
         {
             "instrument": "601919.SH",
             "quote_time": "2026-09-04T10:10:11.000+08:00",
             "last_price": "16.230",
+            "pre_close": "16.120",
+            "open": "16.150",
+            "high": "16.280",
+            "low": "16.080",
             "volume_lots": 123456,
             "turnover_amount": "200345678.000",
             "ask_prices": ["16.240", "16.250", "16.260", "16.270", "16.280"],
@@ -622,11 +636,42 @@ client.unsubscribe_whole_quote()
 行情连接内递增；出现跳号或 `server_dropped_events`、`client_dropped_events`
 增加，表示消费者处理速度不足，应通过普通 `get_quotes()` 主动重取所需证券。
 
-`instrument_scope` 与 `mode` 相互独立：前者决定证券范围，后者决定周期内发送
-增量还是完整快照。QMT底层全推接口只接受市场列表，因此 `STOCK` 仍由Bridge接收
-交易所全推，但会在标准化和管道发送前使用QMT板块成分过滤。
+`initial_snapshot=True` 时，对于 `STOCK` 或明确证券范围，Bridge会在QMT主线程
+主动调用一次 `get_full_tick`，再由后台行情线程完成过滤、标准化和分片。首轮事件
+固定带有 `initial_snapshot=True` 和 `is_snapshot=True`；即使订阅模式是
+`DELTA`，后续事件仍恢复为增量推送。订阅返回值中的
+`initial_snapshot_expected_count` 和 `initial_snapshot_returned_count` 分别表示
+主动请求数及QMT实际返回数。`ALL` 无法在调用 `get_full_tick` 前枚举完整二级市场
+代码，因此会刷新底层全推订阅，并把QMT返回的首批市场快照作为初始快照。
 
-全推行情项采用面向高频批量传输的精简结构。`ask_prices` 与
+`instrument_scope` 是基础证券范围，最终范围为基础范围与 `include_instruments`
+的并集。`instrument_scope=None` 时必须提供至少一个明确证券；`ALL` 已覆盖所选
+市场全部标的，不能再指定明确证券。QMT底层全推接口只接受市场列表，因此Bridge
+仍会接收交易所全推，但会在字段标准化、JSON序列化和管道发送前完成过滤。
+
+沪深A股加上证指数、深证成指：
+
+```python
+client.subscribe_whole_quote(
+    markets=["SH", "SZ"],
+    instrument_scope="STOCK",
+    include_instruments=["000001.SH", "399001.SZ"],
+)
+```
+
+仅订阅这两个指数：
+
+```python
+client.subscribe_whole_quote(
+    markets=["SH", "SZ"],
+    instrument_scope=None,
+    include_instruments=["000001.SH", "399001.SZ"],
+)
+```
+
+全推行情项采用面向高频批量传输的精简结构。标准价格字段包括 `last_price`、
+`pre_close`、`open`、`high` 和 `low`，均为三位小数
+字符串或 `None`。`ask_prices` 与
 `ask_volume_lots`、`bid_prices` 与 `bid_volume_lots` 按数组下标一一对应；
 下标0表示第一档。`quote_time` 是该证券行情快照时间，`push_time` 是整个批次的
 推送时间，二者均为带 `+08:00` 时区的北京时间。静态名称、价格最小变动单位和
@@ -637,8 +682,22 @@ client.unsubscribe_whole_quote()
 在同机大QMT、沪深京A股5558只、`SNAPSHOT`、`include_raw=False` 的22轮稳定
 样本中，每片500只时收齐完整快照延迟中位数为234.223ms；每片2000只时为
 135.040ms；不按数量分片时为125.768ms。默认2000兼顾首片到达速度和全量收齐
-延迟；`chunk_size=0` 仍必须满足单条消息5 MiB限制，不能用于可能超限的全标的或
-原始字段快照。
+延迟。该数据测量缓存已经由持续全推填充后的周期性快照，不包含建立订阅、
+`get_full_tick` 和首次全量标准化。
+
+2026-09-04收盘后使用QMT缓存行情进行的同机实测中，`initial_snapshot=True`、
+每片2000只且底层沪深全推已经保持连接时，仅上证指数和深证成指的完整初始快照
+中位数为138.541ms；沪深股票加这两个指数共5219只时为1094.868ms。同条件下
+仅沪深股票5217只为
+1126.254ms，两个指数没有造成显著额外开销。`initial_snapshot=False` 不生成
+首批快照；底层全推未保持和已经保持连接的两组10轮订阅调用，中位数分别为
+95.218ms和110.886ms。以上数据用于说明不同处理阶段的量级，不是盘中行情延迟
+保证。`chunk_size=0` 仍必须满足单条消息5 MiB限制，不能用于可能超限的全标的
+或原始字段快照。
+
+`subscription_id` 每次订阅使用新的UUID4生成，跨客户端、跨交易日发生碰撞的概率
+可以忽略。Bridge内部按行情连接而不是该ID保存订阅，因此它只负责把事件关联到
+本次订阅；取消订阅、断开连接或Bridge重启后即失效，不应持久化后用于恢复订阅。
 
 ### 5.8 list_sector_instruments、get_instrument_details、get_bar_history 和 get_daily_history
 
@@ -1215,7 +1274,7 @@ async with AsyncQmtClient(config_path=CONFIG_PATH) as client:
 | `await list_positions(account_id, timeout, include_raw)` | `list_positions(...)` |
 | `await get_quote(instrument, timeout, include_raw)` | `get_quote(...)` |
 | `await get_quotes(instruments, timeout, include_raw)` | `get_quotes(...)` |
-| `await subscribe_whole_quote(markets, mode, instrument_scope, push_interval_ms, chunk_size, include_raw, timeout)` | `subscribe_whole_quote(...)` |
+| `await subscribe_whole_quote(markets, mode, instrument_scope, push_interval_ms, chunk_size, include_raw, timeout, include_instruments, initial_snapshot)` | `subscribe_whole_quote(...)` |
 | `await get_quote_event(timeout)` | `get_quote_event(timeout)` |
 | `await unsubscribe_whole_quote()` | `unsubscribe_whole_quote()` |
 | `await list_sector_instruments(sector_name, timeout)` | `list_sector_instruments(...)` |
@@ -1383,7 +1442,7 @@ except QmtAdapterError as exc:
 
 ## 12. 升级说明
 
-本版本的命名管道协议为7。外部库和 QMT 端脚本必须同时升级；协议版本不同会收到
+本版本的命名管道协议为8。外部库和 QMT 端脚本必须同时升级；协议版本不同会收到
 `PROTOCOL_MISMATCH`，不会继续发送交易命令。升级时先停止外部客户端，替换并
 重启 QMT 策略，再启动外部客户端。
 

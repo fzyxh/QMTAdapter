@@ -235,11 +235,13 @@ class AsyncQmtClient:
         self,
         markets: Optional[Iterable[str]] = None,
         mode: str = "DELTA",
-        instrument_scope: str = "ALL",
+        instrument_scope: Optional[str] = "ALL",
         push_interval_ms: int = 50,
         chunk_size: Optional[int] = None,
         include_raw: bool = False,
         timeout: float = 10.0,
+        include_instruments: Optional[Iterable[str]] = None,
+        initial_snapshot: bool = False,
     ) -> Dict[str, Any]:
         """异步订阅专用行情管道的全推行情。
 
@@ -254,6 +256,8 @@ class AsyncQmtClient:
             chunk_size=chunk_size,
             include_raw=include_raw,
             timeout=timeout,
+            include_instruments=include_instruments,
+            initial_snapshot=initial_snapshot,
         )
 
     async def get_quote_event(

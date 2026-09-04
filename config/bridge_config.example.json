@@ -1,5 +1,5 @@
 {
-  "version": "0.8.0",
+  "version": "0.8.1",
   "pipe_name": "\\\\.\\pipe\\qmt_adapter",
   "quote_pipe_name": "\\\\.\\pipe\\qmt_adapter_quote",
   "auth_token": "replace-with-a-random-64-character-hex-token",

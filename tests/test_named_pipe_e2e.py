@@ -794,6 +794,10 @@ class NamedPipeEndToEndTests(unittest.TestCase):
                     "instrument",
                     "quote_time",
                     "last_price",
+                    "pre_close",
+                    "open",
+                    "high",
+                    "low",
                     "volume_lots",
                     "turnover_amount",
                     "ask_prices",
@@ -810,6 +814,10 @@ class NamedPipeEndToEndTests(unittest.TestCase):
                 event["items"][0]["quote_time"],
                 "2026-08-21T14:59:30.000+08:00",
             )
+            self.assertEqual(event["items"][0]["pre_close"], "9.900")
+            self.assertEqual(event["items"][0]["open"], "9.800")
+            self.assertEqual(event["items"][0]["high"], "10.200")
+            self.assertEqual(event["items"][0]["low"], "9.700")
             self.assertTrue(event["push_time"].endswith("+08:00"))
             self.assertEqual(
                 event["items"][0]["ask_volume_lots"],
@@ -881,6 +889,28 @@ class NamedPipeEndToEndTests(unittest.TestCase):
                 client.subscribe_whole_quote(
                     markets=["SH"], chunk_size=-1, timeout=5
                 )
+            with self.assertRaises(ValidationError):
+                client.subscribe_whole_quote(
+                    markets=["SH"], initial_snapshot=1, timeout=5
+                )
+            with self.assertRaises(ValidationError):
+                client.subscribe_whole_quote(
+                    markets=["SH"], instrument_scope=None, timeout=5
+                )
+            with self.assertRaises(ValidationError):
+                client.subscribe_whole_quote(
+                    markets=["SH"],
+                    instrument_scope="ALL",
+                    include_instruments=["000001.SH"],
+                    timeout=5,
+                )
+            with self.assertRaises(ValidationError):
+                client.subscribe_whole_quote(
+                    markets=["SH"],
+                    instrument_scope="STOCK",
+                    include_instruments=["399001.SZ"],
+                    timeout=5,
+                )
             subscription = client.subscribe_whole_quote(
                 markets=["SH"],
                 mode="DELTA",
@@ -900,6 +930,130 @@ class NamedPipeEndToEndTests(unittest.TestCase):
             self.assertEqual(event["chunk_count"], 1)
             self.assertEqual(event["count"], 1)
             self.assertEqual(event["items"][0]["instrument"], "600000.SH")
+            client.unsubscribe_whole_quote()
+
+    def test_whole_quote_can_select_only_explicit_indexes(self):
+        index_tick = dict(self.fake_api.full_ticks["600000.SH"])
+        ticks = dict(self.fake_api.full_ticks)
+        ticks["000001.SH"] = dict(index_tick)
+        ticks["399001.SZ"] = dict(index_tick)
+
+        with QmtClient(
+            config_path=self.config_path, client_id="whole-quote-indexes"
+        ) as client:
+            subscription = client.subscribe_whole_quote(
+                markets=["SH", "SZ"],
+                mode="DELTA",
+                instrument_scope=None,
+                push_interval_ms=10,
+                include_instruments=[
+                    "000001.sh",
+                    "399001.SZ",
+                    "000001.SH",
+                ],
+                timeout=5,
+            )
+            self.assertIsNone(subscription["instrument_scope"])
+            self.assertEqual(
+                subscription["include_instruments"],
+                ["000001.SH", "399001.SZ"],
+            )
+            self.assertEqual(self.fake_api.sector_calls, [])
+
+            self.fake_api.emit_whole_quote(ticks)
+            event = client.get_quote_event(timeout=2)
+            self.assertIsNone(event["instrument_scope"])
+            self.assertEqual(
+                {item["instrument"] for item in event["items"]},
+                {"000001.SH", "399001.SZ"},
+            )
+            client.unsubscribe_whole_quote()
+
+    def test_whole_quote_can_add_indexes_to_shenzhen_shanghai_stocks(self):
+        index_tick = dict(self.fake_api.full_ticks["600000.SH"])
+        ticks = dict(self.fake_api.full_ticks)
+        ticks["000001.SH"] = dict(index_tick)
+        ticks["399001.SZ"] = dict(index_tick)
+        ticks["000001.SZ"] = dict(index_tick)
+
+        with QmtClient(
+            config_path=self.config_path, client_id="whole-quote-stock-indexes"
+        ) as client:
+            subscription = client.subscribe_whole_quote(
+                markets=["SH", "SZ"],
+                mode="DELTA",
+                instrument_scope="STOCK",
+                push_interval_ms=10,
+                include_instruments=["000001.SH", "399001.SZ"],
+                timeout=5,
+            )
+            self.assertEqual(subscription["instrument_scope"], "STOCK")
+            self.assertEqual(
+                subscription["include_instruments"],
+                ["000001.SH", "399001.SZ"],
+            )
+
+            self.fake_api.emit_whole_quote(ticks)
+            event = client.get_quote_event(timeout=2)
+            self.assertEqual(
+                {item["instrument"] for item in event["items"]},
+                {
+                    "600000.SH",
+                    "000001.SZ",
+                    "000001.SH",
+                    "399001.SZ",
+                },
+            )
+            client.unsubscribe_whole_quote()
+
+    def test_whole_quote_initial_snapshot_uses_full_tick_before_delta(self):
+        index_tick = dict(self.fake_api.full_ticks["600000.SH"])
+        self.fake_api.full_ticks["000001.SH"] = dict(index_tick)
+        self.fake_api.full_ticks["399001.SZ"] = dict(index_tick)
+
+        with QmtClient(
+            config_path=self.config_path,
+            client_id="whole-quote-initial-snapshot",
+        ) as client:
+            subscription = client.subscribe_whole_quote(
+                markets=["SH", "SZ"],
+                mode="DELTA",
+                instrument_scope=None,
+                include_instruments=["000001.SH", "399001.SZ"],
+                initial_snapshot=True,
+                push_interval_ms=10,
+                timeout=5,
+            )
+            self.assertTrue(subscription["initial_snapshot"])
+            self.assertEqual(
+                subscription["initial_snapshot_expected_count"], 2
+            )
+            self.assertEqual(
+                subscription["initial_snapshot_returned_count"], 2
+            )
+            self.assertEqual(
+                self.fake_api.full_tick_calls[-1],
+                ["000001.SH", "399001.SZ"],
+            )
+
+            initial = client.get_quote_event(timeout=2)
+            self.assertTrue(initial["initial_snapshot"])
+            self.assertTrue(initial["is_snapshot"])
+            self.assertEqual(initial["mode"], "DELTA")
+            self.assertEqual(
+                {item["instrument"] for item in initial["items"]},
+                {"000001.SH", "399001.SZ"},
+            )
+
+            updated_tick = dict(index_tick)
+            updated_tick["lastPrice"] = 10.5
+            self.fake_api.emit_whole_quote({"000001.SH": updated_tick})
+            delta = client.get_quote_event(timeout=2)
+            self.assertFalse(delta["initial_snapshot"])
+            self.assertFalse(delta["is_snapshot"])
+            self.assertEqual(delta["count"], 1)
+            self.assertEqual(delta["items"][0]["instrument"], "000001.SH")
+            self.assertEqual(delta["items"][0]["last_price"], "10.500")
             client.unsubscribe_whole_quote()
 
     def test_whole_quote_multiple_clients_receive_only_selected_markets(self):

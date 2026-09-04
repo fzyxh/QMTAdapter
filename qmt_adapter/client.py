@@ -26,7 +26,7 @@ from .protocol import (
 from .version import __version__
 
 
-PROTOCOL_VERSION = 7
+PROTOCOL_VERSION = 8
 ORDER_STATUSES = {
     "PENDING_QMT",
     "PENDING_BROKER_ID",
@@ -203,13 +203,44 @@ def _normalized_quote_mode(mode: str) -> str:
     return normalized
 
 
-def _normalized_quote_instrument_scope(instrument_scope: str) -> str:
+def _normalized_quote_instrument_scope(
+    instrument_scope: Optional[str],
+) -> Optional[str]:
+    if instrument_scope is None:
+        return None
     normalized = str(instrument_scope or "").strip().upper()
     if normalized not in QUOTE_INSTRUMENT_SCOPES:
         raise ValidationError(
             "unsupported quote instrument scope: %s" % instrument_scope
         )
     return normalized
+
+
+def _normalized_quote_include_instruments(
+    instruments: Optional[Iterable[str]],
+) -> List[str]:
+    if instruments is None:
+        return []
+    if isinstance(instruments, str):
+        raise ValidationError(
+            "include_instruments must be an iterable of instrument codes"
+        )
+    try:
+        values = list(instruments)
+    except TypeError:
+        raise ValidationError(
+            "include_instruments must be an iterable of instrument codes"
+        )
+    result = []
+    seen = set()
+    for value in values:
+        instrument = str(value or "").strip().upper()
+        if not INSTRUMENT_PATTERN.match(instrument):
+            raise ValidationError("invalid instrument code: %s" % instrument)
+        if instrument not in seen:
+            seen.add(instrument)
+            result.append(instrument)
+    return result
 
 
 class QmtClient:
@@ -466,11 +497,13 @@ class QmtClient:
         self,
         markets: Optional[Iterable[str]] = None,
         mode: str = "DELTA",
-        instrument_scope: str = "ALL",
+        instrument_scope: Optional[str] = "ALL",
         push_interval_ms: int = 50,
         chunk_size: Optional[int] = None,
         include_raw: bool = False,
         timeout: float = 10.0,
+        include_instruments: Optional[Iterable[str]] = None,
+        initial_snapshot: bool = False,
     ) -> Dict[str, Any]:
         """通过专用行情管道订阅大QMT全推行情。
 
@@ -478,16 +511,23 @@ class QmtClient:
             markets: 市场代码集合，默认订阅 ``SH``、``SZ``、``BJ``。
             mode: ``DELTA`` 只发送周期内发生更新的证券；``SNAPSHOT``
                 每个周期发送当前缓存的全部证券快照。
-            instrument_scope: ``ALL`` 接收交易所全部二级市场标的；
-                ``STOCK`` 只接收大QMT“沪深京A股”板块中的股票。
+            instrument_scope: 基础证券范围。``ALL`` 接收交易所全部二级市场
+                标的；``STOCK`` 接收大QMT“沪深京A股”板块中的股票；``None``
+                表示没有基础范围，只接收 ``include_instruments``。
             push_interval_ms: 推送聚合周期，范围为10至60000毫秒。
             chunk_size: 单个事件最多包含的证券数；``None`` 使用服务端
                 默认值，``0`` 表示不按证券数量分片，但仍受5 MiB消息上限约束。
             include_raw: 是否在每个标准行情项中附带QMT原始全推字段。
             timeout: 连接专用行情管道并完成订阅的最长秒数。
+            include_instruments: 在基础范围之外明确加入的证券代码。自动去重；
+                每个代码的市场后缀必须包含在 ``markets`` 中。
+            initial_snapshot: 是否在订阅建立后主动获取并首先发送一轮完整快照。
+                该初始事件不改变后续 ``DELTA`` 或 ``SNAPSHOT`` 模式。
 
         Returns:
-            订阅信息，包含订阅ID、市场、模式、周期和行情管道名称。
+            订阅信息，包含订阅ID、市场、模式、证券范围、周期和行情管道名称。
+            请求初始快照时还包含预计请求数和QMT实际返回数；行情本身仍需通过
+            :meth:`get_quote_event` 读取。
 
         Note:
             每个客户端连接维护一个全推订阅；再次调用会替换原订阅。
@@ -499,6 +539,30 @@ class QmtClient:
         normalized_instrument_scope = _normalized_quote_instrument_scope(
             instrument_scope
         )
+        normalized_include_instruments = (
+            _normalized_quote_include_instruments(include_instruments)
+        )
+        if (
+            normalized_instrument_scope is None
+            and not normalized_include_instruments
+        ):
+            raise ValidationError(
+                "include_instruments must not be empty when instrument_scope is None"
+            )
+        if (
+            normalized_instrument_scope == "ALL"
+            and normalized_include_instruments
+        ):
+            raise ValidationError(
+                "include_instruments is redundant when instrument_scope is ALL"
+            )
+        market_set = set(normalized_markets)
+        for instrument in normalized_include_instruments:
+            instrument_market = instrument.rsplit(".", 1)[-1]
+            if instrument_market not in market_set:
+                raise ValidationError(
+                    "included instrument market is not subscribed: %s" % instrument
+                )
         if isinstance(push_interval_ms, bool) or not isinstance(
             push_interval_ms, int
         ):
@@ -515,6 +579,8 @@ class QmtClient:
                     "chunk_size must be between 0 and 100000"
                 )
         include_raw = _validated_include_raw(include_raw)
+        if not isinstance(initial_snapshot, bool):
+            raise ValidationError("initial_snapshot must be a boolean")
         if self.quote_connection.is_streaming:
             self.quote_connection.close()
             self.quote_hello = None
@@ -526,9 +592,11 @@ class QmtClient:
                 "markets": normalized_markets,
                 "mode": normalized_mode,
                 "instrument_scope": normalized_instrument_scope,
+                "include_instruments": normalized_include_instruments,
                 "push_interval_ms": push_interval_ms,
                 "chunk_size": chunk_size,
                 "include_raw": include_raw,
+                "initial_snapshot": initial_snapshot,
             },
             timeout=timeout,
         )
@@ -547,8 +615,10 @@ class QmtClient:
 
         返回字典包含 ``subscription_id``、``sequence``、``batch_id``、
         ``chunk_index``、``chunk_count``、``mode``、``push_time``、精简的
-        ``items`` 和丢弃计数。每个行情项包含证券代码、北京时间、最新
-        价量额以及按档位对齐的买卖价格和数量数组。
+        ``items`` 和丢弃计数。每个行情项包含证券代码、北京时间、最新价、
+        昨收、开高低、成交量额以及按档位对齐的买卖价格和数量数组。
+        主动初始快照事件同时带有 ``initial_snapshot=True`` 和
+        ``is_snapshot=True``。
         ``SNAPSHOT`` 的一个周期可能拆成多批，可按 ``batch_id`` 和分片字段
         重新组合。``timeout=None`` 表示一直等待。
         """

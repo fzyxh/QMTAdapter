@@ -32,7 +32,7 @@ CONFIG_PATH = globals().get("QMT_ADAPTER_CONFIG_PATH") or os.environ.get(
     r"C:\QMTAdapter\config\bridge_config.json",
 )
 
-PROTOCOL_VERSION = 7
+PROTOCOL_VERSION = 8
 # UTF-8 JSON正文上限，不包含4字节帧长度前缀。
 MAX_MESSAGE_SIZE = 5 * 1024 * 1024
 STRATEGY_NAME = "QMT_ADAPTER_V1"
@@ -1441,25 +1441,35 @@ def _normalize_stream_quote(tick, instrument):
 
     def quote_time():
         text = str(tick.get("stime") or tick.get("timetag") or "").strip()
-        for pattern, date_format in (
-            (r"^([0-9]{14})(?:\.([0-9]+))?$", "%Y%m%d%H%M%S"),
-            (
-                r"^([0-9]{8} [0-9]{2}:[0-9]{2}:[0-9]{2})(?:\.([0-9]+))?$",
-                "%Y%m%d %H:%M:%S",
-            ),
-        ):
-            matched = re.match(pattern, text)
-            if matched:
-                try:
-                    parsed = datetime.datetime.strptime(
-                        matched.group(1), date_format
-                    )
-                    milliseconds = (matched.group(2) or "0")[:3].ljust(3, "0")
-                    return parsed.strftime("%Y-%m-%dT%H:%M:%S") + (
-                        ".%s+08:00" % milliseconds
-                    )
-                except Exception:
-                    pass
+        matched = re.match(r"^([0-9]{14})(?:\.([0-9]+))?$", text)
+        if matched:
+            value = matched.group(1)
+            milliseconds = (matched.group(2) or "0")[:3].ljust(3, "0")
+            return "%s-%s-%sT%s:%s:%s.%s+08:00" % (
+                value[0:4],
+                value[4:6],
+                value[6:8],
+                value[8:10],
+                value[10:12],
+                value[12:14],
+                milliseconds,
+            )
+        matched = re.match(
+            r"^([0-9]{8}) ([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]+))?$",
+            text,
+        )
+        if matched:
+            value = matched.group(1)
+            milliseconds = (matched.group(5) or "0")[:3].ljust(3, "0")
+            return "%s-%s-%sT%s:%s:%s.%s+08:00" % (
+                value[0:4],
+                value[4:6],
+                value[6:8],
+                matched.group(2),
+                matched.group(3),
+                matched.group(4),
+                milliseconds,
+            )
         timestamp_ms = _raw_integer(tick, "time")
         if timestamp_ms is None:
             return None
@@ -1492,6 +1502,10 @@ def _normalize_stream_quote(tick, instrument):
         "instrument": instrument,
         "quote_time": quote_time(),
         "last_price": _optional_three_decimal_text(tick.get("lastPrice")),
+        "pre_close": _optional_three_decimal_text(tick.get("lastClose")),
+        "open": _optional_three_decimal_text(tick.get("open")),
+        "high": _optional_three_decimal_text(tick.get("high")),
+        "low": _optional_three_decimal_text(tick.get("low")),
         "volume_lots": _raw_integer(tick, "volume"),
         "turnover_amount": _optional_three_decimal_text(tick.get("amount")),
         "ask_prices": price_list(tick.get("askPrice")),
@@ -3187,13 +3201,55 @@ class BridgeRuntime(object):
             raise BridgeError(
                 "INVALID_ARGUMENT", "unsupported quote push mode: %s" % mode
             )
-        instrument_scope = str(
-            payload.get("instrument_scope", "ALL") or ""
-        ).strip().upper()
-        if instrument_scope not in QUOTE_INSTRUMENT_SCOPES:
+        raw_instrument_scope = payload.get("instrument_scope", "ALL")
+        if raw_instrument_scope is None:
+            instrument_scope = None
+        else:
+            instrument_scope = str(
+                raw_instrument_scope or ""
+            ).strip().upper()
+            if instrument_scope not in QUOTE_INSTRUMENT_SCOPES:
+                raise BridgeError(
+                    "INVALID_ARGUMENT",
+                    "unsupported quote instrument scope: %s"
+                    % instrument_scope,
+                )
+        include_values = payload.get("include_instruments")
+        if include_values is None:
+            include_values = []
+        if not isinstance(include_values, list):
             raise BridgeError(
                 "INVALID_ARGUMENT",
-                "unsupported quote instrument scope: %s" % instrument_scope,
+                "include_instruments must be an array",
+            )
+        include_instruments = []
+        include_seen = set()
+        subscribed_markets = set(normalized_markets)
+        for value in include_values:
+            instrument = str(value or "").strip().upper()
+            if not re.match(r"^[0-9]{6}\.(SH|SZ|BJ)$", instrument):
+                raise BridgeError(
+                    "INVALID_ARGUMENT",
+                    "invalid included instrument: %s" % instrument,
+                )
+            if instrument.rsplit(".", 1)[-1] not in subscribed_markets:
+                raise BridgeError(
+                    "INVALID_ARGUMENT",
+                    "included instrument market is not subscribed: %s"
+                    % instrument,
+                )
+            if instrument not in include_seen:
+                include_seen.add(instrument)
+                include_instruments.append(instrument)
+        if instrument_scope is None and not include_instruments:
+            raise BridgeError(
+                "INVALID_ARGUMENT",
+                "include_instruments must not be empty when instrument_scope is null",
+            )
+        if instrument_scope == "ALL" and include_instruments:
+            raise BridgeError(
+                "INVALID_ARGUMENT",
+                "include_instruments is redundant when instrument_scope is ALL",
             )
         if instrument_scope == "STOCK":
             self._load_quote_stock_universe(context_info)
@@ -3226,6 +3282,11 @@ class BridgeRuntime(object):
             raise BridgeError(
                 "INVALID_ARGUMENT", "include_raw must be a boolean"
             )
+        initial_snapshot = payload.get("initial_snapshot", False)
+        if not isinstance(initial_snapshot, bool):
+            raise BridgeError(
+                "INVALID_ARGUMENT", "initial_snapshot must be a boolean"
+            )
         now = time.monotonic()
         state = {
             "connection_id": connection_id,
@@ -3233,9 +3294,16 @@ class BridgeRuntime(object):
             "markets": tuple(normalized_markets),
             "mode": mode,
             "instrument_scope": instrument_scope,
+            "include_instruments": tuple(include_instruments),
+            "include_instrument_set": frozenset(include_instruments),
             "push_interval_ms": push_interval_ms,
             "chunk_size": chunk_size,
             "include_raw": include_raw,
+            "initial_snapshot": initial_snapshot,
+            "initial_snapshot_pending": initial_snapshot,
+            "initial_snapshot_ready": False,
+            "initial_snapshot_expected_count": None,
+            "initial_snapshot_returned_count": None,
             "next_emit_at": now + push_interval_ms / 1000.0,
             "pending": {},
         }
@@ -3244,7 +3312,11 @@ class BridgeRuntime(object):
             self.quote_subscribers[connection_id] = state
             self.quote_subscription_dirty = True
         try:
-            self._reconcile_quote_subscription(context_info)
+            self._reconcile_quote_subscription(
+                context_info,
+                force=initial_snapshot and instrument_scope == "ALL",
+            )
+            self._prime_initial_quote_snapshot(state, context_info)
         except Exception:
             with self.quote_lock:
                 if previous is None:
@@ -3259,9 +3331,17 @@ class BridgeRuntime(object):
             "markets": list(state["markets"]),
             "mode": state["mode"],
             "instrument_scope": state["instrument_scope"],
+            "include_instruments": list(state["include_instruments"]),
             "push_interval_ms": state["push_interval_ms"],
             "chunk_size": state["chunk_size"],
             "include_raw": state["include_raw"],
+            "initial_snapshot": state["initial_snapshot"],
+            "initial_snapshot_expected_count": state[
+                "initial_snapshot_expected_count"
+            ],
+            "initial_snapshot_returned_count": state[
+                "initial_snapshot_returned_count"
+            ],
             "quote_pipe_name": self.quote_pipe.pipe_name,
         }
 
@@ -3297,6 +3377,92 @@ class BridgeRuntime(object):
                 self.quote_stock_universe = frozenset(universe)
             return self.quote_stock_universe
 
+    @staticmethod
+    def _quote_state_accepts(state, instrument, market, stock_universe):
+        if market not in state["markets"]:
+            return False
+        if instrument in state["include_instrument_set"]:
+            return True
+        if state["instrument_scope"] == "ALL":
+            return True
+        return (
+            state["instrument_scope"] == "STOCK"
+            and instrument in stock_universe
+        )
+
+    @staticmethod
+    def _quote_candidate_items(
+        data,
+        all_scope_markets,
+        stock_scope_markets,
+        included_instruments,
+        stock_universe,
+    ):
+        if all_scope_markets:
+            return data.items()
+        allowed = set(included_instruments)
+        if stock_scope_markets:
+            allowed.update(
+                instrument
+                for instrument in stock_universe
+                if instrument.rsplit(".", 1)[-1] in stock_scope_markets
+            )
+        if len(allowed) < len(data):
+            return (
+                (instrument, data[instrument])
+                for instrument in allowed
+                if instrument in data
+            )
+        return data.items()
+
+    def _prime_initial_quote_snapshot(self, state, context_info):
+        if not state["initial_snapshot"]:
+            return
+        if state["instrument_scope"] == "ALL":
+            # 全标的集合只能由QMT全推的首批市场快照确定；订阅已被强制
+            # 刷新，后台线程处理首批回调后再将快照标记为可发送。
+            return
+        targets = set(state["include_instruments"])
+        if state["instrument_scope"] == "STOCK":
+            markets = set(state["markets"])
+            targets.update(
+                instrument
+                for instrument in (self.quote_stock_universe or frozenset())
+                if instrument.rsplit(".", 1)[-1] in markets
+            )
+        target_list = sorted(targets)
+        get_full_tick = getattr(context_info, "get_full_tick", None)
+        if not callable(get_full_tick):
+            raise BridgeError(
+                "QMT_API_MISSING", "ContextInfo.get_full_tick is unavailable"
+            )
+        ticks = get_full_tick(target_list)
+        if not isinstance(ticks, dict):
+            raise BridgeError(
+                "QMT_DATA_ERROR",
+                "ContextInfo.get_full_tick did not return a mapping",
+            )
+        normalized_ticks = {}
+        for raw_instrument, tick in ticks.items():
+            instrument = str(raw_instrument or "").strip().upper()
+            if instrument in targets and isinstance(tick, dict):
+                normalized_ticks[instrument] = tick
+        if not normalized_ticks:
+            raise BridgeError(
+                "QMT_DATA_ERROR",
+                "get_full_tick returned no initial snapshot data",
+                {"requested_count": len(target_list)},
+            )
+        state["initial_snapshot_expected_count"] = len(target_list)
+        state["initial_snapshot_returned_count"] = len(normalized_ticks)
+        self.enqueue_quote_batch(
+            normalized_ticks, generation=self.quote_generation
+        )
+        with self.quote_lock:
+            current = self.quote_subscribers.get(state["connection_id"])
+            if current is state:
+                state["initial_snapshot_ready"] = True
+
     def remove_quote_subscriber(self, connection_id):
         """行情管道断开时移除逻辑订阅；QMT反订阅由主线程下次处理。"""
         with self.quote_lock:
@@ -3311,15 +3477,15 @@ class BridgeRuntime(object):
             desired.update(state["markets"])
         return tuple(market for market in QUOTE_MARKETS if market in desired)
 
-    def _reconcile_quote_subscription(self, context_info):
+    def _reconcile_quote_subscription(self, context_info, force=False):
         with self.quote_lock:
             desired_markets = self._desired_quote_markets()
             current_markets = self.quote_subscription_markets
             current_id = self.quote_subscription_id
             dirty = self.quote_subscription_dirty
-            if not dirty and desired_markets == current_markets:
+            if not force and not dirty and desired_markets == current_markets:
                 return
-            if desired_markets == current_markets and (
+            if not force and desired_markets == current_markets and (
                 bool(desired_markets) == (current_id is not None)
             ):
                 self.quote_subscription_dirty = False
@@ -3476,14 +3642,23 @@ class BridgeRuntime(object):
                 return
             all_scope_markets = set()
             stock_scope_markets = set()
+            included_instruments = set()
             for state in self.quote_subscribers.values():
                 if state["instrument_scope"] == "ALL":
                     all_scope_markets.update(state["markets"])
-                else:
+                elif state["instrument_scope"] == "STOCK":
                     stock_scope_markets.update(state["markets"])
+                included_instruments.update(state["include_instruments"])
             stock_universe = self.quote_stock_universe or frozenset()
+        candidate_items = self._quote_candidate_items(
+            data,
+            all_scope_markets,
+            stock_scope_markets,
+            included_instruments,
+            stock_universe,
+        )
         normalized = []
-        for raw_instrument, tick in data.items():
+        for raw_instrument, tick in candidate_items:
             instrument = str(raw_instrument or "").strip().upper()
             if not re.match(r"^[0-9]{6}\.(SH|SZ|BJ)$", instrument):
                 continue
@@ -3496,6 +3671,7 @@ class BridgeRuntime(object):
                     market in stock_scope_markets
                     and instrument in stock_universe
                 )
+                or instrument in included_instruments
             ):
                 continue
             normalized.append(
@@ -3520,15 +3696,16 @@ class BridgeRuntime(object):
                 }
                 self.quote_cache[instrument] = record
                 for state in self.quote_subscribers.values():
-                    if (
-                        state["mode"] == "DELTA"
-                        and market in state["markets"]
-                        and (
-                            state["instrument_scope"] == "ALL"
-                            or instrument in stock_universe
-                        )
+                    if state["mode"] == "DELTA" and self._quote_state_accepts(
+                        state, instrument, market, stock_universe
                     ):
                         state["pending"][instrument] = record
+                    if (
+                        state["initial_snapshot_pending"]
+                        and state["instrument_scope"] == "ALL"
+                        and market in state["markets"]
+                    ):
+                        state["initial_snapshot_ready"] = True
 
     def _emit_due_quote_batches(self):
         now = time.monotonic()
@@ -3543,7 +3720,26 @@ class BridgeRuntime(object):
                 interval = state["push_interval_ms"] / 1000.0
                 while state["next_emit_at"] <= now:
                     state["next_emit_at"] += interval
-                if state["mode"] == "DELTA":
+                is_initial_snapshot = False
+                if state["initial_snapshot_pending"]:
+                    if not state["initial_snapshot_ready"]:
+                        continue
+                    records = [
+                        record
+                        for record in self.quote_cache.values()
+                        if self._quote_state_accepts(
+                            state,
+                            record["instrument"],
+                            record["market"],
+                            self.quote_stock_universe or frozenset(),
+                        )
+                    ]
+                    if not records:
+                        continue
+                    state["initial_snapshot_pending"] = False
+                    state["pending"].clear()
+                    is_initial_snapshot = True
+                elif state["mode"] == "DELTA":
                     records = list(state["pending"].values())
                     state["pending"].clear()
                 else:
@@ -3552,10 +3748,11 @@ class BridgeRuntime(object):
                         record
                         for record in self.quote_cache.values()
                         if record["market"] in markets
-                        and (
-                            state["instrument_scope"] == "ALL"
-                            or record["instrument"]
-                            in (self.quote_stock_universe or frozenset())
+                        and self._quote_state_accepts(
+                            state,
+                            record["instrument"],
+                            record["market"],
+                            self.quote_stock_universe or frozenset(),
                         )
                     ]
                 if not records:
@@ -3567,6 +3764,7 @@ class BridgeRuntime(object):
                         records,
                         cache_size,
                         coalesced_items,
+                        is_initial_snapshot,
                     )
                 )
         for emission in emissions:
@@ -3579,6 +3777,7 @@ class BridgeRuntime(object):
         records,
         cache_size,
         coalesced_items,
+        is_initial_snapshot=False,
     ):
         total_count = len(records)
         max_items = state["chunk_size"] or total_count
@@ -3609,7 +3808,10 @@ class BridgeRuntime(object):
                     "markets": list(state["markets"]),
                     "push_interval_ms": state["push_interval_ms"],
                     "chunk_size": state["chunk_size"],
-                    "is_snapshot": state["mode"] == "SNAPSHOT",
+                    "is_snapshot": (
+                        state["mode"] == "SNAPSHOT" or is_initial_snapshot
+                    ),
+                    "initial_snapshot": is_initial_snapshot,
                     "items": items,
                     "count": len(items),
                     "batch_total_count": total_count,

@@ -1,6 +1,6 @@
 # QMT Adapter 部署与函数调用说明
 
-本文档对应QMTAdapter `0.8.1`、命名管道协议8，说明大 QMT 端脚本的部署方式，
+本文档对应QMTAdapter `0.8.2`、命名管道协议8，说明大 QMT 端脚本的部署方式，
 以及外部封装库的同步、异步函数调用方法。
 
 ## 1. 当前支持范围
@@ -148,7 +148,7 @@ SQLite 启用 WAL 后，运行期间可能在同一目录生成 `bridge.db-wal` 
 
 ```json
 {
-  "version": "0.8.1",
+  "version": "0.8.2",
   "pipe_name": "\\\\.\\pipe\\qmt_adapter",
   "quote_pipe_name": "\\\\.\\pipe\\qmt_adapter_quote",
   "auth_token": "由部署命令生成的64位十六进制字符串",
@@ -328,7 +328,7 @@ result = client.health(timeout=5.0)
 
 | 字段 | 说明 |
 |---|---|
-| `status` | `OK` 或 `DEGRADED`；只由管道、主循环、持久化和对账等基础设施错误决定 |
+| `status` | `OK` 或 `DEGRADED`；由监听器停止、主循环、持久化和对账等整体故障决定，单条客户端连接异常不改变该字段 |
 | `connected` | 当前是否至少有一个已鉴权客户端连接 |
 | `active_client_count` | 当前已鉴权客户端连接数 |
 | `max_clients` | Bridge允许的客户端连接上限 |
@@ -336,10 +336,26 @@ result = client.health(timeout=5.0)
 | `quote_subscriber_count` | 当前全推行情逻辑订阅数 |
 | `configured_accounts` | 配置的账号白名单 |
 | `pending_commands` | 等待QMT主线程处理的命令数 |
-| `last_error` | Bridge最近一次错误，包括请求处理错误和基础设施错误 |
+| `last_error` | Bridge最近一次错误，包括请求处理、客户端连接和基础设施错误；不能单独用作当前健康状态 |
 | `last_request_error` | 最近一次未预期的请求处理错误；不改变 `status` |
+| `last_connection_error` | 最近一次未预期的客户端连接异常，包含通道、管道名、连接ID、客户端ID及操作；保留用于诊断，不改变 `status` |
 | `health_error` | 最近一次影响整体健康状态的基础设施错误 |
 | `timer_interval_median_ms` | QMT命令定时器间隔中位数 |
+
+`connected` 表示命令管道存在已鉴权客户端，不是证券账户的登录状态。
+正常断开、取消订阅和停止产生的管道断开/取消错误不会写入 `health_error`。
+行情连接关闭时，QMT策略输出会记录 `channel`、`pipe`、`connection_id`、
+`client_id` 和 `reason`，以便区分主动停止与异常断开。
+
+从 `0.8.2` 起，连接关闭先停止接收新工作，取消尚未完成的I/O，并等待所有
+读写线程释放句柄使用权，然后才执行 `DisconnectNamedPipe` 和 `CloseHandle`。
+取消请求与线程进入同步I/O之间仍可能发生交错，因此每个管道服务有一个清理
+线程，在连接关闭期间继续取消尚未完成的I/O；没有待关闭连接时该线程休眠。
+整个Bridge停止时会等待监听、读写和清理线程退出。
+
+历史连接异常不会使已经恢复的桥接服务永久处于 `DEGRADED`；真正的整体故障
+仍保存在 `health_error`，不会因某个客户端重新连接而自动清除。已有运行实例
+需要在更新桥接脚本后重启策略，才能加载新的连接管理逻辑。命名管道协议仍为8。
 
 ### 5.4 get_account
 

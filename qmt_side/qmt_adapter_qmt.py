@@ -1720,6 +1720,8 @@ class PipeServer(object):
         self.listener_handle = None
         self.current_connection_id = 0
         self.server_thread = None
+        self.reaper_thread = None
+        self.acceptor_done = threading.Event()
         self.startup_event = threading.Event()
         self.startup_error = None
         self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -1793,17 +1795,25 @@ class PipeServer(object):
             name="qmt-adapter-%s-pipe-server" % self.channel,
         )
         self.server_thread.daemon = True
-        self.server_thread.start()
+        self.reaper_thread = threading.Thread(
+            target=self._reap_connections,
+            name="qmt-adapter-%s-pipe-reaper" % self.channel,
+        )
+        self.reaper_thread.daemon = True
+        try:
+            self.reaper_thread.start()
+            self.server_thread.start()
+        except Exception:
+            self.acceptor_done.set()
+            self.stop()
+            raise
         if not self.startup_event.wait(self.START_TIMEOUT_SECONDS):
             self.stop()
             raise BridgeError(
                 "PIPE_START_TIMEOUT", "named pipe server did not become ready"
             )
         if self.startup_error is not None:
-            thread = self.server_thread
-            if thread is not None and thread is not threading.current_thread():
-                thread.join(self.STOP_TIMEOUT_SECONDS)
-            self.server_thread = None
+            self.stop()
             raise BridgeError("PIPE_START_FAILED", self.startup_error)
 
     def stop(self):
@@ -1829,14 +1839,17 @@ class PipeServer(object):
                 if wake_handle != self.INVALID_HANDLE_VALUE:
                     self.kernel32.CloseHandle(wake_handle)
                 elif hasattr(self.kernel32, "CancelIoEx"):
-                    self.kernel32.CancelIoEx(listener_handle, None)
+                    with self.connection_condition:
+                        if self.listener_handle == listener_handle:
+                            self.kernel32.CancelIoEx(listener_handle, None)
             self._cancel_synchronous_io(thread)
         deadline = time.monotonic() + self.STOP_TIMEOUT_SECONDS
         for state in states:
             self._close_connection(
-                state["connection_id"], expected_handle=state["handle"]
+                state["connection_id"], expected_handle=state["handle"],
+                reason="server_stop",
             )
-        if thread is not threading.current_thread():
+        if thread.ident is not None and thread is not threading.current_thread():
             thread.join(max(0.0, deadline - time.monotonic()))
             if thread.is_alive():
                 raise BridgeError(
@@ -1850,22 +1863,32 @@ class PipeServer(object):
         known_connection_ids = set(state["connection_id"] for state in states)
         for state in late_states:
             self._close_connection(
-                state["connection_id"], expected_handle=state["handle"]
+                state["connection_id"], expected_handle=state["handle"],
+                reason="server_stop",
             )
             if state["connection_id"] not in known_connection_ids:
                 states.append(state)
         for state in states:
-            connection_thread = state.get("thread")
-            if (
-                connection_thread is not None
-                and connection_thread is not threading.current_thread()
-            ):
-                connection_thread.join(max(0.0, deadline - time.monotonic()))
-                if connection_thread.is_alive():
-                    raise BridgeError(
-                        "PIPE_STOP_TIMEOUT",
-                        "named pipe connection thread did not stop",
-                    )
+            for worker in (state.get("thread"), state.get("event_thread")):
+                if (
+                    worker is not None
+                    and worker.ident is not None
+                    and worker is not threading.current_thread()
+                ):
+                    worker.join(max(0.0, deadline - time.monotonic()))
+                    if worker.is_alive():
+                        raise BridgeError(
+                            "PIPE_STOP_TIMEOUT",
+                            "named pipe %s worker did not stop" % self.channel,
+                        )
+        reaper = self.reaper_thread
+        if reaper is not None and reaper.ident is not None:
+            reaper.join(max(0.0, deadline - time.monotonic()))
+            if reaper.is_alive():
+                raise BridgeError(
+                    "PIPE_STOP_TIMEOUT", "named pipe handle cleanup did not stop"
+                )
+        self.reaper_thread = None
         self.server_thread = None
 
     def _cancel_synchronous_io(self, thread):
@@ -1888,6 +1911,14 @@ class PipeServer(object):
             self.kernel32.CloseHandle(thread_handle)
 
     def _server_loop(self):
+        try:
+            self._accept_connections()
+        finally:
+            with self.connection_condition:
+                self.acceptor_done.set()
+                self.connection_condition.notify_all()
+
+    def _accept_connections(self):
         first_instance = True
         while not self.stop_event.is_set():
             with self.connection_condition:
@@ -1941,8 +1972,13 @@ class PipeServer(object):
                     raise ctypes.WinError(ctypes.get_last_error())
             except Exception as exc:
                 if not self.stop_event.is_set() and not self._is_peer_disconnect(exc):
-                    self.runtime.set_error("pipe connection failed: %s" % exc)
-                self._close_raw_handle(handle)
+                    self.runtime.set_connection_error(
+                        "channel=%s pipe=%s operation=ConnectNamedPipe error=%s"
+                        % (self.channel, self.pipe_name, exc)
+                    )
+                with self.connection_condition:
+                    self.listener_handle = None
+                    self._close_raw_handle(handle)
                 continue
             finally:
                 with self.connection_condition:
@@ -1966,6 +2002,11 @@ class PipeServer(object):
                     "event_sequence": 0,
                     "dropped_events": 0,
                     "response_pending": threading.Event(),
+                    "closing": threading.Event(),
+                    # Each worker owns the handle until its finally block.
+                    # Closing a connection must not invalidate another worker's
+                    # in-flight call, including a call not yet issued to Win32.
+                    "handle_users": 1,
                 }
                 connection_thread = threading.Thread(
                     target=self._connection_loop,
@@ -1976,23 +2017,37 @@ class PipeServer(object):
                 connection_thread.daemon = True
                 state["thread"] = connection_thread
                 self.connections[connection_id] = state
-            connection_thread.start()
+            try:
+                connection_thread.start()
+            except Exception as exc:
+                self._close_connection(connection_id, reason="worker_start_failed")
+                self._release_connection_handle(state)
+                self.runtime.set_error(
+                    "channel=%s pipe=%s worker start failed: %s"
+                    % (self.channel, self.pipe_name, exc)
+                )
+                return
 
     def _connection_loop(self, state):
         handle = state["handle"]
         connection_id = state["connection_id"]
+        reason = "reader_finished"
         try:
             self._read_connection(handle, state)
         except Exception as exc:
-            if not self.stop_event.is_set() and not self._is_peer_disconnect(exc):
-                self.runtime.set_error("pipe connection failed: %s" % exc)
+            reason = self._connection_failure(state, "reader", exc)
         finally:
-            self._close_connection(connection_id, expected_handle=handle)
+            try:
+                self._close_connection(
+                    connection_id, expected_handle=handle, reason=reason
+                )
+            finally:
+                self._release_connection_handle(state)
 
     def _read_connection(self, handle, state):
         connection_id = state["connection_id"]
         authenticated = False
-        while not self.stop_event.is_set():
+        while not self.stop_event.is_set() and not state["closing"].is_set():
             header = self._read_exact(handle, 4)
             size = struct.unpack(">I", header)[0]
             if size <= 0 or size > self.max_message_size:
@@ -2049,14 +2104,23 @@ class PipeServer(object):
                     state["write_lock"],
                 )
                 if self.channel == "quote":
-                    event_thread = threading.Thread(
-                        target=self._event_writer_loop,
-                        args=(state,),
-                        name="qmt-adapter-quote-writer-%s" % connection_id,
-                    )
-                    event_thread.daemon = True
-                    state["event_thread"] = event_thread
-                    event_thread.start()
+                    with self.connection_condition:
+                        if state["closing"].is_set():
+                            return
+                        event_thread = threading.Thread(
+                            target=self._event_writer_loop,
+                            args=(state,),
+                            name="qmt-adapter-quote-writer-%s" % connection_id,
+                        )
+                        event_thread.daemon = True
+                        state["event_thread"] = event_thread
+                        state["handle_users"] += 1
+                        try:
+                            event_thread.start()
+                        except Exception:
+                            state["event_thread"] = None
+                            state["handle_users"] -= 1
+                            raise
                 continue
             if message.get("type") != "request":
                 raise BridgeError("PROTOCOL_ERROR", "request message expected")
@@ -2075,7 +2139,10 @@ class PipeServer(object):
                         state["response_pending"].clear()
                     continue
                 completed = False
-                while not self.stop_event.is_set():
+                while (
+                    not self.stop_event.is_set()
+                    and not state["closing"].is_set()
+                ):
                     try:
                         response = response_queue.get(timeout=0.1)
                         try:
@@ -2097,7 +2164,10 @@ class PipeServer(object):
                     # 行情连接完成订阅后转为服务端单向推送。同步命名管道
                     # 同一句柄上的阻塞 ReadFile 会阻挡另一个线程 WriteFile，
                     # 因此此处只用 PeekNamedPipe 检测断开，不再阻塞读取。
-                    while not self.stop_event.wait(0.1):
+                    while (
+                        not state["closing"].wait(0.1)
+                        and not self.stop_event.is_set()
+                    ):
                         if not self._peer_is_connected(handle):
                             return
                     return
@@ -2117,7 +2187,10 @@ class PipeServer(object):
                     self._send_direct(handle, immediate, state["write_lock"])
                     continue
                 completed = False
-                while not self.stop_event.is_set():
+                while (
+                    not self.stop_event.is_set()
+                    and not state["closing"].is_set()
+                ):
                     try:
                         response = response_queue.get(timeout=0.1)
                         self._send_direct(
@@ -2135,7 +2208,10 @@ class PipeServer(object):
     def _mark_authenticated(self, connection_id, handle, client_id):
         with self.connection_condition:
             state = self.connections.get(connection_id)
-            if state is None or state["handle"] != handle:
+            if (
+                state is None or state["handle"] != handle
+                or state["closing"].is_set()
+            ):
                 return False
             state["authenticated"] = True
             state["client_id"] = str(client_id or "")
@@ -2145,14 +2221,18 @@ class PipeServer(object):
     def active_client_count(self):
         with self.handle_lock:
             return sum(
-                1 for state in self.connections.values() if state["authenticated"]
+                1 for state in self.connections.values()
+                if state["authenticated"] and not state["closing"].is_set()
             )
 
     def queue_event(self, connection_id, message):
         """向一个行情连接排队；队列满时丢弃最旧事件而不阻塞行情线程。"""
         with self.connection_condition:
             state = self.connections.get(connection_id)
-            if state is None or not state["authenticated"]:
+            if (
+                state is None or not state["authenticated"]
+                or state["closing"].is_set()
+            ):
                 return False
             state["event_sequence"] += 1
             sequence = state["event_sequence"]
@@ -2187,8 +2267,9 @@ class PipeServer(object):
     def _event_writer_loop(self, state):
         connection_id = state["connection_id"]
         handle = state["handle"]
+        reason = "writer_finished"
         try:
-            while not self.stop_event.is_set():
+            while not self.stop_event.is_set() and not state["closing"].is_set():
                 try:
                     event = state["event_queue"].get(timeout=0.1)
                 except queue.Empty:
@@ -2197,17 +2278,45 @@ class PipeServer(object):
                     return
                 while (
                     state["response_pending"].is_set()
-                    and not self.stop_event.wait(0.001)
+                    and not state["closing"].wait(0.001)
+                    and not self.stop_event.is_set()
                 ):
                     pass
+                if state["closing"].is_set() or self.stop_event.is_set():
+                    return
                 self._send_direct(handle, event, state["write_lock"])
         except Exception as exc:
-            if not self.stop_event.is_set() and not self._is_peer_disconnect(exc):
-                self.runtime.set_error(
-                    "quote pipe writer failed: %s" % exc
-                )
+            reason = self._connection_failure(state, "writer", exc)
         finally:
-            self._close_connection(connection_id, expected_handle=handle)
+            try:
+                self._close_connection(
+                    connection_id, expected_handle=handle, reason=reason
+                )
+            finally:
+                self._release_connection_handle(state)
+
+    def _connection_failure(self, state, worker, exc):
+        reason = "worker=%s operation=%s error=%s: %s" % (
+            worker, getattr(exc, "pipe_operation", "protocol"),
+            type(exc).__name__, exc,
+        )
+        if (
+            not self.stop_event.is_set()
+            and not self._is_peer_disconnect(exc)
+        ):
+            self.runtime.set_connection_error(
+                "channel=%s pipe=%s connection_id=%s client_id=%s %s"
+                % (self.channel, self.pipe_name, state["connection_id"],
+                   state["client_id"], reason)
+            )
+        return reason
+
+    def _io_error(self, operation, error_code=None):
+        if error_code is None:
+            error_code = ctypes.get_last_error()
+        error = ctypes.WinError(error_code)
+        error.pipe_operation = operation
+        return error
 
     def _send_direct(self, handle, message, write_lock=None):
         """发送一帧消息；响应过大时改发可关联的结构化错误。"""
@@ -2273,7 +2382,7 @@ class PipeServer(object):
             if not self.kernel32.ReadFile(
                 handle, buffer, remaining, ctypes.byref(received), None
             ):
-                raise ctypes.WinError(ctypes.get_last_error())
+                raise self._io_error("ReadFile")
             if not received.value:
                 raise BridgeError("CONNECTION_CLOSED", "pipe closed during read")
             chunks.append(buffer.raw[: received.value])
@@ -2281,6 +2390,8 @@ class PipeServer(object):
         return b"".join(chunks)
 
     def _is_peer_disconnect(self, exc):
+        if isinstance(exc, BridgeError) and exc.code == "CONNECTION_CLOSED":
+            return True
         return getattr(exc, "winerror", None) in (
             self.ERROR_BROKEN_PIPE,
             self.ERROR_NO_DATA,
@@ -2295,9 +2406,12 @@ class PipeServer(object):
         ):
             return True
         error = ctypes.get_last_error()
-        if error in (self.ERROR_BROKEN_PIPE, self.ERROR_NO_DATA):
+        if error in (
+            self.ERROR_BROKEN_PIPE, self.ERROR_NO_DATA,
+            self.ERROR_PIPE_NOT_CONNECTED, self.ERROR_OPERATION_ABORTED,
+        ):
             return False
-        raise ctypes.WinError(error)
+        raise self._io_error("PeekNamedPipe", error)
 
     def _write_all(self, handle, data):
         offset = 0
@@ -2308,44 +2422,99 @@ class PipeServer(object):
             if not self.kernel32.WriteFile(
                 handle, buffer, len(part), ctypes.byref(written), None
             ):
-                raise ctypes.WinError(ctypes.get_last_error())
+                raise self._io_error("WriteFile")
             if not written.value:
                 raise BridgeError("CONNECTION_CLOSED", "pipe closed during write")
             offset += written.value
 
-    def _close_connection(self, connection_id, expected_handle=None):
+    def _close_connection(
+        self, connection_id, expected_handle=None, reason="closed"
+    ):
+        """Stop new work; the reaper closes the handle after all users exit."""
         with self.connection_condition:
             state = self.connections.get(connection_id)
             if state is None:
                 return False
             if expected_handle is not None and state["handle"] != expected_handle:
                 return False
-            self.connections.pop(connection_id, None)
-        if self.channel == "command":
-            self.runtime.discard_broker_responses(connection_id)
-        else:
-            self.runtime.remove_quote_subscriber(connection_id)
-            try:
-                state["event_queue"].put_nowait(None)
-            except queue.Full:
-                try:
-                    state["event_queue"].get_nowait()
-                except queue.Empty:
-                    pass
+            if state["closing"].is_set():
+                return False
+            state["closing"].set()
+            # Retain ownership while removing the runtime's subscription or
+            # response waiters, including when stop() initiated the close.
+            state["handle_users"] += 1
+            self.connection_condition.notify_all()
+        try:
+            if self.channel == "command":
+                self.runtime.discard_broker_responses(connection_id)
+            else:
+                self.runtime.remove_quote_subscriber(connection_id)
+                if self.stop_event.is_set():
+                    reason = "server_stop"
+                print(
+                    "QMT Adapter connection closing: channel=%s pipe=%s "
+                    "connection_id=%s client_id=%s reason=%s"
+                    % (self.channel, self.pipe_name, connection_id,
+                       state["client_id"], reason)
+                )
                 try:
                     state["event_queue"].put_nowait(None)
                 except queue.Full:
-                    pass
-        self._close_raw_handle(state["handle"])
-        event_thread = state.get("event_thread")
-        if (
-            event_thread is not None
-            and event_thread is not threading.current_thread()
-        ):
-            event_thread.join(1.0)
-        with self.connection_condition:
-            self.connection_condition.notify_all()
+                    try:
+                        state["event_queue"].get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        state["event_queue"].put_nowait(None)
+                    except queue.Full:
+                        pass
+        finally:
+            self._release_connection_handle(state)
         return True
+
+    def _release_connection_handle(self, state):
+        with self.connection_condition:
+            state["handle_users"] -= 1
+            self.connection_condition.notify_all()
+
+    def _reap_connections(self):
+        """Cancel synchronous I/O until every user releases handle ownership.
+
+        A worker can enter ReadFile/WriteFile just after a cancellation request.
+        Retrying cancellation covers that interval. DisconnectNamedPipe must
+        also wait until then: it can block behind synchronous I/O on the handle.
+        The condition protects cancellation from racing with CloseHandle/reuse.
+        """
+        with self.connection_condition:
+            while True:
+                stopping_listener = (
+                    self.stop_event.is_set() and self.listener_handle is not None
+                )
+                if stopping_listener:
+                    # ConnectNamedPipe can also begin just after stop() tried
+                    # to wake/cancel the acceptor. Its handle remains owned by
+                    # the acceptor until the call returns.
+                    self._cancel_synchronous_io(self.server_thread)
+                closing = [
+                    state for state in self.connections.values()
+                    if state["closing"].is_set()
+                ]
+                for state in closing:
+                    if state["handle_users"] == 0:
+                        self._close_raw_handle(state["handle"])
+                        self.connections.pop(state["connection_id"])
+                        self.connection_condition.notify_all()
+                    else:
+                        self.kernel32.CancelIoEx(state["handle"], None)
+                if (
+                    self.stop_event.is_set()
+                    and self.acceptor_done.is_set()
+                    and not self.connections
+                ):
+                    return
+                self.connection_condition.wait(
+                    0.01 if closing or stopping_listener else None
+                )
 
     def _close_raw_handle(self, handle):
         if handle in (None, self.INVALID_HANDLE_VALUE):
@@ -2894,8 +3063,10 @@ class BridgeRuntime(object):
         self.stopping = False
         self.pending_broker_responses = {}
         self.pending_broker_lock = threading.Lock()
+        self.error_lock = threading.Lock()
         self.last_error = ""
         self.last_request_error = ""
+        self.last_connection_error = ""
         self.health_error = ""
         self.last_reconcile = 0.0
         self.last_algo_scan = 0.0
@@ -2989,14 +3160,26 @@ class BridgeRuntime(object):
         self.store.close()
 
     def set_error(self, value):
-        self.last_error = str(value)
-        self.health_error = self.last_error
-        print("QMT Adapter: %s" % self.last_error)
+        message = str(value)
+        with self.error_lock:
+            self.last_error = message
+            self.health_error = message
+        print("QMT Adapter: %s" % message)
 
     def set_request_error(self, value):
-        self.last_error = str(value)
-        self.last_request_error = self.last_error
-        print("QMT Adapter request error: %s" % self.last_request_error)
+        message = str(value)
+        with self.error_lock:
+            self.last_error = message
+            self.last_request_error = message
+        print("QMT Adapter request error: %s" % message)
+
+    def set_connection_error(self, value):
+        """Keep per-client diagnostics separate from bridge-wide failures."""
+        message = str(value)
+        with self.error_lock:
+            self.last_error = message
+            self.last_connection_error = message
+        print("QMT Adapter connection error: %s" % message)
 
     def hello_response(self, message, connection_id=None, channel="command"):
         if channel == "quote":
@@ -4092,6 +4275,13 @@ class BridgeRuntime(object):
         raise BridgeError("UNSUPPORTED_COMMAND", "unsupported command: %s" % command)
 
     def health(self):
+        with self.error_lock:
+            errors = {
+                "last_error": self.last_error,
+                "last_request_error": self.last_request_error,
+                "last_connection_error": self.last_connection_error,
+                "health_error": self.health_error,
+            }
         with self.tick_lock:
             tick_count = self.tick_count
             intervals = list(self.tick_intervals)
@@ -4106,7 +4296,7 @@ class BridgeRuntime(object):
             tick_min_ms = None
             tick_max_ms = None
         result = {
-            "status": "OK" if not self.health_error else "DEGRADED",
+            "status": "OK" if not errors["health_error"] else "DEGRADED",
             "connected": active_client_count > 0,
             "active_client_count": active_client_count,
             "max_clients": self.pipe.max_clients,
@@ -4114,15 +4304,13 @@ class BridgeRuntime(object):
             "quote_subscriber_count": len(self.quote_subscribers),
             "configured_accounts": list(self.accounts.values()),
             "pending_commands": self.inbound.qsize(),
-            "last_error": self.last_error,
-            "last_request_error": self.last_request_error,
-            "health_error": self.health_error,
             "started_at": self.started_at,
             "timer_tick_count": tick_count,
             "timer_interval_median_ms": tick_median_ms,
             "timer_interval_min_ms": tick_min_ms,
             "timer_interval_max_ms": tick_max_ms,
         }
+        result.update(errors)
         with self.quote_input_lock:
             pending_input_items = len(self.quote_input_latest)
             received_batches = self.quote_received_batches

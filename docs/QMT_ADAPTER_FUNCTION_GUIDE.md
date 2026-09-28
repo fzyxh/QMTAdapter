@@ -1,6 +1,6 @@
 # QMT Adapter 部署与函数调用说明
 
-本文档对应QMTAdapter `0.8.2`、命名管道协议8，说明大 QMT 端脚本的部署方式，
+本文档对应QMTAdapter `0.9.0`、命名管道协议9，说明大 QMT 端脚本的部署方式，
 以及外部封装库的同步、异步函数调用方法。
 
 ## 1. 当前支持范围
@@ -148,7 +148,7 @@ SQLite 启用 WAL 后，运行期间可能在同一目录生成 `bridge.db-wal` 
 
 ```json
 {
-  "version": "0.8.2",
+  "version": "0.9.0",
   "pipe_name": "\\\\.\\pipe\\qmt_adapter",
   "quote_pipe_name": "\\\\.\\pipe\\qmt_adapter_quote",
   "auth_token": "由部署命令生成的64位十六进制字符串",
@@ -196,7 +196,7 @@ SQLite 启用 WAL 后，运行期间可能在同一目录生成 `bridge.db-wal` 
 | `qmt_remark_max_bytes` | 传入 QMT 的委托备注最大字节数 |
 
 配置中的 `version` 与 `qmt_adapter.__version__` 一致，表示写入当前 QMT
-部署目录的包版本；它不是命名管道协议版本，当前协议版本为8。
+部署目录的包版本；它不是命名管道协议版本，当前协议版本为9。
 
 ### 3.3 创建并运行 QMT 策略
 
@@ -306,7 +306,7 @@ client.hello
 
 ```python
 {
-    "protocol_version": 8,
+    "protocol_version": 9,
     "channel": "command",
     "connection_id": 1,
     "max_clients": 8,
@@ -1063,6 +1063,8 @@ result = client.list_orders(
     account_id="YOUR_ACCOUNT_ID",
     timeout=5.0,
     include_raw=False,
+    start_date="2026-09-28",
+    end_date="2026-09-28",
 )
 ```
 
@@ -1083,6 +1085,21 @@ result = client.list_orders(timeout=5.0)
 
 `get_order` 和 `list_orders` 默认不通过命名管道返回QMT原始对象。排查券商字段时
 可临时传入 `include_raw=True`。标准化的成交数量、成交金额和废单原因不受该参数影响。
+`start_date` 和 `end_date` 均可省略，均按北京时间的自然日解释，包含对应日期；
+未传日期时返回持久化的全部委托。查询依据是委托的 `created_at`，不是最后更新时间。
+
+明确清理历史记录时可调用：
+
+```python
+result = client.cleanup_history(before_date="2026-09-01")
+# {"before_date": "2026-09-01", "deleted": {"orders": ..., "trades": ...,
+#   "algo_orders": ..., "algo_children": ...}}
+```
+
+此命令删除北京时间指定日期零点前创建的所有持久化记录，不按委托状态筛选；
+跨截止时间但与待删除算法父单或委托关联的子单、成交也一并删除，保证记录关系完整。
+删除会移除对应委托ID的幂等记录，无法撤销；不会自动运行。SQLite 已释放的页可供
+后续写入复用，但数据库文件不会因删除而立即缩小。
 
 Bridge 已将 QMT 普通股票委托状态 48 至 57 标准化为
 `SUBMITTED`、`CANCEL_PENDING`、`PARTIALLY_FILLED`、`CANCELED`、
@@ -1304,7 +1321,8 @@ async with AsyncQmtClient(config_path=CONFIG_PATH) as client:
 | `await subscribe_new_issue(order, wait_for, timeout)` | `subscribe_new_issue(...)` |
 | `await place_orders(orders, interval_ms, wait_for, timeout)` | `place_orders(...)` |
 | `await get_order(client_order_id, timeout, include_raw)` | `get_order(...)` |
-| `await list_orders(account_id, timeout, include_raw)` | `list_orders(...)` |
+| `await list_orders(account_id, timeout, include_raw, start_date, end_date)` | `list_orders(...)` |
+| `await cleanup_history(before_date, timeout)` | `cleanup_history(...)` |
 | `await list_trades(account_id, scope, client_order_id, include_raw, timeout)` | `list_trades(...)` |
 | `await wait_order(client_order_id, statuses, timeout, include_raw)` | `wait_order(...)` |
 | `await wait_orders(client_order_ids, statuses, timeout, include_raw)` | `wait_orders(...)` |
@@ -1431,6 +1449,7 @@ except QmtAdapterError as exc:
   申购、算法下单和撤单命令在QMT主线程的定时器中执行；
 - `system.health`、`order.get/list/wait` 和 `algo_order.get/list` 是本地持久化读取，
   不需要调用QMT交易函数。
+- `history.cleanup` 直接操作本地持久化，不调用QMT交易函数，也不会自动执行。
 
 ## 11. 推荐的基本调用顺序
 
@@ -1458,7 +1477,7 @@ except QmtAdapterError as exc:
 
 ## 12. 升级说明
 
-本版本的命名管道协议为8。外部库和 QMT 端脚本必须同时升级；协议版本不同会收到
+本版本的命名管道协议为9。外部库和 QMT 端脚本必须同时升级；协议版本不同会收到
 `PROTOCOL_MISMATCH`，不会继续发送交易命令。升级时先停止外部客户端，替换并
 重启 QMT 策略，再启动外部客户端。
 

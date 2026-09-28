@@ -1337,6 +1337,45 @@ class NamedPipeEndToEndTests(unittest.TestCase):
         self.assertEqual(debug["raw"]["m_nOrderStatus"], 57)
         self.assertNotIn("raw", listed["items"][0])
 
+    def test_order_date_filter_and_explicit_history_cleanup(self):
+        store = self.harness.runtime.store
+        store.insert_order(
+            "history-request",
+            {
+                "client_order_id": "history-order",
+                "account_id": ACCOUNT_ID,
+                "instrument": "600000.SH",
+                "side": "BUY",
+                "quantity": 100,
+                "price_type": "LIMIT",
+                "limit_price": "10.00",
+            },
+            "history-wire", "history-remark", "history-hash",
+        )
+        with store.lock:
+            store.conn.execute(
+                "UPDATE orders SET created_at=?,updated_at=? "
+                "WHERE client_order_id='history-order'",
+                ("2026-09-27T15:59:59.000000Z",) * 2,
+            )
+            store.conn.commit()
+        with QmtClient(config_path=self.config_path) as client:
+            self.assertEqual(
+                client.list_orders(account_id=ACCOUNT_ID,
+                                   start_date="2026-09-28")["count"], 0,
+            )
+            self.assertEqual(
+                client.list_orders(account_id=ACCOUNT_ID,
+                                   end_date="2026-09-27")["count"], 1,
+            )
+            with self.assertRaises(RemoteError) as caught:
+                client.list_orders(start_date="2026-09-29",
+                                   end_date="2026-09-28")
+            self.assertEqual(caught.exception.code, "INVALID_ARGUMENT")
+            deleted = client.cleanup_history(before_date="2026-09-28")
+            self.assertEqual(deleted["deleted"]["orders"], 1)
+            self.assertEqual(client.list_orders(account_id=ACCOUNT_ID)["count"], 0)
+
     def test_list_trades_supports_adapter_and_account_scope(self):
         order = OrderRequest(
             account_id=ACCOUNT_ID,

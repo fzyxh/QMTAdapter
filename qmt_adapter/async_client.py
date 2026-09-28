@@ -391,6 +391,8 @@ class AsyncQmtClient:
         account_id: Optional[str] = None,
         timeout: float = 5.0,
         include_raw: bool = False,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
     ) -> Dict[str, Any]:
         """异步列出适配器委托；返回值同 ``QmtClient.list_orders``。"""
         return await self._call(
@@ -398,6 +400,20 @@ class AsyncQmtClient:
             account_id=account_id,
             timeout=timeout,
             include_raw=include_raw,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+    async def cleanup_history(
+        self,
+        before_date: str,
+        timeout: float = 30.0,
+    ) -> Dict[str, Any]:
+        """异步清理历史记录；返回值同 ``QmtClient.cleanup_history``。"""
+        return await self._call(
+            self._client.cleanup_history,
+            before_date,
+            timeout=timeout,
         )
 
     async def list_trades(

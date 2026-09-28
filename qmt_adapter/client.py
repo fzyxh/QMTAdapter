@@ -26,7 +26,7 @@ from .protocol import (
 from .version import __version__
 
 
-PROTOCOL_VERSION = 8
+PROTOCOL_VERSION = 9
 ORDER_STATUSES = {
     "PENDING_QMT",
     "PENDING_BROKER_ID",
@@ -1135,6 +1135,8 @@ class QmtClient:
         account_id: Optional[str] = None,
         timeout: float = 5.0,
         include_raw: bool = False,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
     ) -> Dict[str, Any]:
         """列出适配器持久化的委托记录。
 
@@ -1143,6 +1145,8 @@ class QmtClient:
                 适配器委托。
             timeout: 等待响应的最长秒数。
             include_raw: 是否为每项附带QMT原始委托字段；默认关闭。
+            start_date: 可选的起始交易日期，格式 YYYY-MM-DD，含当天。
+            end_date: 可选的结束交易日期，格式 YYYY-MM-DD，含当天。
 
         Returns:
             ``{"items": [...], "count": N}`` 形式的字典。
@@ -1151,7 +1155,23 @@ class QmtClient:
         payload = {"include_raw": include_raw}
         if account_id is not None:
             payload["account_id"] = str(account_id)
+        if start_date is not None:
+            payload["start_date"] = start_date
+        if end_date is not None:
+            payload["end_date"] = end_date
         return self._request("order.list", payload, timeout=timeout)
+
+    def cleanup_history(
+        self,
+        before_date: str,
+        timeout: float = 30.0,
+    ) -> Dict[str, Any]:
+        """删除北京时间指定日期之前的全部适配器持久化记录及关联记录。"""
+        return self._request(
+            "history.cleanup",
+            {"before_date": before_date},
+            timeout=timeout,
+        )
 
     def list_trades(
         self,

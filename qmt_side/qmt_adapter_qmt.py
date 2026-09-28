@@ -32,7 +32,7 @@ CONFIG_PATH = globals().get("QMT_ADAPTER_CONFIG_PATH") or os.environ.get(
     r"C:\QMTAdapter\config\bridge_config.json",
 )
 
-PROTOCOL_VERSION = 8
+PROTOCOL_VERSION = 9
 # UTF-8 JSON正文上限，不包含4字节帧长度前缀。
 MAX_MESSAGE_SIZE = 5 * 1024 * 1024
 STRATEGY_NAME = "QMT_ADAPTER_V1"
@@ -186,6 +186,19 @@ def _utc_now_text():
     return datetime.datetime.now(datetime.timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%S.%fZ"
     )
+
+
+def _china_date_utc_bound(value, name):
+    if not isinstance(value, str) or not re.match(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$", value):
+        raise BridgeError("INVALID_ARGUMENT", "%s must be YYYY-MM-DD" % name)
+    try:
+        day = datetime.datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError:
+        raise BridgeError("INVALID_ARGUMENT", "%s is not a valid date" % name)
+    china_timezone = datetime.timezone(datetime.timedelta(hours=8))
+    return datetime.datetime.combine(
+        day, datetime.time.min, china_timezone
+    ).astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def _china_now_text():
@@ -2172,7 +2185,7 @@ class PipeServer(object):
                             return
                     return
                 continue
-            if self.runtime.is_local_read_command(message.get("command")):
+            if self.runtime.is_local_command(message.get("command")):
                 self._send_direct(
                     handle,
                     self.runtime.process_local_request(message),
@@ -2570,6 +2583,10 @@ class OrderStore(object):
             CREATE INDEX IF NOT EXISTS ix_orders_qmt_id
             ON orders(account_id, qmt_order_id, created_at DESC)
             WHERE qmt_order_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS ix_orders_account_created
+            ON orders(account_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS ix_orders_created
+            ON orders(created_at DESC);
 
             CREATE TABLE IF NOT EXISTS trades (
                 trade_key TEXT PRIMARY KEY,
@@ -2743,16 +2760,90 @@ class OrderStore(object):
                 "SELECT * FROM orders WHERE wire_order_tag=?", (wire_order_tag,)
             ).fetchone()
 
-    def list_orders(self, account_id=None):
+    def list_orders(self, account_id=None, start_utc=None, end_utc=None):
         with self.lock:
+            clauses = []
+            parameters = []
             if account_id:
-                return self.conn.execute(
-                    "SELECT * FROM orders WHERE account_id=? ORDER BY created_at DESC",
-                    (account_id,),
-                ).fetchall()
-            return self.conn.execute(
-                "SELECT * FROM orders ORDER BY created_at DESC"
-            ).fetchall()
+                clauses.append("account_id=?")
+                parameters.append(account_id)
+            if start_utc is not None:
+                clauses.append("created_at>=?")
+                parameters.append(start_utc)
+            if end_utc is not None:
+                clauses.append("created_at<?")
+                parameters.append(end_utc)
+            sql = "SELECT * FROM orders"
+            if clauses:
+                sql += " WHERE " + " AND ".join(clauses)
+            sql += " ORDER BY created_at DESC"
+            return self.conn.execute(sql, tuple(parameters)).fetchall()
+
+    def cleanup_history(self, cutoff_utc):
+        """原子清理截止时间前的记录及其跨界关联记录。"""
+        with self.lock:
+            try:
+                self.conn.execute("BEGIN IMMEDIATE")
+                self.conn.execute(
+                    "CREATE TEMP TABLE cleanup_algo_ids(algo_order_id TEXT PRIMARY KEY)"
+                )
+                self.conn.execute(
+                    "CREATE TEMP TABLE cleanup_order_ids(client_order_id TEXT PRIMARY KEY)"
+                )
+                self.conn.execute(
+                    "INSERT INTO cleanup_algo_ids SELECT algo_order_id FROM algo_orders "
+                    "WHERE created_at<?", (cutoff_utc,)
+                )
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO cleanup_algo_ids "
+                    "SELECT algo_order_id FROM algo_children WHERE created_at<?",
+                    (cutoff_utc,),
+                )
+                self.conn.execute(
+                    "INSERT INTO cleanup_order_ids SELECT client_order_id FROM orders "
+                    "WHERE created_at<?", (cutoff_utc,)
+                )
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO cleanup_algo_ids "
+                    "SELECT algo_order_id FROM algo_children WHERE client_order_id "
+                    "IN (SELECT client_order_id FROM cleanup_order_ids)"
+                )
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO cleanup_order_ids "
+                    "SELECT client_order_id FROM algo_children WHERE algo_order_id "
+                    "IN (SELECT algo_order_id FROM cleanup_algo_ids)"
+                )
+                wire_tags = [
+                    row[0] for row in self.conn.execute(
+                        "SELECT wire_order_tag FROM orders WHERE client_order_id "
+                        "IN (SELECT client_order_id FROM cleanup_order_ids)"
+                    ).fetchall()
+                ]
+                counts = {}
+                counts["algo_children"] = self.conn.execute(
+                    "DELETE FROM algo_children WHERE algo_order_id "
+                    "IN (SELECT algo_order_id FROM cleanup_algo_ids)"
+                ).rowcount
+                counts["algo_orders"] = self.conn.execute(
+                    "DELETE FROM algo_orders WHERE algo_order_id "
+                    "IN (SELECT algo_order_id FROM cleanup_algo_ids)"
+                ).rowcount
+                counts["trades"] = self.conn.execute(
+                    "DELETE FROM trades WHERE created_at<? OR client_order_id "
+                    "IN (SELECT client_order_id FROM cleanup_order_ids)",
+                    (cutoff_utc,),
+                ).rowcount
+                counts["orders"] = self.conn.execute(
+                    "DELETE FROM orders WHERE client_order_id "
+                    "IN (SELECT client_order_id FROM cleanup_order_ids)"
+                ).rowcount
+                self.conn.execute("DROP TABLE cleanup_order_ids")
+                self.conn.execute("DROP TABLE cleanup_algo_ids")
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+            return counts, wire_tags
 
     def list_pending_orders(self):
         with self.lock:
@@ -3202,6 +3293,7 @@ class BridgeRuntime(object):
                 "order.place",
                 "order.get",
                 "order.list",
+                "history.cleanup",
                 "order.wait",
                 "order.cancel",
                 "trade.list",
@@ -3254,12 +3346,13 @@ class BridgeRuntime(object):
                 message, "BACKPRESSURE", "quote control queue is full"
             )
 
-    def is_local_read_command(self, command):
+    def is_local_command(self, command):
         return str(command or "") in (
             "system.health",
             "order.get",
             "order.list",
             "order.wait",
+            "history.cleanup",
             "algo_order.get",
             "algo_order.list",
         )
@@ -4256,6 +4349,8 @@ class BridgeRuntime(object):
             return self.get_order(payload)
         if command == "order.list":
             return self.list_orders(payload)
+        if command == "history.cleanup":
+            return self.cleanup_history(payload)
         if command == "order.wait":
             return self.wait_orders(payload)
         if command == "order.cancel":
@@ -6022,13 +6117,41 @@ class BridgeRuntime(object):
         account_id = payload.get("account_id")
         if account_id:
             account_id = self._require_account(payload)
-        rows = self.store.list_orders(account_id)
+        start_date = payload.get("start_date")
+        end_date = payload.get("end_date")
+        start_utc = (
+            _china_date_utc_bound(start_date, "start_date")
+            if start_date is not None else None
+        )
+        end_utc = (
+            _china_date_utc_bound(end_date, "end_date")
+            if end_date is not None else None
+        )
+        if end_utc is not None:
+            end_utc = (
+                datetime.datetime.strptime(end_utc, "%Y-%m-%dT%H:%M:%S.%fZ")
+                + datetime.timedelta(days=1)
+            ).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        if start_utc is not None and end_utc is not None and start_utc >= end_utc:
+            raise BridgeError("INVALID_ARGUMENT", "start_date must not exceed end_date")
+        rows = self.store.list_orders(account_id, start_utc, end_utc)
         return {
             "items": [
                 self._order_row(row, include_raw=include_raw) for row in rows
             ],
             "count": len(rows),
         }
+
+    def cleanup_history(self, payload):
+        before_date = payload.get("before_date")
+        cutoff_utc = _china_date_utc_bound(before_date, "before_date")
+        counts, wire_tags = self.store.cleanup_history(cutoff_utc)
+        with self.order_event_cache_lock:
+            for wire_tag in wire_tags:
+                self.order_event_cache.pop(wire_tag, None)
+        with self.order_state_condition:
+            self.order_state_condition.notify_all()
+        return {"before_date": before_date, "deleted": counts}
 
     def wait_orders(self, payload):
         client_order_ids = payload.get("client_order_ids")

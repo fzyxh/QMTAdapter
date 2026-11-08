@@ -1221,7 +1221,11 @@ result = client.cancel_order(
 
 ### 5.19 list_account_flows
 
-在 QMT 的导出设置中开启定时或盘后导出，勾选「股票 → 资金流水」，选择带表头的 CSV 或制表符文本，以及所需的历史天数。导出根目录默认约定为 Adapter 安装目录下的 `statements`，例如 `C:\QMTAdapter\statements`。使用其他目录时，在 Bridge 的 `bridge_config.json` 中设置 `flow_export_dir`，重启 Bridge 后生效。调用方只传白名单账号和筛选条件。
+迅投《QMT 极速策略交易系统说明文档》在「独立交易 → 策略交易 → 数据导出」一节展示了按账号导出流水的窗口。若券商客户端提供这个页签，选中所需账号及该行的「资金流水」，选择 CSV 格式，指定保存路径，点击该页的「运行」。如需在下次启动客户端后继续导出，可勾选同页的「客户端开启自动开始导出」。手册中的流水文件名为 `*_stkFundFlow.*`。
+
+「系统设置 → 导出设置 → 股票交易」在部分客户端只列持仓、委托、成交和账号。「账号导出」生成的 `Account.csv` 记录账户余额等汇总值。若客户端没有生成资金流水快照，查询会返回 `FLOW_EXPORT_UNAVAILABLE`。
+
+Bridge 默认从 Adapter 安装目录下的 `statements` 读取，例如 `C:\QMTAdapter\statements`。使用其他目录时，在 `bridge_config.json` 中设置 `flow_export_dir` 并重启 Bridge。调用方只传白名单账号和筛选条件。
 
 ```python
 page = client.list_account_flows(

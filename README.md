@@ -10,7 +10,7 @@
 
 同步和异步客户端均可调用 `list_orders(account_id, scope="ACCOUNT")`，从大 QMT 读取该股票账户的当日委托，包含手工委托和其他策略委托。默认的 `scope="ADAPTER"` 继续查询本地持久化委托，支持跨日历史。使用新范围需将 SDK 和 QMT 侧 Bridge 均升级到 0.10.1，通信协议仍为 9。
 
-`list_account_flows(account_id, start_date=..., end_date=...)` 自动读取 QMT 最近一次生成的股票资金流水。首次在 QMT 自动导出中启用「股票 → 资金流水」，将带表头的 CSV 或制表符文本输出到 Adapter 安装目录下的 `statements`。此后按账号和日期调用即可。可查询的日期取决于 QMT 导出的历史天数，股份发生数量和余额取决于导出表头。[接口示例与返回字段](docs/QMT_ADAPTER_FUNCTION_GUIDE.md#519-list_account_flows)
+`list_account_flows(account_id, start_date=..., end_date=...)` 读取 QMT 最近一次生成的股票资金流水。支持此功能的客户端可在「独立交易 → 策略交易 → 数据导出」中选定账号和「资金流水」，将 CSV 输出到 Adapter 安装目录下的 `statements`。可查询的日期取决于导出的历史天数，股份发生数量和余额取决于表头。若客户端只提供持仓、委托、成交和账号文件，Bridge 无法由这些文件取得完整流水。[设置位置、接口示例与返回字段](docs/QMT_ADAPTER_FUNCTION_GUIDE.md#519-list_account_flows)
 
 ## v0.10.0 · Python 3.12 迁移
 

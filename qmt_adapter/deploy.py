@@ -166,7 +166,7 @@ def deploy(
 ) -> Dict[str, Any]:
     """Deploy or upgrade the QMT-side runtime.
 
-    The bridge and loader are replaced atomically on every call. Existing
+    The bridge is replaced atomically. An identical loader is reused. Existing
     account, authentication, database settings and SQLite data are preserved.
     The configuration's ``version`` is updated to the deployed package version.
     Legacy default pipe, message-size and 500-item quote chunk settings are
@@ -200,8 +200,10 @@ def deploy(
     config_path.parent.mkdir(parents=True, exist_ok=True)
     database_path.parent.mkdir(parents=True, exist_ok=True)
 
+    loader = _loader_source(bridge_path, config_path)
     _atomic_write(bridge_path, _bridge_source())
-    _atomic_write(loader_path, _loader_source(bridge_path, config_path))
+    if not loader_path.is_file() or loader_path.read_bytes() != loader:
+        _atomic_write(loader_path, loader)
 
     config_created = False
     if config is not None:

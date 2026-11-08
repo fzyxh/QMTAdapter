@@ -1,4 +1,6 @@
 .venv/
+.venv312/
+qmt312_probe_*.jsonl
 __pycache__/
 *.py[cod]
 

@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """QMT-side bridge for stock account, position, order and algorithm operations.
 
-This file intentionally uses Python 3.6 compatible syntax and UTF-8 source text.
+The QMT host must run 64-bit CPython 3.12. Source text is UTF-8.
+Keep this module importable by Python 3.11 for isolated SDK/bridge tests.
 Only this module calls QMT-provided functions.
 """
 
@@ -17,10 +18,12 @@ import hashlib
 import json
 import math
 import os
+import platform
 import queue
 import re
 import sqlite3
 import struct
+import sys
 import threading
 import time
 import traceback
@@ -33,10 +36,32 @@ CONFIG_PATH = globals().get("QMT_ADAPTER_CONFIG_PATH") or os.environ.get(
 )
 
 PROTOCOL_VERSION = 9
+ADAPTER_VERSION = "0.10.0"
 # UTF-8 JSON正文上限，不包含4字节帧长度前缀。
 MAX_MESSAGE_SIZE = 5 * 1024 * 1024
 STRATEGY_NAME = "QMT_ADAPTER_V1"
 _RUNTIME = None
+
+
+def _runtime_identity():
+    return {
+        "adapter_version": ADAPTER_VERSION,
+        "protocol_version": PROTOCOL_VERSION,
+        "python_implementation": platform.python_implementation(),
+        "python_version": platform.python_version(),
+        "pointer_bits": struct.calcsize("P") * 8,
+        "sqlite_version": sqlite3.sqlite_version,
+    }
+
+
+def _require_qmt_host():
+    if (sys.implementation.name != "cpython"
+            or sys.version_info[:2] != (3, 12)
+            or struct.calcsize("P") != 8):
+        raise RuntimeError(
+            "QMTAdapter requires 64-bit CPython 3.12 in the QMT strategy; got %s %s / %s-bit"
+            % (platform.python_implementation(), platform.python_version(), struct.calcsize("P") * 8)
+        )
 
 ALGORITHM_BOOK_LIQUIDITY_WEIGHTED = "BOOK_LIQUIDITY_WEIGHTED"
 RESERVED_EXECUTION_ALGORITHMS = ("TWAP", "VWAP")
@@ -2544,7 +2569,12 @@ class OrderStore(object):
         if directory and not os.path.isdir(directory):
             os.makedirs(directory)
         self.lock = threading.RLock()
-        self.conn = sqlite3.connect(path, timeout=5, check_same_thread=False)
+        # Preserve the pre-3.12 implicit BEGIN/explicit commit contract.
+        # The fallback exists only for the isolated 3.11 SDK test harness.
+        options = {"isolation_level": ""}
+        if hasattr(sqlite3, "LEGACY_TRANSACTION_CONTROL"):
+            options["autocommit"] = sqlite3.LEGACY_TRANSACTION_CONTROL
+        self.conn = sqlite3.connect(path, timeout=5, check_same_thread=False, **options)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=FULL")
@@ -4392,6 +4422,7 @@ class BridgeRuntime(object):
             tick_max_ms = None
         result = {
             "status": "OK" if not errors["health_error"] else "DEGRADED",
+            "runtime": _runtime_identity(),
             "connected": active_client_count > 0,
             "active_client_count": active_client_count,
             "max_clients": self.pipe.max_clients,
@@ -6459,6 +6490,8 @@ def _load_config():
 
 def init(ContextInfo):
     global _RUNTIME
+    # Reject before touching the shared slot or stopping a working instance.
+    _require_qmt_host()
     if _RUNTIME is not None:
         return
     runtime = None
@@ -6482,7 +6515,7 @@ def init(ContextInfo):
         setattr(builtins, _RUNTIME_SLOT, runtime)
         print(
             "QMT Adapter bridge [v%s] is ready: %s"
-            % (config["version"], config.get("pipe_name"))
+            % (ADAPTER_VERSION, config.get("pipe_name"))
         )
         print(
             "QMT Adapter quote stream is ready: %s"
@@ -6494,7 +6527,7 @@ def init(ContextInfo):
     except Exception as exc:
         if _RUNTIME is runtime:
             _RUNTIME = None
-        if getattr(builtins, _RUNTIME_SLOT, None) is runtime:
+        if runtime is not None and getattr(builtins, _RUNTIME_SLOT, None) is runtime:
             delattr(builtins, _RUNTIME_SLOT)
         cleanup_error = None
         if runtime is not None:
@@ -6550,5 +6583,5 @@ def stop(ContextInfo):
     if runtime is not None:
         runtime.stop()
         _RUNTIME = None
-    if getattr(builtins, _RUNTIME_SLOT, None) is runtime:
+    if runtime is not None and getattr(builtins, _RUNTIME_SLOT, None) is runtime:
         delattr(builtins, _RUNTIME_SLOT)

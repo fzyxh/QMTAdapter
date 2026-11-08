@@ -31,13 +31,8 @@ class DeployTests(unittest.TestCase):
             self.assertIn("exec(bridge_code, globals(), globals())", loader)
             loaded = runpy.run_path(str(result["loader_path"]))
             self.assertEqual(loaded["CONFIG_PATH"], str(result["config_path"]))
-            self.assertEqual(
-                loaded["init"].__code__.co_filename, str(result["bridge_path"])
-            )
-            self.assertEqual(
-                loaded["handlebar"].__code__.co_filename,
-                str(result["bridge_path"]),
-            )
+            for name in ("init", "handlebar", "order_callback", "deal_callback"):
+                self.assertEqual(loaded[name].__code__.co_filename, str(result["bridge_path"]))
 
             config = json.loads(result["config_path"].read_text(encoding="ascii"))
             self.assertNotIn("environment", config)

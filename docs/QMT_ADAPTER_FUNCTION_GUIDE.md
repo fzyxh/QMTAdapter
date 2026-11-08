@@ -1,7 +1,12 @@
 # QMT Adapter 部署与函数调用说明
 
-本文档对应QMTAdapter `0.9.0`、命名管道协议9，说明大 QMT 端脚本的部署方式，
+本文档对应QMTAdapter `0.10.0`（开发中）、命名管道协议9，说明大 QMT 端脚本的部署方式，
 以及外部封装库的同步、异步函数调用方法。
+
+大 QMT 宿主必须为 **64 位 CPython 3.12.x**；外部 SDK 最低 **Python 3.11**，
+验证范围为 3.11/3.12。原目录升级可继续使用 v0.9.0 的 ASCII/GBK 短加载器。
+主体 `init` 在停止旧实例、打开数据库和创建监听器之前检查宿主版本与位数。
+迁移状态和测试步骤见 [Python 3.12 验证说明](python312-migration-validation.md)。
 
 ## 1. 当前支持范围
 
@@ -148,7 +153,7 @@ SQLite 启用 WAL 后，运行期间可能在同一目录生成 `bridge.db-wal` 
 
 ```json
 {
-  "version": "0.9.0",
+  "version": "0.10.0",
   "pipe_name": "\\\\.\\pipe\\qmt_adapter",
   "quote_pipe_name": "\\\\.\\pipe\\qmt_adapter_quote",
   "auth_token": "由部署命令生成的64位十六进制字符串",
@@ -238,10 +243,13 @@ QMT 自动调用以下入口，不需要外部程序直接调用：
 .\.venv\Scripts\qmt-adapter.exe deploy
 ```
 
-部署命令会原子替换完整 Bridge 和加载器，并把配置中的 `version` 更新为
+部署命令会原子替换完整 Bridge，复用内容相同的加载器，并把配置中的 `version` 更新为
 当前包版本；其余用户配置以及 `C:\QMTAdapter\data` 下的数据库或 WAL 文件
 保持不变。
-随后停止并重新启动 QMT 策略即可加载新代码，不需要再次把完整 Bridge 复制进 QMT。
+从 v0.9.0 原目录升级时，在 QMT 中选择内置 Python 3.12 并重启策略即可沿用现有加载器加载新主体。
+
+从 v0.9.0 升级后，已有同步和异步 SDK 调用可继续使用协议 9。资金、持仓、行情、K 线和交易回执的标准字段沿用原定义。
+`health()` 增加顶层 `runtime` 对象，严格限制返回键集合的调用方应允许该字段。`include_raw=True` 返回券商原始字段，按实际宿主与数据对象读取。
 
 ## 4. 外部库使用准备
 
@@ -330,6 +338,7 @@ result = client.health(timeout=5.0)
 |---|---|
 | `status` | `OK` 或 `DEGRADED`；由监听器停止、主循环、持久化和对账等整体故障决定，单条客户端连接异常不改变该字段 |
 | `connected` | 当前是否至少有一个已鉴权客户端连接 |
+| `runtime` | 实际宿主的 `adapter_version`、`protocol_version`、`python_implementation`、`python_version`、`pointer_bits`、`sqlite_version`；来自运行代码，不回显配置版本 |
 | `active_client_count` | 当前已鉴权客户端连接数 |
 | `max_clients` | Bridge允许的客户端连接上限 |
 | `quote_pipe_name` | 全推行情专用管道名称 |
@@ -355,7 +364,7 @@ result = client.health(timeout=5.0)
 
 历史连接异常不会使已经恢复的桥接服务永久处于 `DEGRADED`；真正的整体故障
 仍保存在 `health_error`，不会因某个客户端重新连接而自动清除。已有运行实例
-需要在更新桥接脚本后重启策略，才能加载新的连接管理逻辑。命名管道协议仍为8。
+需要在更新桥接脚本后重启策略，才能加载新的连接管理逻辑。当前命名管道协议为9。
 
 ### 5.4 get_account
 

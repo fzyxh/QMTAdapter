@@ -1,1 +1,6 @@
+include scripts/qmt_python312_probe_qmt.py
+include scripts/prepare_python312_readonly_test.py
+include scripts/python312_readonly_smoke.py
+include scripts/README.md
+include docs/python312-migration-validation.md
 prune tests

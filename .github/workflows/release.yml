@@ -16,7 +16,14 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 设置 Python
+      - name: 设置 QMT 测试宿主 Python 3.12
+        id: python312
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 设置 SDK Python 3.11
+        id: python311
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -31,7 +38,15 @@ jobs:
           }
 
       - name: 运行单元测试与隔离管道测试
+        env:
+          QMT_TEST_PYTHON312: ${{ steps.python312.outputs.python-path }}
         run: python -m unittest discover -s tests -v -b
+
+      - name: Python 3.12 全量测试与跨进程验证
+        env:
+          QMT_TEST_PYTHON311: ${{ steps.python311.outputs.python-path }}
+        shell: pwsh
+        run: '& "${{ steps.python312.outputs.python-path }}" -m unittest discover -s tests -v -b'
 
       - name: 安装构建工具
         run: python -m pip install --upgrade build

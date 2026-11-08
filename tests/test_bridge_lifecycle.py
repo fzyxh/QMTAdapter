@@ -65,16 +65,37 @@ class BridgeLifecycleTests(unittest.TestCase):
                 "timer_period": "10nMilliSecond",
                 "version": "9.8.7",
             },
-        ), redirect_stdout(output):
+        ), patch.object(bridge, "_require_qmt_host"), redirect_stdout(output):
             bridge.init(context)
         return output.getvalue()
 
-    def test_successful_start_logs_deployed_version(self):
+    def test_successful_start_logs_code_version_not_config_version(self):
         output = self._patched_init(WorkingContext())
 
         self.assertIn(
-            "QMT Adapter bridge [v9.8.7] is ready: audit", output
+            "QMT Adapter bridge [v%s] is ready: audit" % bridge.ADAPTER_VERSION, output
         )
+
+    def test_constructor_failure_keeps_original_diagnostic(self):
+        class FailingRuntime(object):
+            def __init__(self, config):
+                raise OSError('isolated database creation failed')
+
+        output = self._patched_init(WorkingContext(), runtime_class=FailingRuntime)
+        self.assertIn('OSError: isolated database creation failed', output)
+        self.assertNotIn('AttributeError', output)
+        self.assertIsNone(bridge._RUNTIME)
+        self.assertFalse(hasattr(builtins, bridge._RUNTIME_SLOT))
+
+    def test_entry_stop_is_safe_before_start_and_after_repeated_stop(self):
+        bridge.stop(None)
+        self._patched_init(WorkingContext())
+        runtime = bridge._RUNTIME
+        bridge.stop(None)
+        bridge.stop(None)
+        self.assertEqual(runtime.stop_count, 1)
+        self.assertIsNone(bridge._RUNTIME)
+        self.assertFalse(hasattr(builtins, bridge._RUNTIME_SLOT))
 
     def test_set_account_failure_cleans_runtime_and_allows_retry(self):
         class FailingContext(WorkingContext):

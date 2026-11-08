@@ -14,6 +14,50 @@ class PipeLifetimeTests(unittest.TestCase):
     setUp = pipe_fixture.NamedPipeEndToEndTests.setUp
     tearDown = pipe_fixture.NamedPipeEndToEndTests.tearDown
 
+    def test_ten_restarts_release_threads_and_handles_with_eight_clients(self):
+        import ctypes
+        import gc
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        k32.GetProcessHandleCount.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        k32.GetProcessHandleCount.restype = wintypes.BOOL
+        def handles():
+            count = wintypes.DWORD()
+            self.assertTrue(k32.GetProcessHandleCount(k32.GetCurrentProcess(), ctypes.byref(count)))
+            return count.value
+        self.harness.stop()
+        self.config['max_clients'] = 8
+        self.config['max_quote_clients'] = 8
+        gc.collect()
+        baseline_handles = handles()
+        baseline_threads = set(threading.enumerate())
+        for iteration in range(10):
+            with self.subTest(iteration=iteration):
+                self.harness = pipe_fixture.BridgeHarness(self.config, self.fake_api)
+                self.harness.start()
+                clients = []
+                try:
+                    for _ in range(8):
+                        client = QmtClient(config_path=self.config_path).connect()
+                        clients.append(client)
+                        client.subscribe_whole_quote(markets=['SH'], push_interval_ms=10)
+                    self.assertEqual(clients[0].health()['active_client_count'], 8)
+                    self.assertEqual(clients[0].health()['runtime']['protocol_version'], 9)
+                finally:
+                    for client in clients:
+                        client.close()
+                    self.harness.stop()
+                    self.harness.stop()
+                remaining = [t.name for t in threading.enumerate() if t not in baseline_threads
+                             and ('qmt' in t.name.lower() or 'quote' in t.name.lower())]
+                self.assertEqual(remaining, [])
+                # Python locks/events may own OS handles while test objects live.
+                clients.clear()
+                del client
+                gc.collect()
+                self.assertLessEqual(handles(), baseline_handles + 2)
+
     def _wait_for_close(self, server, connection_id):
         deadline = time.monotonic() + 2
         with server.connection_condition:

@@ -1,6 +1,6 @@
 # QMT Adapter 部署与函数调用说明
 
-本文档对应QMTAdapter `0.10.0`、命名管道协议9，说明大 QMT 端脚本的部署方式，
+本文档对应QMTAdapter `0.10.1`、命名管道协议9，说明大 QMT 端脚本的部署方式，
 以及外部封装库的同步、异步函数调用方法。
 
 大 QMT 宿主必须为 **64 位 CPython 3.12.x**；外部 SDK 最低 **Python 3.11**，
@@ -25,7 +25,7 @@
 - 查询当日新股、新债发行数据和账户申购额度；
 - 新股、新债申购；
 - 按指定时间间隔串行提交多笔普通股票委托；
-- 查询本适配器发出的委托；
+- 查询本适配器的委托历史及指定股票账户的当日全部委托；
 - 查询当日成交，可选择本Adapter委托或账户全部成交；
 - 由QMT回报驱动地等待单笔或一批委托进入目标状态；
 - 撤销本适配器发出的委托；
@@ -153,7 +153,7 @@ SQLite 启用 WAL 后，运行期间可能在同一目录生成 `bridge.db-wal` 
 
 ```json
 {
-  "version": "0.10.0",
+  "version": "0.10.1",
   "pipe_name": "\\\\.\\pipe\\qmt_adapter",
   "quote_pipe_name": "\\\\.\\pipe\\qmt_adapter_quote",
   "auth_token": "由部署命令生成的64位十六进制字符串",
@@ -1065,6 +1065,23 @@ order = client.get_order(
 
 ### 5.15 list_orders
 
+从 v0.10.1 起，`scope` 作为关键字参数选择与 `list_trades` 相同的两种范围。
+
+| 范围 | 数据来源 | 日期范围 |
+| --- | --- | --- |
+| `ADAPTER`（默认） | 本地订单库，支持省略 `account_id` | 按委托创建时的北京时间筛选，可跨日查询 |
+| `ACCOUNT` | 指定白名单账户在 QMT 当前交易日的委托快照，包括其他终端及策略的委托 | 按快照中的委托日期筛选，起止日期均包含在内 |
+
+```python
+orders = client.list_orders("YOUR_ACCOUNT_ID", scope="ACCOUNT", include_raw=True)
+for order in orders["items"]:
+    print(order["qmt_order_id"], order["instrument"], order["order_status"])
+```
+
+`ACCOUNT` 返回 `account_id`、`account_type`、`scope`、`items`、`count` 和 `as_of`。每项包含证券、方向、委托号、委托价量、状态、成交量、剩余量、成交均价、成交额、废单原因、备注，以及 QMT 的 `order_date` 和 `order_time`。通过 `price_type_code` 读取券商回报中的原生报价类型。
+
+能按 Adapter 备注标识和账户关联本地订单时，返回对应的 `client_order_id`、`request_id`、`order_kind` 和 `price_type`。其他委托的这些字段为 `None`。该查询只读取快照，外部委托不会写入本地订单库。旧 Bridge 收到全账户查询会返回 `UNSUPPORTED_COMMAND`，需升级并重启 Bridge。下文的 `created_at`、本地历史和清理说明适用于 `ADAPTER` 范围。
+
 查询指定账号的适配器委托：
 
 ```python
@@ -1202,6 +1219,28 @@ result = client.cancel_order(
 会重新根据 QMT 的 `can_cancel_order` 结果决定是否再次调用 `cancel`，不会因为
 `client_order_id` 相同而直接禁止撤单。
 
+### 5.19 list_account_flows
+
+在 QMT 的导出设置中开启定时或盘后导出，勾选「股票 → 资金流水」，选择带表头的 CSV 或制表符文本，以及所需的历史天数。导出根目录默认约定为 Adapter 安装目录下的 `statements`，例如 `C:\QMTAdapter\statements`。使用其他目录时，在 Bridge 的 `bridge_config.json` 中设置 `flow_export_dir`，重启 Bridge 后生效。调用方只传白名单账号和筛选条件。
+
+```python
+page = client.list_account_flows(
+    account_id,
+    start_date="2026-10-01",
+    end_date="2026-10-31",
+    limit=200,
+)
+for row in page["items"]:
+    print(row["date"], row["business_name"], row["amount_change"], row["quantity_change"])
+```
+
+Bridge 识别股票目录的 `Stock/16772.csv`、`Stock/16772-YYYYMMDD.csv` 以及按账号命名的 `<账号>_stkFundFlow.csv` 等文本快照。它读取最近修改的一份快照，按行核对资金账号，再按发生日期筛选，起止日均包含在内。该调用不会触发柜台刷新。数据源尚未生成时返回 `FLOW_EXPORT_UNAVAILABLE`。有表头且没有符合条件的流水时返回 `total=0`。
+
+- `source` 为 `QMT_AUTO_EXPORT`。`file_modified_at` 为文件最后更新时间（UTC）。`first_record_date`、`last_record_date` 为本账号在整份文件中实际出现的首末日期。
+- `available_fields` 列出表头提供的字段，包括日期、时间、流水号、业务名称、证券代码等。`amount_change`、`cash_balance`、`quantity_change`、`share_balance` 分别对应发生金额、剩余金额、发生数量、剩余数量。金额和数量使用字符串保留符号和小数位。源表缺少的列返回 `None`。
+- `count` 为本页条数，`total` 为筛选后的总条数。将 `next_offset` 作为下一次调用的 `offset`，直到它为 `None`。`limit` 默认为 200，最大为 1000。分页期间若 `file_modified_at` 发生变化，应从第一页重新读取。
+- `include_raw=True` 会另附原始列名和文本值。异步客户端使用同名方法，参数相同。
+
 ## 6. OrderRequest 参数
 
 构造函数：
@@ -1330,7 +1369,7 @@ async with AsyncQmtClient(config_path=CONFIG_PATH) as client:
 | `await subscribe_new_issue(order, wait_for, timeout)` | `subscribe_new_issue(...)` |
 | `await place_orders(orders, interval_ms, wait_for, timeout)` | `place_orders(...)` |
 | `await get_order(client_order_id, timeout, include_raw)` | `get_order(...)` |
-| `await list_orders(account_id, timeout, include_raw, start_date, end_date)` | `list_orders(...)` |
+| `await list_orders(account_id, timeout, include_raw, start_date, end_date, *, scope="ADAPTER")` | `list_orders(...)` |
 | `await cleanup_history(before_date, timeout)` | `cleanup_history(...)` |
 | `await list_trades(account_id, scope, client_order_id, include_raw, timeout)` | `list_trades(...)` |
 | `await wait_order(client_order_id, statuses, timeout, include_raw)` | `wait_order(...)` |

@@ -1,6 +1,7 @@
 """Query only a generated, guarded Python 3.12 migration test bridge."""
 
 import argparse
+import inspect
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -49,7 +50,7 @@ def run(config_path, report_path):
         if not value.get('readonly_test', {}).get('enabled'):
             raise ValueError('Connected server is not the guarded read-only test')
         runtime = value.get('runtime', {})
-        if (runtime.get('adapter_version') != '0.10.0' or runtime.get('protocol_version') != 9
+        if (runtime.get('adapter_version') != '0.10.1' or runtime.get('protocol_version') != 9
                 or not runtime.get('python_version', '').startswith('3.12.')
                 or runtime.get('python_implementation') != 'CPython' or runtime.get('pointer_bits') != 64):
             raise ValueError('Unexpected server runtime: ' + json.dumps(runtime))
@@ -88,6 +89,8 @@ def run(config_path, report_path):
             check('account.get', lambda: client.get_account(account_id, include_raw=True), account_summary)
             check('position.list', lambda: client.list_positions(account_id, include_raw=True), count)
             check('order.list', lambda: client.list_orders(account_id=account_id), count)
+            if 'scope' in inspect.signature(client.list_orders).parameters:
+                check('order.list.ACCOUNT', lambda: client.list_orders(account_id, scope='ACCOUNT'), count)
             for scope in ('ACCOUNT', 'ADAPTER'):
                 check('trade.list.' + scope, lambda scope=scope: client.list_trades(account_id, scope=scope), count)
 

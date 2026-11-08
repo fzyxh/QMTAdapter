@@ -9,15 +9,19 @@ Only this module calls QMT-provided functions.
 from __future__ import print_function
 
 import builtins
+import codecs
 from collections import deque
+import csv
 import ctypes
 from ctypes import wintypes
 import datetime
 import decimal
 import hashlib
+import io
 import json
 import math
 import os
+from pathlib import Path
 import platform
 import queue
 import re
@@ -36,7 +40,7 @@ CONFIG_PATH = globals().get("QMT_ADAPTER_CONFIG_PATH") or os.environ.get(
 )
 
 PROTOCOL_VERSION = 9
-ADAPTER_VERSION = "0.10.0"
+ADAPTER_VERSION = "0.10.1"
 # UTF-8 JSON正文上限，不包含4字节帧长度前缀。
 MAX_MESSAGE_SIZE = 5 * 1024 * 1024
 STRATEGY_NAME = "QMT_ADAPTER_V1"
@@ -1325,7 +1329,7 @@ def _raw_integer(raw, name):
 
 
 def _optional_decimal_text(value):
-    if value in (None, ""):
+    if value in (None, "", sys.float_info.max, -sys.float_info.max):
         return None
     try:
         number = decimal.Decimal(str(value))
@@ -1626,6 +1630,140 @@ def _normalize_trade(raw, configured_account_id, order_row=None, include_raw=Fal
     if include_raw:
         result["raw"] = raw
     return result
+
+
+_FLOW_COLUMNS = {
+    "account_id": ("资金账号", "资金帐号", "账号信息", "账户"),
+    "date": ("发生日期", "业务日期"), "time": ("发生时间", "业务时间"),
+    "flow_id": ("流水序号", "流水号", "流水编号"), "business_name": ("业务名称", "业务摘要"),
+    "amount_change": ("发生金额",), "cash_balance": ("剩余金额", "资金余额", "结存金额"),
+    "currency": ("币种",), "market": ("市场类别", "交易市场类别", "市场", "市场类型"),
+    "security_code": ("证券代码", "股票代码"), "security_name": ("证券名称", "股票名称"),
+    "price": ("成交价格", "成交价"), "quantity_change": ("发生数量",),
+    "share_balance": ("剩余数量", "股份余额", "结存数量"),
+}
+_FLOW_NUMERIC_FIELDS = ("amount_change", "cash_balance", "price", "quantity_change", "share_balance")
+_FLOW_NUMBER = re.compile(r"[+-]?(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d+)?")
+
+
+def _flow_cell(cell):
+    cell = cell.strip()
+    return cell[2:-1] if cell.startswith('="') and cell.endswith('"') else cell
+
+
+def _flow_encoding(raw):
+    header = raw.readline(65536)
+    raw.seek(0)
+    if header.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        return "utf-16"
+    try:
+        header.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return "gb18030"
+    return "utf-8-sig"
+
+
+def _read_flow_export(path, account_id, start, end, include_raw, offset, limit):
+    items = []
+    total = 0
+    first_date = last_date = None
+    try:
+        with path.open("rb") as raw:
+            before = os.fstat(raw.fileno())
+            with io.TextIOWrapper(raw, encoding=_flow_encoding(raw), newline="") as stream:
+                header = stream.readline()
+                stream.seek(0)
+                reader = csv.DictReader(stream, delimiter="\t" if "\t" in header else ",", strict=True)
+                names = [s.strip() for s in reader.fieldnames or []]
+                if len(names) != len(set(names)):
+                    raise BridgeError("FLOW_EXPORT_FORMAT_ERROR", "Duplicate export columns")
+                reader.fieldnames = names
+                columns = {key: next((h for h in aliases if h in names), None)
+                           for key, aliases in _FLOW_COLUMNS.items()}
+                for key in ("account_id", "date", "business_name"):
+                    if not columns[key]:
+                        raise BridgeError("FLOW_EXPORT_FORMAT_ERROR", "Missing column: " + _FLOW_COLUMNS[key][0])
+                if not (columns["amount_change"] or columns["quantity_change"]):
+                    raise BridgeError("FLOW_EXPORT_FORMAT_ERROR", "Missing amount and quantity change columns")
+                for raw_row in reader:
+                    owner = _flow_cell(raw_row.get(columns["account_id"]) or "")
+                    if owner and owner != account_id:
+                        continue
+                    if str(raw_row.get("成功", "")).strip().lower() in ("0", "false", "否", "失败"):
+                        raise BridgeError("FLOW_EXPORT_QUERY_FAILED", "QMT marked the export query as unsuccessful")
+                    if not owner:  # Includes the trailing total row.
+                        continue
+                    if None in raw_row or None in raw_row.values():
+                        raise BridgeError("FLOW_EXPORT_FORMAT_ERROR", "Wrong column count at line %d" % reader.line_num)
+                    record = {k: _flow_cell(raw_row[col]) if col else None for k, col in columns.items()}
+                    try:
+                        day = datetime.date.fromisoformat(record["date"].replace("/", "-")).isoformat()
+                    except ValueError as exc:
+                        raise BridgeError("FLOW_EXPORT_FORMAT_ERROR", "Invalid date at line %d" % reader.line_num) from exc
+                    first_date = min(first_date, day) if first_date else day
+                    last_date = max(last_date, day) if last_date else day
+                    if (start and day < start) or (end and day > end):
+                        continue
+                    total += 1
+                    if not offset < total <= offset + limit:
+                        continue
+                    record["date"] = day
+                    for key in _FLOW_NUMERIC_FIELDS:
+                        value = record[key]
+                        if value in (None, "", "-", "--"):
+                            record[key] = None
+                        elif _FLOW_NUMBER.fullmatch(value):
+                            record[key] = value.replace(",", "")
+                        else:
+                            raise BridgeError("FLOW_EXPORT_FORMAT_ERROR", "Invalid %s at line %d" % (key, reader.line_num))
+                    if include_raw:
+                        record["raw"] = raw_row
+                    items.append(record)
+            after = path.stat()
+            if (before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns):
+                raise BridgeError("FLOW_EXPORT_CHANGED", "Export changed while reading; retry the query")
+    except (UnicodeError, csv.Error) as exc:
+        raise BridgeError("FLOW_EXPORT_FORMAT_ERROR", "Cannot parse delimited text export: " + str(exc)) from exc
+    except OSError as exc:
+        raise BridgeError("FLOW_EXPORT_UNAVAILABLE", "Cannot read QMT automatic export: " + str(exc)) from exc
+    return {"source": "QMT_AUTO_EXPORT", "account_id": account_id, "items": items,
+            "count": len(items), "total": total, "offset": offset, "limit": limit,
+            "next_offset": offset + len(items) if offset + len(items) < total else None,
+            "available_fields": [key for key, col in columns.items() if col],
+            "first_record_date": first_date, "last_record_date": last_date,
+            "file_modified_at": datetime.datetime.fromtimestamp(before.st_mtime, datetime.timezone.utc).isoformat()}
+
+
+def _normalize_account_order(raw, account_id, row, date, qmt_id, remark):
+    filled = _raw_integer(raw, "m_nVolumeTraded")
+    has_fills = filled is not None and filled > 0
+    side = _normalized_trade_side(raw, row)
+    if side is None:
+        side = {23: "BUY", 24: "SELL"}.get(_raw_integer(raw, "m_nOpType"))
+    return {
+        "account_id": account_id,
+        "account_type": "STOCK",
+        "client_order_id": row["client_order_id"] if row is not None else None,
+        "request_id": row["request_id"] if row is not None else None,
+        "qmt_order_id": qmt_id or None,
+        "instrument": _normalized_instrument(raw),
+        "side": side,
+        "order_kind": row["order_kind"] if row is not None else None,
+        "order_status": _reported_order_status(raw, None) or "UNKNOWN",
+        "quantity": _raw_integer(raw, "m_nVolumeTotalOriginal"),
+        "price_type": row["price_type"] if row is not None else None,
+        "price_type_code": _raw_integer(raw, "m_nOrderPriceType"),
+        "limit_price": _raw_decimal_text(raw, "m_dLimitPrice"),
+        "filled_quantity": filled,
+        "remaining_quantity": _raw_integer(raw, "m_nVolumeTotal"),
+        "average_filled_price": _raw_decimal_text(raw, "m_dTradedPrice") if has_fills else None,
+        "filled_amount": _optional_money_text(raw.get("m_dTradeAmount")) if has_fills else None,
+        "reject_reason": _order_reject_reason(raw),
+        "remark": row["user_remark"] if row is not None else remark,
+        "qmt_remark": remark,
+        "order_date": date,
+        "order_time": str(raw.get("m_strInsertTime") or "").strip(),
+    }
 
 
 def _order_reject_reason(raw):
@@ -3311,6 +3449,7 @@ class BridgeRuntime(object):
             commands = [
                 "system.health",
                 "account.get",
+                "account.flow.list",
                 "position.list",
                 "quote.get",
                 "quote.list",
@@ -3323,6 +3462,7 @@ class BridgeRuntime(object):
                 "order.place",
                 "order.get",
                 "order.list",
+                "order.account.list",
                 "history.cleanup",
                 "order.wait",
                 "order.cancel",
@@ -3379,6 +3519,7 @@ class BridgeRuntime(object):
     def is_local_command(self, command):
         return str(command or "") in (
             "system.health",
+            "account.flow.list",
             "order.get",
             "order.list",
             "order.wait",
@@ -4355,6 +4496,8 @@ class BridgeRuntime(object):
             return self.health()
         if command == "account.get":
             return self.query_account(payload)
+        if command == "account.flow.list":
+            return self.query_account_flows(payload)
         if command == "position.list":
             return self.query_positions(payload)
         if command == "quote.get":
@@ -4379,6 +4522,8 @@ class BridgeRuntime(object):
             return self.get_order(payload)
         if command == "order.list":
             return self.list_orders(payload)
+        if command == "order.account.list":
+            return self.query_account_orders(payload)
         if command == "history.cleanup":
             return self.cleanup_history(payload)
         if command == "order.wait":
@@ -6143,11 +6288,8 @@ class BridgeRuntime(object):
             raise BridgeError("ORDER_NOT_FOUND", "order was not found")
         return self._order_row(row, include_raw=include_raw)
 
-    def list_orders(self, payload):
-        include_raw = self._include_raw(payload)
-        account_id = payload.get("account_id")
-        if account_id:
-            account_id = self._require_account(payload)
+    @staticmethod
+    def _order_date_bounds(payload):
         start_date = payload.get("start_date")
         end_date = payload.get("end_date")
         start_utc = (
@@ -6165,13 +6307,86 @@ class BridgeRuntime(object):
             ).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
         if start_utc is not None and end_utc is not None and start_utc >= end_utc:
             raise BridgeError("INVALID_ARGUMENT", "start_date must not exceed end_date")
+        return start_utc, end_utc
+
+    def list_orders(self, payload):
+        include_raw = self._include_raw(payload)
+        account_id = payload.get("account_id")
+        if account_id:
+            account_id = self._require_account(payload)
+        start_utc, end_utc = self._order_date_bounds(payload)
         rows = self.store.list_orders(account_id, start_utc, end_utc)
         return {
+            "scope": "ADAPTER",
             "items": [
                 self._order_row(row, include_raw=include_raw) for row in rows
             ],
             "count": len(rows),
         }
+
+    def query_account_flows(self, payload):
+        account_id = self._require_account(payload)
+        include_raw = self._include_raw(payload)
+        self._order_date_bounds(payload)
+        offset, limit = payload.get("offset", 0), payload.get("limit", 200)
+        if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 1000:
+            raise BridgeError("INVALID_ARGUMENT", "offset must be nonnegative and limit must be 1..1000")
+        directory = Path(self.config.get("flow_export_dir") or Path(CONFIG_PATH).parent.parent / "statements")
+        # Some clients write one file per account. Others use a shared Stock/16772
+        # file. In both cases _read_flow_export verifies each row's account.
+        per_account = re.escape(account_id) + r"_stkFundFlow"
+        pattern = re.compile(r"(?:[0-9_-]+_)?(?:" + per_account
+                             + r"|16772)(?:[-_][0-9_-]+)?\.(?:csv|txt|tsv)", re.IGNORECASE)
+        try:
+            candidates = []
+            for folder in (directory, directory / "Stock"):
+                if folder.is_dir():
+                    for path in folder.iterdir():
+                        if pattern.fullmatch(path.name) and path.is_file():
+                            candidates.append((path.stat().st_mtime_ns, path))
+        except OSError as exc:
+            raise BridgeError("FLOW_EXPORT_UNAVAILABLE", "Cannot scan QMT automatic export directory: " + str(exc))
+        if not candidates:
+            raise BridgeError("FLOW_EXPORT_UNAVAILABLE",
+                              "No stock fund flow snapshot in %s. Enable Stock fund flow (16772) in QMT automatic export settings." % directory)
+        path = max(candidates)[1]
+        return _read_flow_export(path, account_id, payload.get("start_date"), payload.get("end_date"),
+                                 include_raw, offset, limit)
+
+    def query_account_orders(self, payload):
+        account_id = self._require_account(payload)
+        include_raw = self._include_raw(payload)
+        self._order_date_bounds(payload)
+        start = (payload.get("start_date") or "").replace("-", "")
+        end = (payload.get("end_date") or "").replace("-", "")
+        objects = self._qmt_function("get_trade_detail_data")(account_id, "STOCK", "ORDER")
+        if not isinstance(objects, (list, tuple)):
+            raise BridgeError("QMT_DATA_ERROR", "QMT ORDER query did not return a list")
+        items = []
+        for obj in objects:
+            raw = _serialize_qmt_object(obj)
+            owner = str(raw.get("m_strAccountID") or "").strip()
+            if owner and owner != account_id:
+                continue
+            date = str(raw.get("m_strInsertDate") or "").strip().replace("-", "")
+            if start or end:
+                if not re.fullmatch(r"[0-9]{8}", date) or (start and date < start) or (end and date > end):
+                    continue
+            remark = str(raw.get("m_strRemark") or "")
+            qmt_id = str(raw.get("m_strOrderSysID") or "").strip()
+            # Broker order IDs can be reused on later trading days. Only
+            # attribute an order with a matching Adapter wire tag and account.
+            row = self.store.get_order_by_wire_tag(remark.split(":", 1)[0]) if remark else None
+            if row is not None and (row["account_id"] != account_id or
+                                    (row["qmt_order_id"] and qmt_id and row["qmt_order_id"] != qmt_id)):
+                row = None
+            item = _normalize_account_order(raw, account_id, row, date, qmt_id, remark)
+            if include_raw:
+                item["raw"] = raw
+            items.append(item)
+        items.sort(key=lambda item: (item["order_date"], item["order_time"]), reverse=True)
+        return {"scope": "ACCOUNT", "account_id": account_id, "account_type": "STOCK",
+                "items": items, "count": len(items), "as_of": _utc_now_text()}
 
     def cleanup_history(self, payload):
         before_date = payload.get("before_date")

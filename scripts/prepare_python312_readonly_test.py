@@ -16,10 +16,10 @@ TEST_WRAPPER = '''
 
 # Test-only guards. The deployed production source above is unchanged.
 _TEST_READ_COMMANDS = frozenset((
-    "system.health", "account.get", "position.list", "quote.get", "quote.list",
+    "system.health", "account.get", "account.flow.list", "position.list", "quote.get", "quote.list",
     "sector.instruments.list", "instrument.detail.list", "market.history.bar.get",
     "market.history.daily.get", "new_issue.list", "new_issue.quota.get",
-    "order.get", "order.list", "trade.list", "algo_order.get", "algo_order.list",
+    "order.get", "order.list", "order.account.list", "trade.list", "algo_order.get", "algo_order.list",
 ))
 _TEST_NATIVE_READ_APIS = frozenset((
     "get_trade_detail_data", "get_ipo_data", "get_new_purchase_limit",

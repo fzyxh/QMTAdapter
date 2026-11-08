@@ -393,8 +393,10 @@ class AsyncQmtClient:
         include_raw: bool = False,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
+        *,
+        scope: str = "ADAPTER",
     ) -> Dict[str, Any]:
-        """异步列出适配器委托；返回值同 ``QmtClient.list_orders``。"""
+        """异步查询委托，范围与返回值同 ``QmtClient.list_orders``。"""
         return await self._call(
             self._client.list_orders,
             account_id=account_id,
@@ -402,7 +404,17 @@ class AsyncQmtClient:
             include_raw=include_raw,
             start_date=start_date,
             end_date=end_date,
+            scope=scope,
         )
+
+    async def list_account_flows(
+        self, account_id: str, *, start_date: Optional[str] = None, end_date: Optional[str] = None,
+        include_raw: bool = False, offset: int = 0, limit: int = 200, timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """异步查询 QMT 定时生成的资金/股份流水快照。"""
+        return await self._call(self._client.list_account_flows, account_id,
+                                start_date=start_date, end_date=end_date, include_raw=include_raw,
+                                offset=offset, limit=limit, timeout=timeout)
 
     async def cleanup_history(
         self,

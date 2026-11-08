@@ -19,6 +19,7 @@ from tests.test_named_pipe_e2e import (
     ACCOUNT_ID,
     BridgeHarness,
     FakeQmtApi,
+    FakeOrder,
     FakeTrade,
 )
 
@@ -53,6 +54,14 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         self.harness.stop()
         self.temp_dir.cleanup()
+
+    async def test_async_account_orders_include_other_terminal(self):
+        self.fake_api.orders.append(FakeOrder("manual", "manual-1", 100))
+        async with AsyncQmtClient(config_path=self.config_path) as client:
+            self.assertEqual((await client.list_orders(ACCOUNT_ID))["count"], 0)
+            orders = await client.list_orders(ACCOUNT_ID, scope="ACCOUNT", include_raw=True)
+        self.assertEqual(orders["scope"], "ACCOUNT")
+        self.assertEqual(orders["items"][0]["raw"]["m_strOrderSysID"], "manual-1")
 
     async def test_async_queries_and_broker_id_callback(self):
         async with AsyncQmtClient(

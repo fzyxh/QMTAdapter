@@ -1137,8 +1137,10 @@ class QmtClient:
         include_raw: bool = False,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
+        *,
+        scope: str = "ADAPTER",
     ) -> Dict[str, Any]:
-        """列出适配器持久化的委托记录。
+        """查询适配器持久化的委托或指定账户的 QMT 当日委托。
 
         Args:
             account_id: 可选资金账号；为 ``None`` 时返回所有已配置账号的
@@ -1147,11 +1149,18 @@ class QmtClient:
             include_raw: 是否为每项附带QMT原始委托字段；默认关闭。
             start_date: 可选的起始交易日期，格式 YYYY-MM-DD，含当天。
             end_date: 可选的结束交易日期，格式 YYYY-MM-DD，含当天。
+            scope: ADAPTER 查询本地委托历史。ACCOUNT 要求指定 account_id，
+                查询 QMT 当前返回的全账户当日委托，日期范围仅筛选该快照。
 
         Returns:
             ``{"items": [...], "count": N}`` 形式的字典。
         """
         include_raw = _validated_include_raw(include_raw)
+        scope = str(scope or "").strip().upper()
+        if scope not in ("ADAPTER", "ACCOUNT"):
+            raise ValidationError("scope must be ADAPTER or ACCOUNT")
+        if scope == "ACCOUNT" and not str(account_id or "").strip():
+            raise ValidationError("account_id is required for ACCOUNT scope")
         payload = {"include_raw": include_raw}
         if account_id is not None:
             payload["account_id"] = str(account_id)
@@ -1159,7 +1168,20 @@ class QmtClient:
             payload["start_date"] = start_date
         if end_date is not None:
             payload["end_date"] = end_date
-        return self._request("order.list", payload, timeout=timeout)
+        # A distinct command makes an older bridge reject an account query
+        # rather than silently serving local SQLite history.
+        command = "order.account.list" if scope == "ACCOUNT" else "order.list"
+        return self._request(command, payload, timeout=timeout)
+
+    def list_account_flows(
+        self, account_id: str, *, start_date: Optional[str] = None, end_date: Optional[str] = None,
+        include_raw: bool = False, offset: int = 0, limit: int = 200, timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """查询 Bridge 自动发现的 QMT 定时流水快照，日期包含两端。"""
+        return self._request("account.flow.list", {
+            "account_id": account_id, "start_date": start_date, "end_date": end_date,
+            "include_raw": _validated_include_raw(include_raw), "offset": offset, "limit": limit,
+        }, timeout=timeout)
 
     def cleanup_history(
         self,

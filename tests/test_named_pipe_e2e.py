@@ -376,7 +376,7 @@ class FakeQmtApi(object):
                 raise self.position_query_error
             return list(self.positions)
         if detail_type == "ORDER":
-            return list(self.orders) if self.return_orders_for_reconcile else []
+            return list(self.orders) if not args or self.return_orders_for_reconcile else []
         if detail_type == "DEAL":
             if args:
                 return [
@@ -1375,6 +1375,76 @@ class NamedPipeEndToEndTests(unittest.TestCase):
             deleted = client.cleanup_history(before_date="2026-09-28")
             self.assertEqual(deleted["deleted"]["orders"], 1)
             self.assertEqual(client.list_orders(account_id=ACCOUNT_ID)["count"], 0)
+
+    def test_account_orders_include_manual_orders_and_run_on_qmt_thread(self):
+        with QmtClient(config_path=self.config_path) as client:
+            order = OrderRequest(account_id=ACCOUNT_ID, instrument="600000.SH", side="BUY",
+                                 quantity=100, price_type="LIMIT", limit_price="10.25",
+                                 client_order_id="adapter-list-account")
+            client.place_order(order, wait_for="BROKER_ID", timeout=5)
+            own = self.fake_api.orders[0]
+            # A broker order number alone cannot establish Adapter ownership.
+            manual = FakeOrder("manual", own.m_strOrderSysID, 200, "000001.SZ", "SELL")
+            manual.m_nOrderStatus = 55
+            manual.m_nVolumeTraded = manual.m_nVolumeTotal = 100
+            manual.m_dLimitPrice, manual.m_dTradedPrice, manual.m_dTradeAmount = 12.35, 12.34, 1234
+            own.m_strInsertDate, manual.m_strInsertDate = "20261105", "20261106"
+            other_strategy = FakeOrder("another-strategy", "Q-OTHER", 100)
+            wrong_account = FakeOrder(own.m_strRemark, own.m_strOrderSysID, 100)
+            wrong_account.m_strAccountID = "OTHER-ACCOUNT"
+            self.fake_api.orders.extend([manual, other_strategy, wrong_account])
+
+            calls = []
+            previous_query = bridge.get_trade_detail_data
+            def track_query(*args):
+                calls.append((args, threading.current_thread()))
+                return previous_query(*args)
+            bridge.get_trade_detail_data = track_query
+            try:
+                local = client.list_orders(ACCOUNT_ID, 5, False)
+                self.assertEqual([r["client_order_id"] for r in local["items"]], [order.client_order_id])
+                self.assertEqual(calls, [])
+                account = client.list_orders(ACCOUNT_ID, scope="account")
+                self.assertEqual(calls, [((ACCOUNT_ID, "STOCK", "ORDER"), self.harness.thread)])
+                self.assertEqual(account["scope"], "ACCOUNT")
+                self.assertEqual(account["count"], 3)
+                by_remark = {r["qmt_remark"]: r for r in account["items"]}
+                self.assertEqual(by_remark[own.m_strRemark]["client_order_id"], order.client_order_id)
+                self.assertIsNone(by_remark["another-strategy"]["client_order_id"])
+                item = by_remark["manual"]
+                self.assertNotIn("raw", item)
+                self.assertIsNone(item["client_order_id"])
+                self.assertEqual((item["side"], item["order_status"], item["quantity"],
+                                  item["filled_quantity"], item["remaining_quantity"]),
+                                 ("SELL", "PARTIALLY_FILLED", 200, 100, 100))
+                filtered = client.list_orders(ACCOUNT_ID, start_date="2026-11-06", end_date="2026-11-06",
+                                              scope="ACCOUNT", include_raw=True)
+                self.assertEqual(filtered["count"], 1)
+                self.assertEqual(filtered["items"][0]["raw"]["m_strRemark"], "manual")
+                self.assertEqual(client.list_orders(ACCOUNT_ID)["count"], 1)
+            finally:
+                bridge.get_trade_detail_data = previous_query
+
+    def test_account_orders_distinguish_empty_snapshot_from_query_failure(self):
+        with QmtClient(config_path=self.config_path) as client:
+            self.assertEqual(client.list_orders(ACCOUNT_ID, scope="ACCOUNT")["items"], [])
+            for kwargs in ({"scope": "ACCOUNT"}, {"account_id": ACCOUNT_ID, "scope": "INVALID"}):
+                with self.assertRaises(ValidationError):
+                    client.list_orders(**kwargs)
+            with self.assertRaises(RemoteError) as denied:
+                client.list_orders("NOT-CONFIGURED", scope="ACCOUNT")
+            self.assertEqual(denied.exception.code, "ACCOUNT_NOT_ALLOWED")
+            with self.assertRaises(RemoteError) as reversed_dates:
+                client.list_orders(ACCOUNT_ID, scope="ACCOUNT", start_date="2026-11-02", end_date="2026-11-01")
+            self.assertEqual(reversed_dates.exception.code, "INVALID_ARGUMENT")
+            previous_query = bridge.get_trade_detail_data
+            try:
+                bridge.get_trade_detail_data = lambda *args: None
+                with self.assertRaises(RemoteError) as invalid:
+                    client.list_orders(ACCOUNT_ID, scope="ACCOUNT")
+                self.assertEqual(invalid.exception.code, "QMT_DATA_ERROR")
+            finally:
+                bridge.get_trade_detail_data = previous_query
 
     def test_list_trades_supports_adapter_and_account_scope(self):
         order = OrderRequest(
